@@ -27,6 +27,343 @@ def test_task_message_round_trip() -> None:
     original = TaskRequested.create("hello")
     restored = TaskRequested.from_json(original.to_json())
     assert restored == original
+    assert restored.version == 2
+    assert restored.root_task_id == original.task_id
+    assert restored.parent_task_id is None
+
+
+def test_task_requested_create_creates_v2_root_by_default() -> None:
+    task = TaskRequested.create("  execute root task  ")
+    assert task.version == 2
+    assert task.prompt == "execute root task"
+    assert task.root_task_id == task.task_id
+    assert task.parent_task_id is None
+    assert isinstance(task.created_at, str) and len(task.created_at) > 0
+
+    data = task.to_dict()
+    assert data["version"] == 2
+    assert data["root_task_id"] == task.task_id
+    assert data["parent_task_id"] is None
+    assert data["prompt"] == "execute root task"
+
+
+def test_task_requested_v2_root_round_trip() -> None:
+    original = TaskRequested.create("survey consensus algorithms")
+    data = original.to_dict()
+    assert data["version"] == 2
+    assert data["root_task_id"] == original.task_id
+    assert data["parent_task_id"] is None
+
+    from_dict_restored = TaskRequested.from_dict(data)
+    assert from_dict_restored == original
+    assert from_dict_restored.root_task_id == original.task_id
+    assert from_dict_restored.parent_task_id is None
+
+    from_json_restored = TaskRequested.from_json(original.to_json())
+    assert from_json_restored == original
+    assert from_json_restored.root_task_id == original.task_id
+    assert from_json_restored.parent_task_id is None
+
+
+def test_task_requested_v1_upcasts_to_root() -> None:
+    v1_payload = {
+        "task_id": "legacy-task-1",
+        "prompt": "legacy prompt",
+        "created_at": "2026-11-15T00:00:00+00:00",
+        "version": 1,
+    }
+    task = TaskRequested.from_dict(v1_payload)
+    assert task.task_id == "legacy-task-1"
+    assert task.root_task_id == "legacy-task-1"
+    assert task.parent_task_id is None
+    assert task.prompt == "legacy prompt"
+    assert task.version == 2
+
+    # Verify normalized object reserializes as a valid v2 payload
+    reserialized_dict = task.to_dict()
+    assert reserialized_dict["version"] == 2
+    assert reserialized_dict["root_task_id"] == "legacy-task-1"
+    assert reserialized_dict["parent_task_id"] is None
+    assert TaskRequested.from_dict(reserialized_dict) == task
+
+    restored_json = TaskRequested.from_json(
+        '{"task_id": "legacy-task-2", "prompt": "p2", "created_at": "2026-11-15T00:00:00+00:00", "version": 1}'
+    )
+    assert restored_json.task_id == "legacy-task-2"
+    assert restored_json.root_task_id == "legacy-task-2"
+    assert restored_json.parent_task_id is None
+    assert restored_json.version == 2
+    assert restored_json.to_dict()["version"] == 2
+
+
+def test_task_requested_v1_rejects_child_lineage() -> None:
+    with pytest.raises(ValueError, match="version 1 tasks must not specify parent_task_id"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "version": 1,
+            "parent_task_id": "p1",
+        })
+
+    with pytest.raises(ValueError, match="version 1 tasks must have root_task_id equal to task_id"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "version": 1,
+            "root_task_id": "r1",
+        })
+
+
+def test_task_requested_v2_child_round_trip() -> None:
+    child = TaskRequested(
+        task_id="child-1",
+        prompt="child prompt",
+        created_at="2026-11-15T00:00:00+00:00",
+        root_task_id="root-1",
+        parent_task_id="root-1",
+        version=2,
+    )
+    assert child.task_id == "child-1"
+    assert child.root_task_id == "root-1"
+    assert child.parent_task_id == "root-1"
+    assert child.version == 2
+
+    data = child.to_dict()
+    assert data["parent_task_id"] == "root-1"
+    assert data["root_task_id"] == "root-1"
+    assert TaskRequested.from_dict(data) == child
+    assert TaskRequested.from_json(child.to_json()) == child
+
+    child_payload = {
+        "task_id": "child-2",
+        "prompt": "child prompt 2",
+        "created_at": "2026-11-15T00:00:00+00:00",
+        "root_task_id": "root-1",
+        "parent_task_id": "root-1",
+        "version": 2,
+    }
+    child2 = TaskRequested.from_dict(child_payload)
+    assert child2.task_id == "child-2"
+    assert child2.root_task_id == "root-1"
+    assert child2.parent_task_id == "root-1"
+    assert child2.version == 2
+    assert child2.to_dict() == child_payload
+
+
+def test_task_requested_wire_contract_represents_deeper_ancestry() -> None:
+    """Wire contract represents multi-hop ancestry (root != parent) structurally.
+
+    For example, task_id='A3', root_task_id='A', parent_task_id='A2'.
+    Platform depth enforcement (e.g. depth-1 limit) belongs to later platform
+    policy and persistence increments, not the wire contract.
+    """
+    descendant = TaskRequested(
+        task_id="A3",
+        prompt="deeper child task",
+        created_at="2026-11-15T00:00:00+00:00",
+        root_task_id="A",
+        parent_task_id="A2",
+        version=2,
+    )
+    assert descendant.task_id == "A3"
+    assert descendant.root_task_id == "A"
+    assert descendant.parent_task_id == "A2"
+    assert descendant.version == 2
+
+    # Verify round-trip serialization and deserialization
+    data = descendant.to_dict()
+    assert data["task_id"] == "A3"
+    assert data["root_task_id"] == "A"
+    assert data["parent_task_id"] == "A2"
+    assert data["version"] == 2
+
+    restored = TaskRequested.from_dict(data)
+    assert restored == descendant
+    assert restored.task_id == "A3"
+    assert restored.root_task_id == "A"
+    assert restored.parent_task_id == "A2"
+
+
+def test_task_requested_v2_rejects_missing_or_invalid_root_task_id() -> None:
+    with pytest.raises(ValueError, match="root_task_id is required in version 2"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "version": 2,
+        })
+
+    with pytest.raises(ValueError, match="root_task_id is required in version 2"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": None,
+            "version": 2,
+        })
+
+    with pytest.raises(ValueError, match="root_task_id must be a non-empty string"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "   ",
+            "version": 2,
+        })
+
+    with pytest.raises(ValueError, match="root_task_id must be a non-empty string"):
+        TaskRequested(
+            task_id="t1",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="",
+            version=2,
+        )
+
+
+def test_task_requested_rejects_self_parenting() -> None:
+    with pytest.raises(ValueError, match="parent_task_id must not equal task_id"):
+        TaskRequested(
+            task_id="task-1",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="root-1",
+            parent_task_id="task-1",
+            version=2,
+        )
+
+    with pytest.raises(ValueError, match="parent_task_id must not equal task_id"):
+        TaskRequested.from_dict({
+            "task_id": "task-1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "root-1",
+            "parent_task_id": "task-1",
+            "version": 2,
+        })
+
+
+def test_task_requested_rejects_child_claiming_root_id() -> None:
+    with pytest.raises(ValueError, match="child tasks must not have root_task_id equal to task_id"):
+        TaskRequested(
+            task_id="child-1",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="child-1",
+            parent_task_id="parent-1",
+            version=2,
+        )
+
+    with pytest.raises(ValueError, match="child tasks must not have root_task_id equal to task_id"):
+        TaskRequested.from_dict({
+            "task_id": "child-1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "child-1",
+            "parent_task_id": "parent-1",
+            "version": 2,
+        })
+
+
+def test_task_requested_rejects_root_with_different_root_id() -> None:
+    with pytest.raises(ValueError, match="root tasks must have root_task_id equal to task_id"):
+        TaskRequested(
+            task_id="t1",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="different-root",
+            parent_task_id=None,
+            version=2,
+        )
+
+    with pytest.raises(ValueError, match="root tasks must have root_task_id equal to task_id"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "different-root",
+            "parent_task_id": None,
+            "version": 2,
+        })
+
+
+def test_task_requested_rejects_unknown_or_missing_version() -> None:
+    for bad_ver in [3, 0, -1]:
+        with pytest.raises(ValueError, match="Unsupported contract version"):
+            TaskRequested.from_dict({
+                "task_id": "t1",
+                "prompt": "p",
+                "created_at": "2026-11-15T00:00:00+00:00",
+                "root_task_id": "t1",
+                "version": bad_ver,
+            })
+
+    with pytest.raises(TypeError, match="version must be an int"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "t1",
+            "version": True,
+        })
+
+    with pytest.raises(ValueError, match="version is required"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "t1",
+        })
+
+    with pytest.raises(ValueError, match="Unsupported contract version"):
+        TaskRequested(
+            task_id="t1",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="t1",
+            version=1,
+        )
+
+
+def test_task_requested_field_validation_and_unexpected_fields() -> None:
+    with pytest.raises(ValueError, match="task_id must be a non-empty string"):
+        TaskRequested(
+            task_id="",
+            prompt="p",
+            created_at="2026-11-15T00:00:00+00:00",
+            root_task_id="r1",
+            version=2,
+        )
+
+    with pytest.raises(ValueError, match="created_at must be a non-empty string"):
+        TaskRequested(
+            task_id="t1",
+            prompt="p",
+            created_at="",
+            root_task_id="t1",
+            version=2,
+        )
+
+    with pytest.raises(TypeError, match="prompt must be a str"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": 123,
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "t1",
+            "version": 2,
+        })
+
+    with pytest.raises(TypeError, match="unexpected TaskRequested fields"):
+        TaskRequested.from_dict({
+            "task_id": "t1",
+            "prompt": "p",
+            "created_at": "2026-11-15T00:00:00+00:00",
+            "root_task_id": "t1",
+            "version": 2,
+            "unexpected_field": "disallowed",
+        })
 
 
 def test_agent_event_round_trip() -> None:

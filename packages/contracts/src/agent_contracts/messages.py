@@ -18,11 +18,56 @@ class TaskRequested:
     task_id: str
     prompt: str
     created_at: str
-    version: int = 1
+    root_task_id: str
+    parent_task_id: str | None = None
+    version: int = 2
+
+    def __post_init__(self) -> None:
+        if type(self.version) is bool or not isinstance(self.version, int):
+            raise TypeError(f"version must be an int, got {type(self.version).__name__}")
+        if self.version != 2:
+            raise ValueError(f"Unsupported contract version: {self.version}")
+
+        if not isinstance(self.task_id, str) or not self.task_id.strip():
+            raise ValueError("task_id must be a non-empty string")
+        object.__setattr__(self, "task_id", self.task_id.strip())
+
+        if not isinstance(self.prompt, str):
+            raise TypeError(f"prompt must be a str, got {type(self.prompt).__name__}")
+
+        if not isinstance(self.created_at, str) or not self.created_at.strip():
+            raise ValueError("created_at must be a non-empty string")
+        object.__setattr__(self, "created_at", self.created_at.strip())
+
+        if not isinstance(self.root_task_id, str) or not self.root_task_id.strip():
+            raise ValueError("root_task_id must be a non-empty string")
+        object.__setattr__(self, "root_task_id", self.root_task_id.strip())
+
+        if self.parent_task_id is not None:
+            if not isinstance(self.parent_task_id, str) or not self.parent_task_id.strip():
+                raise ValueError("parent_task_id must be a non-empty string or None")
+            object.__setattr__(self, "parent_task_id", self.parent_task_id.strip())
+
+        if self.parent_task_id is None:
+            if self.root_task_id != self.task_id:
+                raise ValueError("root tasks must have root_task_id equal to task_id")
+        else:
+            if self.parent_task_id == self.task_id:
+                raise ValueError("parent_task_id must not equal task_id")
+            if self.root_task_id == self.task_id:
+                raise ValueError("child tasks must not have root_task_id equal to task_id")
 
     @classmethod
     def create(cls, prompt: str) -> "TaskRequested":
-        return cls(task_id=str(uuid4()), prompt=prompt.strip(), created_at=now_iso())
+        assigned_task_id = str(uuid4())
+        return cls(
+            task_id=assigned_task_id,
+            prompt=prompt.strip(),
+            created_at=now_iso(),
+            root_task_id=assigned_task_id,
+            parent_task_id=None,
+            version=2,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -32,11 +77,70 @@ class TaskRequested:
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "TaskRequested":
-        return cls(**data)
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+
+        allowed_fields = {
+            "task_id",
+            "prompt",
+            "created_at",
+            "root_task_id",
+            "parent_task_id",
+            "version",
+        }
+        unexpected_fields = data.keys() - allowed_fields
+        if unexpected_fields:
+            raise TypeError(f"unexpected TaskRequested fields: {sorted(unexpected_fields)}")
+
+        if "version" not in data:
+            raise ValueError("version is required and must be 1 or 2")
+
+        version = data["version"]
+        if type(version) is bool or not isinstance(version, int):
+            raise TypeError(f"version must be an int, got {type(version).__name__}")
+        if version not in {1, 2}:
+            raise ValueError(f"Unsupported contract version: {version}")
+
+        if "task_id" not in data:
+            raise ValueError("task_id is required")
+        if "prompt" not in data:
+            raise ValueError("prompt is required")
+        if "created_at" not in data:
+            raise ValueError("created_at is required")
+
+        task_id = data["task_id"]
+        prompt = data["prompt"]
+        created_at = data["created_at"]
+
+        if version == 1:
+            if data.get("parent_task_id") is not None:
+                raise ValueError("version 1 tasks must not specify parent_task_id")
+            if "root_task_id" in data and data["root_task_id"] != task_id:
+                raise ValueError("version 1 tasks must have root_task_id equal to task_id")
+            return cls(
+                task_id=task_id,
+                prompt=prompt,
+                created_at=created_at,
+                root_task_id=task_id,
+                parent_task_id=None,
+                version=2,
+            )
+
+        if "root_task_id" not in data or data["root_task_id"] is None:
+            raise ValueError("root_task_id is required in version 2")
+
+        return cls(
+            task_id=task_id,
+            prompt=prompt,
+            created_at=created_at,
+            root_task_id=data["root_task_id"],
+            parent_task_id=data.get("parent_task_id"),
+            version=2,
+        )
 
     @classmethod
     def from_json(cls, value: str) -> "TaskRequested":
-        return cls(**json.loads(value))
+        return cls.from_dict(json.loads(value))
 
 
 @dataclass(frozen=True)
