@@ -1,14 +1,14 @@
-# Autonomous Agent Lab Roadmap
+# Tiny Agent Lab Roadmap
 
 ## Roadmap Principle
 
 **Versions represent demonstrated platform capabilities, not the amount of code written.**
 
-Autonomous Agent Lab follows a capability-oriented development roadmap.
+Tiny Agent Lab follows a capability-oriented development roadmap.
 
 A version milestone is reached when the associated capability works end-to-end, is tested, and can be demonstrated through the platform. Individual implementation details may change as the architecture evolves.
 
-The roadmap is intentionally flexible. Capabilities may move between milestones when experimentation shows that a different sequence produces a stronger architecture.
+The roadmap is intentionally flexible. Capabilities may move between milestones when experimentation shows that a different sequence produces a stronger architecture. Descriptions of v0.6.0 and later milestones are planning direction, not fixed promises.
 
 ---
 
@@ -95,13 +95,13 @@ The platform identifies the required capability, delegates the work to the Resea
 
 # v0.3.0 — Dynamic Orchestration
 
-**Status: Current**
+**Status: Complete**
 
 ### Goal
 
 Move from configured agent routing toward runtime capability-driven orchestration.
 
-### Target Capabilities
+### Capabilities
 
 - Runtime capability discovery
 - Orchestrator awareness of registered capabilities
@@ -114,7 +114,7 @@ Move from configured agent routing toward runtime capability-driven orchestratio
 - Source-quality awareness for research
 - Prototype Console visualization of routing decisions
 
-### Target Flow
+### Demonstrated Flow
 
 Task
 → Determine Required Capability
@@ -131,13 +131,13 @@ The orchestrator can discover which currently registered agent provides a reques
 
 # v0.4.0 — Resilient Multi-Provider Inference
 
-**Status: Planned**
+**Status: Complete**
 
 ### Goal
 
 Allow agents to use different inference resources without becoming dependent on a single model provider or execution environment.
 
-### Target Capabilities
+### Capabilities
 
 - Multiple InferenceProvider adapters
 - Cloud inference
@@ -150,7 +150,7 @@ Allow agents to use different inference resources without becoming dependent on 
 - Inference telemetry
 - Configurable provider priorities
 
-### Target Architecture
+### Architecture
 
 InferenceProvider
 ├── Cloud Provider
@@ -166,13 +166,13 @@ The application layer requests inference as a capability while infrastructure de
 
 # v0.5.0 — Tool-Using Agents
 
-**Status: Planned**
+**Status: Released**
 
 ### Goal
 
 Allow agents to use discoverable tools instead of being limited to integrations explicitly embedded into each agent implementation.
 
-### Target Capabilities
+### Capabilities
 
 - Tool abstraction
 - Tool registry
@@ -185,7 +185,7 @@ Allow agents to use discoverable tools instead of being limited to integrations 
 - Tool permission boundaries
 - Failure handling for unavailable tools
 
-### Target Flow
+### Demonstrated Flow
 
 Agent Goal
 → Determine Required Tool
@@ -203,7 +203,7 @@ Agents can select and invoke tools through standardized capability boundaries ra
 
 # v0.6.0 — Multi-Agent Collaboration
 
-**Status: Planned**
+**Status: Next planned milestone**
 
 ### Goal
 
@@ -385,13 +385,13 @@ User / Console
 
 ### Milestone Outcome
 
-Autonomous Agent Lab provides a stable framework for demonstrating and experimenting with autonomous-agent patterns using interchangeable agents, tools, and inference providers.
+Tiny Agent Lab provides a stable framework for demonstrating and experimenting with autonomous-agent patterns using interchangeable agents, tools, and inference providers.
 
 ---
 
 # Versioning Policy
 
-Autonomous Agent Lab uses capability-oriented semantic versioning.
+Tiny Agent Lab uses capability-oriented semantic versioning.
 
 ## Minor Releases
 
@@ -423,7 +423,9 @@ Examples:
 
 # Current Position
 
-**Current milestone: v0.3.0 — Dynamic Orchestration**
+**Current published release: v0.5.0 — Tool-Using Agents**
+
+**Next planned milestone: v0.6.0 — Multi-Agent Collaboration**
 
 Completed:
 
@@ -435,9 +437,12 @@ Foundation
 → Persistent Results
 → Observable Capabilities
 → Prototype Console
+→ Dynamic Orchestration
+→ Resilient Multi-Provider Inference
+→ Tool-Using Agents
 
 Next major target:
 
-**v0.4.0 — Resilient Multi-Provider Inference**
+**v0.6.0 — Multi-Agent Collaboration**
 
-The next phase will focus on allowing agents to use different inference resources without becoming dependent on a single model provider or execution environment.
+The next planned milestone will focus on allowing multiple specialist agents to contribute independently to a larger goal. This is planning direction, not a fixed promise.
