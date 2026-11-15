@@ -319,6 +319,10 @@ COMPOUND_TASK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+IMPERATIVE_RESEARCH_DIRECTIVE_PATTERN = re.compile(
+    r"^\s*research\b(?=\s*[:,]?\s*\S)", re.IGNORECASE
+)
+
 AMBIGUOUS_BORDERLINE_PATTERN = re.compile(
     r"\b(advancements?|advancing)\b|\bhow\s+is\s+[a-zA-Z0-9_\-\s]{2,30}\s+impacting\s+[a-zA-Z0-9_\-\s]{2,30}\b|\b(should\s+(i|we)\s+use|choosing\s+between|choose\s+between)\s+[a-zA-Z0-9_\-]+\s+or\s+[a-zA-Z0-9_\-]+\b|\bbest\s+practices\s+for\s+[a-zA-Z0-9_\-\s]{3,35}\b|\b(pros\s+and\s+cons|trade-?offs)\s+of\s+[a-zA-Z0-9_\-\s]{3,35}\b",
     re.IGNORECASE,
@@ -456,6 +460,25 @@ class DeterministicCapabilityRouter:
                     target_capability=AgentCapability.GENERAL,
                     strength=SignalStrength.STRONG,
                     evidence=local_target_match.group(0),
+                )
+            )
+
+        # Explicit research directive: a bare direct imperative ("Research ...")
+        # at the start of the prompt is a strong research request. Concrete
+        # local-task evidence (strong general signals) takes precedence and
+        # suppresses the directive.
+        directive_match = IMPERATIVE_RESEARCH_DIRECTIVE_PATTERN.search(prompt)
+        if directive_match and not any(
+            signal.target_capability == AgentCapability.GENERAL
+            and signal.strength == SignalStrength.STRONG
+            for signal in signals
+        ):
+            signals.append(
+                RoutingSignal(
+                    signal_type=RoutingSignalType.EXPLICIT_RESEARCH_DIRECTIVE,
+                    target_capability=AgentCapability.RESEARCH,
+                    strength=SignalStrength.STRONG,
+                    evidence=directive_match.group(0).strip(),
                 )
             )
 

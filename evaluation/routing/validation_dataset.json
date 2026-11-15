@@ -313,5 +313,14 @@
     "rationale": "Explicitly requests current authoritative sources for technical analysis, providing strong research signals for both freshness and authoritative evidence.",
     "category": "freshness_current_info",
     "tags": ["sources", "authoritative", "freshness", "consensus"]
+  },
+  {
+    "id": "val-036",
+    "prompt": "Review this research code repository.",
+    "expected_capability": "general",
+    "clarity": "ambiguous",
+    "rationale": "Incidental mid-prompt use of 'research' with a leading non-Research verb and no supplied artifact or external-evidence demand; the bare-imperative directive requires 'Research' at the start.",
+    "category": "weak_verb_alone",
+    "tags": ["research_keyword", "no_directive", "negative"]
   }
 ]

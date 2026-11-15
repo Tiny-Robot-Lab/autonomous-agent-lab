@@ -21,13 +21,13 @@ As the platform evaluates potential improvements to capability routing (GitHub i
 
 Routing evaluation is separated into two version-controlled datasets to distinguish development iteration from regression and adversarial coverage:
 
-1. **Development Dataset** ([`evaluation/routing/dataset.json`](../evaluation/routing/dataset.json)): 45 curated test cases across 9 categories used to define and evaluate initial baseline signals. A 100% score on this dataset indicates that all known development cases pass, not universal production accuracy.
-2. **Validation Dataset** ([`evaluation/routing/validation_dataset.json`](../evaluation/routing/validation_dataset.json)): 35 diverse test cases and adversarial prompts created during the same implementation cycle. This dataset provides regression and adversarial coverage for weak-verb disambiguation, diagnostic artifacts, and edge cases.
+1. **Development Dataset** ([`evaluation/routing/dataset.json`](../evaluation/routing/dataset.json)): 46 curated test cases across 9 categories used to define and evaluate initial baseline signals. A 100% score on this dataset indicates that all known development cases pass, not universal production accuracy.
+2. **Validation Dataset** ([`evaluation/routing/validation_dataset.json`](../evaluation/routing/validation_dataset.json)): 36 diverse test cases and adversarial prompts created during the same implementation cycle. This dataset provides regression and adversarial coverage for weak-verb disambiguation, diagnostic artifacts, and edge cases.
 
 > [!IMPORTANT]
 > Development-set and validation-set metrics are always reported separately.
-> - The 45-case dataset is the primary development dataset.
-> - The 35-case validation dataset was created during the same implementation cycle; its results provide regression and adversarial coverage rather than an unbiased production-accuracy estimate.
+> - The 46-case dataset is the primary development dataset.
+> - The 36-case validation dataset was created during the same implementation cycle; its results provide regression and adversarial coverage rather than an unbiased production-accuracy estimate.
 > - An unbiased production-accuracy estimate requires a future independent lockbox dataset created independently after the implementation is frozen.
 
 ### Schema
@@ -56,7 +56,7 @@ Routing evaluation is separated into two version-controlled datasets to distingu
 
 ### Categories Covered Across Datasets
 
-- **Development Dataset (45 cases)**: `clear_general`, `clear_research`, `ambiguous_borderline`, `freshness_current_info`, `explicit_sources_evidence`, `explanatory_general`, `code_transformation`, `multi_clause_mixed`, `research_keywords_negative`.
+- **Development Dataset (46 cases)**: `clear_general`, `clear_research`, `ambiguous_borderline`, `freshness_current_info`, `explicit_sources_evidence`, `explanatory_general`, `code_transformation`, `multi_clause_mixed`, `research_keywords_negative`.
 - **Validation Dataset (35 cases)**: `weak_verb_supplied_artifact`, `freshness_current_info`, `supported_versions_compatibility`, `changing_prices_availability`, `external_standards_guidance`, `historical_established_advances`, `negative_current_program_state`, `negative_current_electrical`, `vague_insufficient_evidence`, `mixed_supplied_and_external`, `compound_retrieval_prerequisite`, `weak_verb_alone`, `package_management_installation`, `personal_activity_temporal`, `diagnostic_evidence_supplied_artifact`, `volatile_demographic_freshness`.
 
 ---
@@ -211,6 +211,7 @@ To verify the hybrid execution plumbing prior to introducing model providers (Ph
 | `CHANGING_EXTERNAL_INFO` | `RESEARCH` | `STRONG` | High-frequency changing information (`pricing tiers`, `stock market trends`, `breaking changes`). |
 | `OUTSIDE_AUTHORITY_OR_PROVIDER` | `RESEARCH` | `STRONG` | Inquiries targeting specific external conferences, standards bodies (NIST, ISO), or vulnerability registries (NVD, CVE). |
 | `RESEARCH_SYNTHESIS` | `RESEARCH` | `STRONG` | Scoped synthesis cues such as trends in a subject, a criterion-based comparison of technologies, a literature review, or a deep dive. |
+| `EXPLICIT_RESEARCH_DIRECTIVE` | `RESEARCH` | `STRONG` | Bare direct imperative (`Research ...`) at the start of the prompt. Suppressed when strong GENERAL/local-task evidence is present. |
 | `EXPLICIT_EXTERNAL_RETRIEVAL` | `RESEARCH` | `STRONG` | Explicit directions to query live external search engines. |
 | `SUPPLIED_LOCAL_ARTIFACT` | `GENERAL` | `STRONG` | Actual presence of structural markers (fenced code, diffs, stack traces, INI configs, JSON payloads). |
 | `LOCAL_CODE_OR_DEBUGGING` | `GENERAL` | `STRONG` | Local coding/debugging tasks and explicit local targets (`write a python script`, `this exception`, `this stack trace`, `this function`). |
@@ -226,7 +227,9 @@ To verify the hybrid execution plumbing prior to introducing model providers (Ph
 Weak research-like verbs (`analyze`, `assess`, `benchmark`, `compare`, `evaluate`, `survey`, `conduct`, `research`, `investigate`, `study`, `explore`) are contextual indicators and **must never independently determine RESEARCH**:
 - **Weak verb + strong General evidence** -> `GENERAL / CLEAR` (e.g. *"Research this function and explain why the loop never terminates"*).
 - **Weak verb + strong Research evidence** -> follows strong Research evidence (e.g. *"Research the latest developments in quantum computing"* -> `RESEARCH / CLEAR`).
-- **Weak verb alone** -> provisional `GENERAL`, with clarity marked `AMBIGUOUS` (e.g. *"Research consensus algorithms"* -> `GENERAL / AMBIGUOUS`).
+- **Weak verb alone** -> provisional `GENERAL`, with clarity marked `AMBIGUOUS` (e.g. *"Compare local and cloud LLMs"* -> `GENERAL / AMBIGUOUS`).
+- **Bare imperative exception**: a direct imperative starting with `Research` (`^\s*research\b` with following content, e.g. *"Research consensus algorithms."* or *"Research the current advantages and limitations of small local LLMs compared with cloud-hosted LLMs."*) emits a **strong** `EXPLICIT_RESEARCH_DIRECTIVE` signal and routes `RESEARCH / CLEAR`. Polite or embedded forms (*"Please research ..."*, *"Explain what a research paper is"*) stay weak. A lone *"Research"* with no following content stays weak.
+- **Strong-GENERAL guard**: concrete local-task evidence (`LOCAL_CODE_OR_DEBUGGING`, `SUPPLIED_LOCAL_ARTIFACT`, `TRANSFORMATION_OR_REWRITE`) suppresses the directive (e.g. *"Research this function and explain why the loop never terminates"* -> `GENERAL / CLEAR`).
 - The word "research" alone is never proof of external retrieval.
 
 Scoped research-synthesis evidence can be strong without explicit freshness wording. Examples include trends in a subject, comparing technologies against a stated criterion, literature reviews, and deep dives. Explicit local code/debugging targets suppress these synthesis cues; generic verbs remain weak.

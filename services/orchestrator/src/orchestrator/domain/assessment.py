@@ -34,6 +34,7 @@ class RoutingSignalType(StrEnum):
     """Taxonomy of inspectable deterministic routing signals."""
 
     # Strong Research signals
+    EXPLICIT_RESEARCH_DIRECTIVE = "explicit_research_directive"
     EXPLICIT_EXTERNAL_RETRIEVAL = "explicit_external_retrieval"
     EXPLICIT_SOURCES_OR_CITATIONS = "explicit_sources_or_citations"
     FRESHNESS_OR_CURRENT_INFO = "freshness_or_current_info"
