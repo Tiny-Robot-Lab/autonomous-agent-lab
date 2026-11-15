@@ -4,7 +4,7 @@ Autonomous Agent Lab is Lab #1 under the [Tiny Robot Lab](https://tinyrobotlab.c
 
 It is a non-commercial, open-source educational testbed for exploring how modern AI and autonomous-agent systems actually work by building them from scratch: asynchronous messaging queues, dynamic capability registration, heartbeat liveness policies, evidence-conditioned synthesis, and provider-neutral Clean Architecture boundaries.
 
-- **Current Release:** `v0.4.0 — Resilient Multi-Provider Inference`
+- **Current Release:** `v0.5.0 — Tool-Using Agents`
 - **Live Experimental Lab:** [Tiny Agent Lab](https://agents.tinyrobotlab.com)
 - **Umbrella Website:** [Tiny Robot Lab](https://tinyrobotlab.com)
 
@@ -23,6 +23,7 @@ Dependency direction is inward: presentation/infrastructure -> application -> do
 - **v0.2.0 — Multi-Agent Research Prototype**: Automatic capability-based task routing, independent Research Agent service, grounded Tavily research retrieval, pluggable Cloudflare inference synthesis, persistent task results, observable agent capabilities and providers, and the Prototype Console interface.
 - **v0.3.0 — Dynamic Orchestration**: Runtime capability discovery, heartbeat liveness tracking, deterministic candidate selection, advertised delivery target queues, and comprehensive routing observability.
 - **v0.4.0 — Resilient Multi-Provider Inference**: Provider-neutral inference availability and health observation, integration of Google Gemini as a second real inference provider alongside Cloudflare Workers AI, deterministic provider selection policy, graceful fallback traversal across configured provider priority chains, per-attempt operational inference telemetry, deterministic provider failure and fallback simulation test suites, and Prototype Console visibility into provider execution and fallback transitions without dependency on any single model provider.
+- **v0.5.0 — Tool-Using Agents**: Bounded provider-neutral tool-use coordination (discovery → selection → validation → authorization → execution → continuation, with at most one tool invocation plus one continuation step), runtime tool discovery and registry with tool capability metadata, MCP client integration with a Tavily-access prototype, explicit tool permission and authorization boundaries with security auditing, a tool execution telemetry contract, and Prototype Console display of tool execution entries and inference fallback attempt history.
 
 ## Start
 
@@ -34,15 +35,15 @@ Dependency direction is inward: presentation/infrastructure -> application -> do
 
 From another computer on your LAN, use `http://<windows-host-ip>:8080` after allowing TCP 8080 through the Windows firewall. Do not expose Redis directly.
 
-## Prototype Console (v0.4.0)
+## Prototype Console (v0.5.0)
 
 The Prototype Console provides a unified, approachable browser interface (`GET /`) for demonstrating and interacting with the lab:
 
 - **Task Submission & Observability**: Enter natural-language prompts with client-side validation and live progress feedback.
 - **Automatic Capability Routing**: Agent selection is fully automatic—the platform analyzes prompt requirements on the backend and dispatches to either the General Worker or Research Agent without requiring manual agent selection.
-- **Result Presentation & Inference Metadata**: View synthesized research output with formatted headings, numbered findings, preserved line breaks, and safe clickable links (`http`/`https` only, `rel="noopener noreferrer"`). When complete, displays successful inference execution metadata including provider name, model (when known), latency in milliseconds, and human-friendly attempt number. Includes quick "Copy Result" and "New Task" workflows.
+- **Result Presentation & Inference Metadata**: View synthesized research output with formatted headings, numbered findings, preserved line breaks, and safe clickable links (`http`/`https` only, `rel="noopener noreferrer"`). When complete, displays successful inference execution metadata including provider name, model (when known), latency in milliseconds, and human-friendly attempt number. When multiple inference attempts occurred, shows a compact prior-attempt ("Fallback from") note; when all providers fail, shows per-attempt failure reasons. Includes quick "Copy Result" and "New Task" workflows.
 - **Available Agents Registry & Provider Priority**: Inspect registered autonomous agents, their operational state (`idle`, `working`, `error`), active task assignments, separate retrieval provider configuration, and configured inference-provider priority chains (`1. provider1 → 2. provider2`), with truthful indication that provider health is evaluated per task rather than continuously persisted.
-- **Activity Timeline & Fallback Transitions**: Monitor live operational transitions and task events emitted asynchronously over Redis, featuring visually highlighted entries and compact transition details (`failed provider → target provider`, reason, and attempt) when inference fallbacks occur.
+- **Activity Timeline, Fallback & Tool Transitions**: Monitor live operational transitions and task events emitted asynchronously over Redis, featuring visually highlighted entries and compact transition details (`failed provider → target provider`, reason, and attempt) when inference fallbacks occur, plus tool-execution entries (tool name, call ID, succeeded/failed status, duration, and error code when present) for events carrying tool execution telemetry. Tool execution is bounded to a single invocation plus one continuation step per the coordination policy, and entries appear only where tool telemetry is emitted—not as general end-to-end tool use in every agent runtime.
 - **Server-Side Credential Isolation**: All provider keys and tokens remain strictly server-side within container environments and are never transmitted to or stored within the browser console.
 
 To access the console:
