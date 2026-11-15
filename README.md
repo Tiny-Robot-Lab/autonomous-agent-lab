@@ -1,6 +1,6 @@
-# Autonomous Agent Lab
+# Tiny Agent Lab
 
-Autonomous Agent Lab is Lab #1 under the [Tiny Robot Lab](https://tinyrobotlab.com) learning project.
+Tiny Agent Lab is Lab #1 under the [Tiny Robot Lab](https://tinyrobotlab.com) learning project (technical repository: `autonomous-agent-lab`).
 
 It is a non-commercial, open-source educational testbed for exploring how modern AI and autonomous-agent systems actually work by building them from scratch: asynchronous messaging queues, dynamic capability registration, heartbeat liveness policies, evidence-conditioned synthesis, and provider-neutral Clean Architecture boundaries.
 
