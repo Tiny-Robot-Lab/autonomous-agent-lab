@@ -344,6 +344,7 @@ async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
         child_task = TaskRequested(
             task_id=child_id,
             prompt="Child task for atomicity test",
+            created_at="2026-11-15T00:00:00+00:00",
             root_task_id=root_task.task_id,
             parent_task_id=root_task.task_id,
             version=2,
@@ -397,6 +398,7 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
             child = TaskRequested(
                 task_id=cid,
                 prompt=f"Child prompt for {cid}",
+                created_at="2026-11-15T00:00:00+00:00",
                 root_task_id=root_task.task_id,
                 parent_task_id=root_task.task_id,
                 version=2,
