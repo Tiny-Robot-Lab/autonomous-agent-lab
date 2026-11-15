@@ -52,8 +52,21 @@ async def test_dashboard_html_binds_prompt_element_explicitly() -> None:
 @pytest.mark.anyio
 async def test_dashboard_displays_authoritative_version() -> None:
     html = await dashboard()
-    assert "v0.4.0" in html
-    assert '<span class="version-badge">v0.4.0</span>' in html
+    assert "v0.5.0" in html
+    assert '<span class="version-badge">v0.5.0</span>' in html
+
+
+@pytest.mark.anyio
+async def test_dashboard_footer_support_link() -> None:
+    html = await dashboard()
+    assert "Multi-Agent Research Prototype" not in html
+    assert "Support Tiny Robot Lab" in html
+    assert 'href="https://buymeacoffee.com/tinyrobotlab"' in html
+    assert (
+        '<a href="https://buymeacoffee.com/tinyrobotlab" '
+        'target="_blank" rel="noopener noreferrer">'
+        "Support Tiny Robot Lab"
+    ) in html
 
 
 @pytest.mark.anyio
@@ -133,7 +146,7 @@ async def test_create_app_with_fakes_and_endpoints() -> None:
         state_reader=fake_reader,
     )
 
-    assert app.version == "0.4.0"
+    assert app.version == "0.5.0"
     assert app.state.settings.app_env == "test"
     assert app.state.gateway is None
 

@@ -1,4 +1,4 @@
 """Authoritative application version for autonomous-agent-lab."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
