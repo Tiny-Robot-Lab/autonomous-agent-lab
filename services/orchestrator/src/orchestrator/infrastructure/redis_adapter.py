@@ -17,6 +17,7 @@ from orchestrator.application.inference_history import (
 )
 from orchestrator.application.ports import TelemetryStorageError
 from orchestrator.domain.capability import AgentCapability
+from orchestrator.domain.task import TaskLineage
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,125 @@ class RedisGateway:
     def __init__(self, url: str) -> None:
         self._client = redis.from_url(url, decode_responses=True)
 
+    async def register_root_task(
+        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+    ) -> None:
+        if task.parent_task_id is not None or task.root_task_id != task.task_id:
+            raise ValueError(f"Task '{task.task_id}' is not a root task")
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(
+                f"task.status:{task.task_id}",
+                json.dumps({"task_id": task.task_id, "status": initial_status}),
+            )
+            pipe.set(
+                f"task.lineage:{task.task_id}",
+                json.dumps({
+                    "task_id": task.task_id,
+                    "root_task_id": task.root_task_id,
+                    "parent_task_id": None,
+                }),
+            )
+            await pipe.execute()
+
+    async def register_child_task(
+        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+    ) -> None:
+        """Atomically persist pre-validated child task status, forward lineage, and parent membership.
+
+        Domain validation (parent existence and depth-1 policy) is enforced by the
+        platform application use case (RegisterChildTask) prior to invoking this method.
+        This method executes the atomic storage consistency boundary across status, lineage, and parent set.
+        """
+        if task.parent_task_id is None or task.root_task_id == task.task_id:
+            raise ValueError(f"Task '{task.task_id}' is not a child task")
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(
+                f"task.status:{task.task_id}",
+                json.dumps({"task_id": task.task_id, "status": initial_status}),
+            )
+            pipe.set(
+                f"task.lineage:{task.task_id}",
+                json.dumps({
+                    "task_id": task.task_id,
+                    "root_task_id": task.root_task_id,
+                    "parent_task_id": task.parent_task_id,
+                }),
+            )
+            pipe.sadd(f"task.children:{task.parent_task_id}", task.task_id)
+            await pipe.execute()
+
+    async def get_lineage(self, task_id: str) -> TaskLineage | None:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return None
+        raw = await self._client.get(f"task.lineage:{clean_task_id}")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return TaskLineage.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    async def get_children(self, parent_task_id: str) -> list[str]:
+        clean_parent_task_id = str(parent_task_id).strip()
+        if not clean_parent_task_id:
+            return []
+        members = await self._client.smembers(f"task.children:{clean_parent_task_id}")
+        decoded = [
+            m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+            for m in members
+        ]
+        return sorted(decoded)
+
+    async def update_status(self, task_id: str, status: str) -> None:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            raise ValueError("task_id must be a non-empty string")
+        clean_status = str(status).strip()
+        if not clean_status:
+            raise ValueError("status must be a non-empty string")
+        await self._client.set(
+            f"task.status:{clean_task_id}",
+            json.dumps({"task_id": clean_task_id, "status": clean_status}),
+        )
+
+    async def get_status(self, task_id: str) -> str | None:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return None
+        raw = await self._client.get(f"task.status:{clean_task_id}")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if isinstance(data, dict):
+                return data.get("status")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
     async def dispatch(self, task: TaskRequested, target: str) -> None:
+        """Atomically enqueue task payload and establish pending status.
+
+        In accordance with ADR-0006:
+        - RPUSH of TaskRequested and transition of task.status to 'pending' commit together
+          in an atomic transaction pipeline (transaction=True).
+        - If the transaction fails, neither the queue insertion nor 'pending' status is committed.
+        - Failure handling and transition to 'dispatch_failed' is coordinated by the application use case.
+        """
         if not target or not isinstance(target, str) or not target.strip():
             raise ValueError("Dispatch target must be a non-empty string")
-        await self._client.set(
-            f"task.status:{task.task_id}",
-            json.dumps({"task_id": task.task_id, "status": "pending"}),
-        )
-        await self._client.rpush(target.strip(), task.to_json())
+        clean_target = target.strip()
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.rpush(clean_target, task.to_json())
+            pipe.set(
+                f"task.status:{task.task_id}",
+                json.dumps({"task_id": task.task_id, "status": "pending"}),
+            )
+            await pipe.execute()
 
     async def enqueue(
         self,

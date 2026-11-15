@@ -1,4 +1,5 @@
 from .ports import (
+    AuthoritativeTaskStore,
     CandidateFinder,
     CapabilityRouter,
     EventPublisher,
@@ -16,9 +17,10 @@ from .queries import (
     GetTaskResult,
     QueryAgentsByCapability,
 )
-from .use_cases import SubmitTask
+from .use_cases import RegisterChildTask, SubmitTask
 
 __all__ = [
+    "AuthoritativeTaskStore",
     "CandidateFinder",
     "CapabilityRouter",
     "EventPublisher",
@@ -28,6 +30,7 @@ __all__ = [
     "GetRoutingDecision",
     "GetTaskResult",
     "QueryAgentsByCapability",
+    "RegisterChildTask",
     "ResultReader",
     "RoutingRecorder",
     "StateReader",

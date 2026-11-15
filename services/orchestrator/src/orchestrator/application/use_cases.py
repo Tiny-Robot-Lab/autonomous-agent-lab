@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from agent_contracts import AgentEvent, RoutingDecision, RoutingProvenance, TaskRequested
@@ -15,10 +16,15 @@ from orchestrator.domain.selection import (
     CandidateSelectionPolicy,
     DeterministicSelectionPolicy,
 )
-from orchestrator.domain.task import Task
+from orchestrator.domain.task import (
+    DelegationDepthExceededError,
+    ParentTaskNotFoundError,
+    Task,
+)
 
 from .ports import (
     AssessingCapabilityRouter,
+    AuthoritativeTaskStore,
     CandidateFinder,
     CapabilityRouter,
     EventPublisher,
@@ -32,6 +38,7 @@ from .ports import (
 class SubmitTask:
     def __init__(
         self,
+        task_store: AuthoritativeTaskStore,
         queue: TaskQueue | TaskDispatcher | None = None,
         router: CapabilityRouter | None = None,
         candidate_finder: CandidateFinder | None = None,
@@ -41,6 +48,13 @@ class SubmitTask:
         routing_recorder: RoutingRecorder | None = None,
         advisor: RoutingAdvisor | None = None,
     ) -> None:
+        if task_store is None:
+            raise TypeError("SubmitTask requires an AuthoritativeTaskStore")
+        if not isinstance(task_store, AuthoritativeTaskStore):
+            raise TypeError(
+                f"task_store must implement AuthoritativeTaskStore, got {type(task_store).__name__}"
+            )
+        self._task_store = task_store
         self._dispatcher: TaskDispatcher | None = dispatcher or (
             queue if isinstance(queue, TaskDispatcher) else None
         )
@@ -277,14 +291,25 @@ class SubmitTask:
             if self._routing_recorder is not None:
                 await self._routing_recorder.record_routing_decision(decision)
 
+            await self._task_store.register_root_task(message, initial_status="pending_dispatch")
+
             if self._dispatcher is not None:
-                await self._dispatcher.dispatch(message, clean_target)
-                return message
+                try:
+                    await self._dispatcher.dispatch(message, clean_target)
+                    return message
+                except Exception:
+                    await self._task_store.update_status(message.task_id, "dispatch_failed")
+                    raise
 
             # Preserve backward compatibility only where required for older isolated test doubles
             # that implement TaskQueue but not TaskDispatcher
             if self._queue is not None:
-                await self._queue.enqueue(message, resolved_capability, target=clean_target)
+                try:
+                    await self._queue.enqueue(message, resolved_capability, target=clean_target)
+                except Exception:
+                    await self._task_store.update_status(message.task_id, "dispatch_failed")
+                    raise
+                await self._task_store.update_status(message.task_id, "pending")
                 return message
 
             raise RuntimeError("No task dispatcher or queue configured for dispatch")
@@ -309,7 +334,82 @@ class SubmitTask:
             if self._routing_recorder is not None:
                 await self._routing_recorder.record_routing_decision(decision)
 
-            await self._queue.enqueue(message, resolved_capability)
+            await self._task_store.register_root_task(message, initial_status="pending_dispatch")
+
+            try:
+                await self._queue.enqueue(message, resolved_capability)
+            except Exception:
+                await self._task_store.update_status(message.task_id, "dispatch_failed")
+                raise
+            await self._task_store.update_status(message.task_id, "pending")
             return message
 
         raise RuntimeError("No task queue configured for legacy enqueue")
+
+
+class RegisterChildTask:
+    """Internal platform-controlled primitive to create and register a child task.
+
+    Enforces platform governance required by ADR-0006:
+    - Verifies authoritative parent existence;
+    - Derives root_task_id from the authoritative parent;
+    - Enforces depth-1 policy (parent must be a root task);
+    - Atomically commits the child existence consistency boundary (durable status,
+      forward lineage, and parent-to-child membership);
+    - Remains non-executable: does not route, enqueue, or dispatch.
+    """
+
+    def __init__(self, task_store: AuthoritativeTaskStore) -> None:
+        if task_store is None:
+            raise TypeError("RegisterChildTask requires an AuthoritativeTaskStore")
+        if not isinstance(task_store, AuthoritativeTaskStore):
+            raise TypeError(
+                f"task_store must implement AuthoritativeTaskStore, got {type(task_store).__name__}"
+            )
+        self._task_store = task_store
+
+    async def execute(
+        self,
+        parent_task_id: str,
+        prompt: str,
+    ) -> TaskRequested:
+        if not isinstance(parent_task_id, str) or not parent_task_id.strip():
+            raise ValueError("parent_task_id must be a non-empty string")
+        clean_parent_task_id = parent_task_id.strip()
+
+        task = Task(prompt=prompt)
+        clean_prompt = task.prompt
+
+        # 1. Authoritative parent existence check
+        parent_lineage = await self._task_store.get_lineage(clean_parent_task_id)
+        if parent_lineage is None:
+            raise ParentTaskNotFoundError(
+                f"Authoritative parent task not found: {clean_parent_task_id}"
+            )
+
+        # 2. Depth-1 policy enforcement (parent itself must be a root)
+        if parent_lineage.parent_task_id is not None:
+            raise DelegationDepthExceededError(
+                f"Delegation depth exceeded: parent task '{clean_parent_task_id}' is already a child task"
+            )
+
+        # 3. Platform-derived root inheritance (never caller input)
+        child_root_task_id = parent_lineage.root_task_id
+
+        # 4. Mint child identity under trusted platform control
+        child_task_id = str(uuid4())
+
+        # 5. Construct valid TaskRequested v2 child
+        child_task = TaskRequested(
+            task_id=child_task_id,
+            prompt=clean_prompt,
+            created_at=datetime.now(UTC).isoformat(),
+            root_task_id=child_root_task_id,
+            parent_task_id=clean_parent_task_id,
+            version=2,
+        )
+
+        # 6. Commit child existence consistency boundary (durable task state + forward lineage + parent membership)
+        await self._task_store.register_child_task(child_task, initial_status="pending_dispatch")
+
+        return child_task

@@ -5,6 +5,7 @@ from agent_contracts import AgentCandidate, AgentEvent, RoutingDecision, TaskReq
 from orchestrator.domain.advisor import AdvisorRecommendation
 from orchestrator.domain.assessment import RoutingAssessment
 from orchestrator.domain.capability import AgentCapability
+from orchestrator.domain.task import TaskLineage
 
 
 @runtime_checkable
@@ -24,6 +25,43 @@ class TaskDispatcher(Protocol):
         task: TaskRequested,
         target: str,
     ) -> None: ...
+
+
+@runtime_checkable
+class AuthoritativeTaskStore(Protocol):
+    """Authoritative platform storage port for task existence, forward lineage, and parent membership.
+
+    Governed by ADR-0006:
+    - Persists durable task existence and forward lineage;
+    - Commits child task state, forward lineage, and parent membership as one consistency boundary;
+    - Tracks lifecycle transitions: pending_dispatch -> pending / dispatch_failed.
+    """
+
+    async def register_root_task(
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+    ) -> None: ...
+
+    async def register_child_task(
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+    ) -> None:
+        """Atomically persist pre-validated child task status, forward lineage, and parent membership.
+
+        Domain validation (parent existence and depth-1 policy) is enforced by the
+        platform application use case (RegisterChildTask) prior to invoking this method.
+        """
+        ...
+
+    async def get_lineage(self, task_id: str) -> TaskLineage | None: ...
+
+    async def get_children(self, parent_task_id: str) -> list[str]: ...
+
+    async def update_status(self, task_id: str, status: str) -> None: ...
+
+    async def get_status(self, task_id: str) -> str | None: ...
 
 
 class StateReader(Protocol):

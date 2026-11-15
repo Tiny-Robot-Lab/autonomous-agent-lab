@@ -1,6 +1,6 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import redis.asyncio as redis
@@ -15,40 +15,58 @@ from worker.infrastructure.redis_bus import RedisBus
 @pytest.mark.anyio
 async def test_redis_gateway_routes_general_capability() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    gateway._client.rpush = AsyncMock()
-    gateway._client.set = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
     task = TaskRequested.create("general task prompt")
 
     await gateway.enqueue(task, capability=AgentCapability.GENERAL)
 
-    gateway._client.rpush.assert_awaited_once_with("agent.tasks.general", task.to_json())
-    gateway._client.set.assert_awaited_once()
+    mock_pipe.rpush.assert_called_once_with("agent.tasks.general", task.to_json())
+    mock_pipe.set.assert_called_once()
+    mock_pipe.execute.assert_awaited_once()
 
 
 @pytest.mark.anyio
 async def test_redis_gateway_routes_research_capability() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    gateway._client.rpush = AsyncMock()
-    gateway._client.set = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
     task = TaskRequested.create("research task prompt")
 
     await gateway.enqueue(task, capability=AgentCapability.RESEARCH)
 
-    gateway._client.rpush.assert_awaited_once_with("agent.tasks.research", task.to_json())
-    gateway._client.set.assert_awaited_once()
+    mock_pipe.rpush.assert_called_once_with("agent.tasks.research", task.to_json())
+    mock_pipe.set.assert_called_once()
+    mock_pipe.execute.assert_awaited_once()
 
 
 @pytest.mark.anyio
 async def test_redis_gateway_defaults_to_general() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    gateway._client.rpush = AsyncMock()
-    gateway._client.set = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
     task = TaskRequested.create("default task prompt")
 
     await gateway.enqueue(task)
 
-    gateway._client.rpush.assert_awaited_once_with("agent.tasks.general", task.to_json())
-    gateway._client.set.assert_awaited_once()
+    mock_pipe.rpush.assert_called_once_with("agent.tasks.general", task.to_json())
+    mock_pipe.set.assert_called_once()
+    mock_pipe.execute.assert_awaited_once()
 
 
 @pytest.mark.anyio

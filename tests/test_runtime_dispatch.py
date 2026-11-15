@@ -2,7 +2,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent_contracts import (
@@ -396,7 +396,7 @@ async def test_orchestrator_dispatches_to_selected_candidate_advertised_target()
     candidate = make_candidate("worker-1", capability="general", dispatch_target=target_queue)
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
     task = await submit_task.execute("Process background task")
 
     # Verify task was dispatched to the advertised target queue
@@ -416,7 +416,7 @@ async def test_dynamic_queue_change_requires_no_orchestrator_topology_changes() 
     )
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
     task = await submit_task.execute("Process background batch job")
 
     assert len(queue.dispatches) == 1
@@ -431,7 +431,7 @@ async def test_dynamic_dispatch_does_not_depend_on_capability_queue_map() -> Non
     candidate = make_candidate("research-agent-dynamic", capability="research", dispatch_target=target)
     finder = FakeCandidateFinder({"research": [candidate]})
 
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     # Temporarily clear the static queue map to prove zero runtime dependency during dynamic dispatch
     with patch.dict(CAPABILITY_QUEUE_MAP, {}, clear=True):
@@ -459,7 +459,7 @@ async def test_dispatch_with_multiple_candidates_selects_deterministically() -> 
 
     # Provide in non-alphabetical order
     finder = FakeCandidateFinder({"general": [c_beta, c_alpha, c_gamma]})
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     task = await submit_task.execute("Compile documentation")
 
@@ -476,7 +476,7 @@ async def test_rejection_preserved_when_zero_candidates() -> None:
     finder = FakeCandidateFinder({"general": []})
     events = FakeEventPublisher()
 
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute("Execute standard batch task")
@@ -525,7 +525,7 @@ async def test_ineligible_candidates_are_excluded_by_candidate_finder() -> None:
     )
     finder = FindCandidatesByCapability(reader)
     queue = FakeTaskQueue()
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     # Zero eligible candidates should be found, resulting in rejection
     with pytest.raises(CapabilityUnavailableError):
@@ -543,7 +543,7 @@ async def test_candidate_without_dispatch_target_fails_explicitly_without_queue_
     object.__setattr__(candidate, "dispatch_target", None)
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     with (
         patch.dict(CAPABILITY_QUEUE_MAP, {AgentCapability.GENERAL: "agent.tasks.general"}),
@@ -567,7 +567,7 @@ async def test_candidate_with_blank_dispatch_target_fails_explicitly() -> None:
     object.__setattr__(candidate, "dispatch_target", "   ")
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     with pytest.raises(
         ValueError,
@@ -582,23 +582,28 @@ async def test_candidate_with_blank_dispatch_target_fails_explicitly() -> None:
 @pytest.mark.anyio
 async def test_production_dynamic_dispatch_via_redis_gateway_never_depends_on_capability_queue_map() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    gateway._client.set = AsyncMock()
-    gateway._client.rpush = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
 
     custom_target = "agent.tasks.production-custom-node"
     candidate = make_candidate("worker-prod", capability="general", dispatch_target=custom_target)
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(gateway, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=gateway, dispatcher=gateway, candidate_finder=finder)
 
     # Completely clear the capability queue map
     with patch.dict(CAPABILITY_QUEUE_MAP, {}, clear=True):
         assert len(CAPABILITY_QUEUE_MAP) == 0
         task = await submit_task.execute("Process production event")
 
-    # Dynamic dispatch succeeded strictly using the candidate's advertised target
-    gateway._client.rpush.assert_awaited_once_with(custom_target, task.to_json())
-    gateway._client.set.assert_awaited_once_with(
+    # Dynamic dispatch succeeded strictly using the candidate's advertised target via atomic pipeline
+    mock_pipe.rpush.assert_called_once_with(custom_target, task.to_json())
+    mock_pipe.set.assert_any_call(
         f"task.status:{task.task_id}",
         json.dumps({"task_id": task.task_id, "status": "pending"}),
     )
@@ -618,7 +623,9 @@ async def test_runtime_dispatch_prefers_explicit_task_dispatcher() -> None:
     candidate = make_candidate("worker-dispatch", capability="general", dispatch_target="queue.target")
     finder = FakeCandidateFinder({"general": [candidate]})
 
-    submit_task = SubmitTask(dispatcher=dispatcher, candidate_finder=finder)
+    submit_task = SubmitTask(
+        task_store=FakeTaskQueue(), dispatcher=dispatcher, candidate_finder=finder
+    )
     task = await submit_task.execute("Process batch job")
 
     assert len(dispatcher.dispatches) == 1
@@ -630,7 +637,7 @@ async def test_runtime_dispatch_prefers_explicit_task_dispatcher() -> None:
 async def test_legacy_non_dynamic_path_preserves_enqueue_for_isolated_callers() -> None:
     queue = FakeTaskQueue()
     # Non-dynamic mode: candidate_finder is None
-    submit_task = SubmitTask(queue, candidate_finder=None)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=None)
     task = await submit_task.execute("Process legacy task")
 
     assert len(queue.enqueued) == 1
@@ -646,21 +653,26 @@ async def test_legacy_non_dynamic_path_preserves_enqueue_for_isolated_callers() 
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    gateway._client.set = AsyncMock()
-    gateway._client.rpush = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
 
     task = TaskRequested.create("Execute runtime task")
     target = "agent.tasks.custom-executor-1"
 
     await gateway.dispatch(task, target=target)
 
-    # Sets status: pending
-    gateway._client.set.assert_awaited_once_with(
+    # Sets status: pending and pushes to target via atomic pipeline
+    mock_pipe.set.assert_called_once_with(
         f"task.status:{task.task_id}",
         json.dumps({"task_id": task.task_id, "status": "pending"}),
     )
-    # Pushes to advertised target
-    gateway._client.rpush.assert_awaited_once_with(target, task.to_json())
+    mock_pipe.rpush.assert_called_once_with(target, task.to_json())
+    mock_pipe.execute.assert_awaited_once()
 
 
 @pytest.mark.anyio

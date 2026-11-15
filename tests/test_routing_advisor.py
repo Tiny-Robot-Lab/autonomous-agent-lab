@@ -303,7 +303,7 @@ def test_routing_provenance_round_trip_serialization() -> None:
 async def test_1_explicit_override_never_calls_advisor() -> None:
     advisor = RecordingAdvisor()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, queue=queue, advisor=advisor)
 
     # Even on ambiguous prompt, explicit override must bypass router and advisor
     await use_case.execute(
@@ -317,7 +317,7 @@ async def test_1_explicit_override_never_calls_advisor() -> None:
 async def test_2_clear_general_never_calls_advisor() -> None:
     advisor = RecordingAdvisor()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, queue=queue, advisor=advisor)
 
     await use_case.execute("Calculate the sum of [1, 2, 3, 4, 5]")
     assert len(advisor.calls) == 0
@@ -327,7 +327,7 @@ async def test_2_clear_general_never_calls_advisor() -> None:
 async def test_3_clear_research_never_calls_advisor() -> None:
     advisor = RecordingAdvisor()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, queue=queue, advisor=advisor)
 
     await use_case.execute("Search for the latest news and updates on Python 3.13 release")
     assert len(advisor.calls) == 0
@@ -337,7 +337,7 @@ async def test_3_clear_research_never_calls_advisor() -> None:
 async def test_4_ambiguous_assessment_calls_advisor_once_when_configured() -> None:
     advisor = RecordingAdvisor()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, queue=queue, advisor=advisor)
 
     prompt = "Tell me about quantum computing advancements"
     await use_case.execute(prompt)
@@ -351,7 +351,7 @@ async def test_4_ambiguous_assessment_calls_advisor_once_when_configured() -> No
 async def test_5_no_configured_advisor_preserves_provisional_capability() -> None:
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
-    use_case = SubmitTask(queue=queue, routing_recorder=recorder, advisor=None)
+    use_case = SubmitTask(task_store=queue, queue=queue, routing_recorder=recorder, advisor=None)
 
     prompt = "Tell me about quantum computing advancements"
     await use_case.execute(prompt)
@@ -389,7 +389,7 @@ async def test_6_advisor_recommendation_can_change_general_to_research() -> None
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
-        router=router, queue=queue, routing_recorder=recorder, advisor=advisor
+        task_store=queue, router=router, queue=queue, routing_recorder=recorder, advisor=advisor
     )
 
     await use_case.execute("Investigate the architecture trade-offs")
@@ -428,7 +428,7 @@ async def test_7_advisor_recommendation_can_change_research_to_general() -> None
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
-        router=router, queue=queue, routing_recorder=recorder, advisor=advisor
+        task_store=queue, router=router, queue=queue, routing_recorder=recorder, advisor=advisor
     )
 
     await use_case.execute("Summarize recent thoughts on clean architecture")
@@ -460,7 +460,7 @@ async def test_8_advisor_agreement_preserves_capability() -> None:
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
-        router=router, queue=queue, routing_recorder=recorder, advisor=advisor
+        task_store=queue, router=router, queue=queue, routing_recorder=recorder, advisor=advisor
     )
 
     await use_case.execute("Some borderline research inquiry")
@@ -488,7 +488,7 @@ async def test_9_advisor_unavailable_falls_back_to_provisional() -> None:
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
-        router=router, queue=queue, routing_recorder=recorder, advisor=advisor
+        task_store=queue, router=router, queue=queue, routing_recorder=recorder, advisor=advisor
     )
 
     await use_case.execute("Some borderline inquiry")
@@ -525,7 +525,7 @@ async def test_10_advisor_timeout_and_failure_fall_back_to_provisional(
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
-        router=router, queue=queue, routing_recorder=recorder, advisor=advisor
+        task_store=queue, router=router, queue=queue, routing_recorder=recorder, advisor=advisor
     )
 
     await use_case.execute("Some borderline inquiry")
@@ -553,8 +553,9 @@ async def test_11_invalid_recommendation_raises_type_error() -> None:
         reason="Borderline prompt",
     )
     router = StubAssessingRouter(ambiguous_assessment)
+    queue = FakeTaskQueue()
     use_case = SubmitTask(
-        router=router, queue=FakeTaskQueue(), advisor=BrokenAdvisor()
+        task_store=queue, router=router, queue=queue, advisor=BrokenAdvisor()
     )
 
     with pytest.raises(TypeError, match="must return AdvisorRecommendation"):
@@ -582,6 +583,7 @@ async def test_12_candidate_discovery_receives_final_resolved_capability() -> No
     )
     queue = FakeTaskQueue()
     use_case = SubmitTask(
+        task_store=queue,
         router=router,
         candidate_finder=finder,
         queue=queue,
@@ -614,6 +616,7 @@ async def test_13_availability_check_uses_final_resolved_capability() -> None:
     )
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
+        task_store=FakeTaskQueue(),
         router=router,
         candidate_finder=finder,
         routing_recorder=recorder,
@@ -654,6 +657,7 @@ async def test_14_dispatch_behavior_remains_unchanged() -> None:
     )
     queue = FakeTaskQueue()
     use_case = SubmitTask(
+        task_store=queue,
         router=router,
         candidate_finder=finder,
         queue=queue,
@@ -692,6 +696,7 @@ async def test_15_explicit_override_remains_higher_authority_than_advisor() -> N
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
+        task_store=queue,
         router=router,
         candidate_finder=finder,
         queue=queue,
@@ -719,6 +724,7 @@ async def test_16_route_only_legacy_test_doubles_remain_compatible() -> None:
     queue = FakeTaskQueue()
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
+        task_store=queue,
         router=legacy_router,
         queue=queue,
         routing_recorder=recorder,
@@ -755,7 +761,7 @@ async def test_17_advisor_never_receives_clear_assessments() -> None:
     advisor = StrictAdvisor()
     router = DeterministicCapabilityRouter()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(router=router, queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, router=router, queue=queue, advisor=advisor)
 
     clear_prompts = [
         "Calculate the sum of [1, 2, 3]",
@@ -786,7 +792,7 @@ async def test_18_prompt_and_complete_routing_assessment_passed_unchanged() -> N
     router = StubAssessingRouter(assessment)
     advisor = RecordingAdvisor()
     queue = FakeTaskQueue()
-    use_case = SubmitTask(router=router, queue=queue, advisor=advisor)
+    use_case = SubmitTask(task_store=queue, router=router, queue=queue, advisor=advisor)
 
     test_prompt = "Study the behavior of sorting algorithms"
     await use_case.execute(test_prompt)
@@ -806,8 +812,9 @@ async def test_19_provenance_distinguishes_deterministic_advised_fallback_and_ov
     recorder = FakeRoutingRecorder()
 
     # 1. Explicit override
+    queue_override = FakeTaskQueue()
     use_case_override = SubmitTask(
-        router=router, queue=FakeTaskQueue(), routing_recorder=recorder
+        task_store=queue_override, router=router, queue=queue_override, routing_recorder=recorder
     )
     await use_case_override.execute(
         "Any prompt", capability=AgentCapability.RESEARCH
@@ -817,8 +824,9 @@ async def test_19_provenance_distinguishes_deterministic_advised_fallback_and_ov
     assert override_prov.advisor_consulted is False
 
     # 2. Clear deterministic
+    queue_clear = FakeTaskQueue()
     use_case_clear = SubmitTask(
-        router=router, queue=FakeTaskQueue(), routing_recorder=recorder
+        task_store=queue_clear, router=router, queue=queue_clear, routing_recorder=recorder
     )
     await use_case_clear.execute("Calculate 1 + 1")
     clear_prov = RoutingProvenance.from_dict(recorder.recorded[-1].provenance)
@@ -847,9 +855,11 @@ async def test_19_provenance_distinguishes_deterministic_advised_fallback_and_ov
             reason="Advisor resolved to research",
         )
     )
+    queue_changed = FakeTaskQueue()
     use_case_changed = SubmitTask(
+        task_store=queue_changed,
         router=stub_router,
-        queue=FakeTaskQueue(),
+        queue=queue_changed,
         routing_recorder=recorder,
         advisor=advisor_changed,
     )
@@ -867,9 +877,11 @@ async def test_19_provenance_distinguishes_deterministic_advised_fallback_and_ov
     advisor_fallback = RecordingAdvisor(
         error_to_raise=AdvisorTimeoutError("Timed out")
     )
+    queue_fallback = FakeTaskQueue()
     use_case_fallback = SubmitTask(
+        task_store=queue_fallback,
         router=stub_router,
-        queue=FakeTaskQueue(),
+        queue=queue_fallback,
         routing_recorder=recorder,
         advisor=advisor_fallback,
     )
@@ -901,6 +913,7 @@ async def test_20_no_candidate_rejection_preserves_provenance() -> None:
     finder = FakeCandidateFinder(candidates_by_capability={})
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
+        task_store=FakeTaskQueue(),
         router=stub_router,
         candidate_finder=finder,
         routing_recorder=recorder,
@@ -943,6 +956,7 @@ async def test_21_dispatch_failure_preserves_provenance() -> None:
     )
     recorder = FakeRoutingRecorder()
     use_case = SubmitTask(
+        task_store=FakeTaskQueue(),
         router=stub_router,
         candidate_finder=finder,
         dispatcher=FailingDispatcher(),
@@ -1038,9 +1052,11 @@ async def test_24_async_advisor_awaited_directly_rejects_sync_callable() -> None
         reason="Ambiguous",
     )
     stub_router = StubAssessingRouter(ambiguous_assessment)
+    queue = FakeTaskQueue()
     use_case = SubmitTask(
+        task_store=queue,
         router=stub_router,
-        queue=FakeTaskQueue(),
+        queue=queue,
         advisor=SyncAdvisor(),  # type: ignore[arg-type]
     )
 
