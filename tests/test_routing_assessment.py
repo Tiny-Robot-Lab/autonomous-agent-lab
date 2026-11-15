@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-from agent_contracts import TaskRequested
 from orchestrator.application.ports import AssessingCapabilityRouter
 from orchestrator.application.use_cases import SubmitTask
 from orchestrator.domain.assessment import (
@@ -18,18 +17,7 @@ from orchestrator.domain.assessment import (
 from orchestrator.domain.capability import AgentCapability
 from orchestrator.domain.router import DeterministicCapabilityRouter
 
-
-class FakeTaskQueue:
-    def __init__(self) -> None:
-        self.enqueued: list[tuple[TaskRequested, AgentCapability]] = []
-
-    async def enqueue(
-        self,
-        task: TaskRequested,
-        capability: AgentCapability = AgentCapability.GENERAL,
-        target: str | None = None,
-    ) -> None:
-        self.enqueued.append((task, capability))
+from tests.test_application import FakeTaskQueue
 
 
 class TestRoutingDomainContract:
@@ -587,7 +575,7 @@ class TestSubmitTaskAssessingProtocol:
         router = DeterministicCapabilityRouter()
         assert isinstance(router, AssessingCapabilityRouter)
 
-        submit = SubmitTask(queue=queue, router=router)
+        submit = SubmitTask(task_store=queue, queue=queue, router=router)
         await submit.execute("What version of Redis is currently supported by the latest Ubuntu LTS release?")
         assert len(queue.enqueued) == 1
         _, cap = queue.enqueued[0]
@@ -599,7 +587,7 @@ class TestSubmitTaskAssessingProtocol:
         router = RouteOnlyTestDouble()
         assert not isinstance(router, AssessingCapabilityRouter)
 
-        submit = SubmitTask(queue=queue, router=router)  # type: ignore[arg-type]
+        submit = SubmitTask(task_store=queue, queue=queue, router=router)  # type: ignore[arg-type]
         await submit.execute("please research this")
         assert len(queue.enqueued) == 1
         _, cap = queue.enqueued[0]
@@ -615,7 +603,7 @@ class TestSubmitTaskAssessingProtocol:
                 return "not_a_routing_assessment"
 
         queue = FakeTaskQueue()
-        submit = SubmitTask(queue=queue, router=BrokenAssessingRouter())  # type: ignore[arg-type]
+        submit = SubmitTask(task_store=queue, queue=queue, router=BrokenAssessingRouter())  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="must return RoutingAssessment"):
             await submit.execute("some prompt")
 
@@ -639,6 +627,7 @@ class TestSubmitTaskAssessingProtocol:
 
         router = DeterministicCapabilityRouter()
         submit = SubmitTask(
+            task_store=FakeTaskQueue(),
             router=router,
             candidate_finder=finder,
             dispatcher=dispatcher,
@@ -677,7 +666,7 @@ class TestSubmitTaskExplicitOverride:
     @pytest.mark.anyio
     async def test_explicit_override_bypasses_router_inference(self) -> None:
         queue = FakeTaskQueue()
-        submit_task = SubmitTask(queue=queue)
+        submit_task = SubmitTask(task_store=queue, queue=queue)
 
         # Clear research prompt explicitly forced to GENERAL
         task = await submit_task.execute(
@@ -711,6 +700,7 @@ class TestSubmitTaskExplicitOverride:
         recorder.record_routing_decision = AsyncMock()
 
         submit_task = SubmitTask(
+            task_store=FakeTaskQueue(),
             candidate_finder=finder,
             dispatcher=dispatcher,
             routing_recorder=recorder,

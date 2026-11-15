@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from agent_contracts import TaskRequested
+from orchestrator.application.ports import AuthoritativeTaskStore
 from orchestrator.application.queries import (
     GetAgentStates,
     GetRecentEvents,
@@ -9,12 +10,50 @@ from orchestrator.application.queries import (
 )
 from orchestrator.application.use_cases import SubmitTask
 from orchestrator.domain.capability import AgentCapability
+from orchestrator.domain.task import TaskLineage
 
 
-class FakeTaskQueue:
+class FakeTaskQueue(AuthoritativeTaskStore):
     def __init__(self) -> None:
         self.enqueued: list[tuple[TaskRequested, AgentCapability]] = []
         self.dispatches: list[tuple[TaskRequested, str]] = []
+        self.statuses: dict[str, str] = {}
+        self.lineages: dict[str, TaskLineage] = {}
+        self.children: dict[str, set[str]] = {}
+
+    async def register_root_task(
+        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+    ) -> None:
+        self.statuses[task.task_id] = initial_status
+        self.lineages[task.task_id] = TaskLineage(
+            task_id=task.task_id,
+            root_task_id=task.root_task_id,
+            parent_task_id=None,
+        )
+
+    async def register_child_task(
+        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+    ) -> None:
+        self.statuses[task.task_id] = initial_status
+        self.lineages[task.task_id] = TaskLineage(
+            task_id=task.task_id,
+            root_task_id=task.root_task_id,
+            parent_task_id=task.parent_task_id,
+        )
+        if task.parent_task_id:
+            self.children.setdefault(task.parent_task_id, set()).add(task.task_id)
+
+    async def get_lineage(self, task_id: str) -> TaskLineage | None:
+        return self.lineages.get(task_id.strip())
+
+    async def get_children(self, parent_task_id: str) -> list[str]:
+        return sorted(self.children.get(parent_task_id.strip(), set()))
+
+    async def update_status(self, task_id: str, status: str) -> None:
+        self.statuses[task_id.strip()] = status.strip()
+
+    async def get_status(self, task_id: str) -> str | None:
+        return self.statuses.get(task_id.strip())
 
     async def enqueue(
         self,
@@ -32,6 +71,7 @@ class FakeTaskQueue:
             AgentCapability.RESEARCH if "research" in target else AgentCapability.GENERAL
         )
         self.enqueued.append((task, capability))
+        self.statuses[task.task_id] = "pending"
 
 
 class FakeStateReader:
@@ -176,7 +216,7 @@ class FakeResultReader:
 @pytest.mark.anyio
 async def test_submit_task_use_case() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
     task = await use_case.execute("test task prompt")
 
     assert task.prompt == "test task prompt"
@@ -225,7 +265,7 @@ async def test_get_recent_events_bounds_limits() -> None:
 @pytest.mark.anyio
 async def test_submit_research_task_routes_to_research_capability() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
 
     task = await use_case.execute(
         "Compare local and cloud LLMs",
@@ -243,7 +283,7 @@ async def test_submit_research_task_routes_to_research_capability() -> None:
 @pytest.mark.anyio
 async def test_submit_task_automatic_routing_research() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
 
     # Under Phase B routing policy, genuine research prompts require external retrieval/freshness/source evidence rather than weak verbs alone
     task = await use_case.execute("Compare current features and pricing of local and cloud LLMs")
@@ -257,7 +297,7 @@ async def test_submit_task_automatic_routing_research() -> None:
 @pytest.mark.anyio
 async def test_submit_task_automatic_routing_general() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
 
     task = await use_case.execute("build agent")
 
@@ -270,7 +310,7 @@ async def test_submit_task_automatic_routing_general() -> None:
 @pytest.mark.anyio
 async def test_submit_task_routing_v2_freshness_and_explanatory() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
 
     # Freshness prompt automatically resolves to RESEARCH
     task_research = await use_case.execute(
@@ -289,7 +329,7 @@ async def test_submit_task_routing_v2_freshness_and_explanatory() -> None:
 @pytest.mark.anyio
 async def test_submit_task_preserves_explicit_capability_override() -> None:
     queue = FakeTaskQueue()
-    use_case = SubmitTask(queue)
+    use_case = SubmitTask(task_store=queue, queue=queue)
 
     # Research prompt explicitly directed to GENERAL
     task1 = await use_case.execute(
@@ -320,7 +360,7 @@ class FakeCapabilityRouter:
 async def test_submit_task_uses_injected_router() -> None:
     queue = FakeTaskQueue()
     fake_router = FakeCapabilityRouter(AgentCapability.RESEARCH)
-    use_case = SubmitTask(queue, router=fake_router)
+    use_case = SubmitTask(task_store=queue, queue=queue, router=fake_router)
 
     # Non-research prompt routed to RESEARCH via injected router
     task = await use_case.execute("simple task")

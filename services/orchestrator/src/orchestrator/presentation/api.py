@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from orchestrator.application.ports import (
+    AuthoritativeTaskStore,
     CandidateFinder,
     CapabilityRouter,
     EventPublisher,
@@ -148,20 +149,45 @@ def create_app(
     enforce_availability: bool | None = None,
     selection_policy: CandidateSelectionPolicy | None = None,
     routing_recorder: RoutingRecorder | None = None,
+    task_store: AuthoritativeTaskStore | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
 
-    if (
-        gateway is None
-        and task_queue is None
-        and dispatcher is None
-        and state_reader is None
-        and result_reader is None
-    ):
+    # 1. Gateway resolution
+    # In default production composition (or when neither task_store, dispatcher, nor task_queue
+    # is provided), create exactly one RedisGateway used coherently across all ports.
+    # When an explicit task_store, dispatcher, or task_queue identifies the backend,
+    # do not auto-create an extra RedisGateway.
+    if gateway is None and task_store is None and dispatcher is None and task_queue is None:
         gateway = RedisGateway(resolved_settings.redis_url)
 
-    queue = task_queue or gateway
+    # 2. AuthoritativeTaskStore linear resolution
+    if task_store is not None:
+        resolved_task_store: AuthoritativeTaskStore | None = task_store
+    elif isinstance(gateway, AuthoritativeTaskStore):
+        resolved_task_store = gateway
+    elif isinstance(task_queue, AuthoritativeTaskStore):
+        resolved_task_store = task_queue
+    elif isinstance(dispatcher, AuthoritativeTaskStore):
+        resolved_task_store = dispatcher
+    else:
+        resolved_task_store = None
+
+    if resolved_task_store is None:
+        raise TypeError(
+            "create_app requires an AuthoritativeTaskStore (e.g., via task_store, gateway, or an adapter implementing AuthoritativeTaskStore)"
+        )
+
+    # 3. Dispatch / Queue linear resolution
     dispatch_client = dispatcher or (gateway if isinstance(gateway, TaskDispatcher) else None)
+    queue = task_queue or (gateway if isinstance(gateway, TaskQueue) else None)
+
+    if dispatch_client is None and queue is None:
+        raise TypeError(
+            "create_app requires a dispatch path (e.g., via gateway, dispatcher, or task_queue)"
+        )
+
+    # 4. State reader, result reader, events, and routing recorder resolution
     reader = state_reader or gateway
     results = result_reader or gateway or NoOpResultReader()
     events_out = event_publisher or gateway
@@ -177,6 +203,7 @@ def create_app(
     find_candidates_query = resolved_finder or (FindCandidatesByCapability(reader) if reader else None)
 
     submit_task = SubmitTask(
+        task_store=resolved_task_store,
         queue=queue,
         dispatcher=dispatch_client,
         router=router,

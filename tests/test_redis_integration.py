@@ -13,6 +13,7 @@ from agent_contracts import (
     TaskRequested,
     TaskResult,
 )
+from orchestrator.domain.task import TaskLineage
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from research_agent.domain.models import ResearchResult
@@ -286,3 +287,141 @@ async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:
     finally:
         await gateway.aclose()
         await bus.aclose()
+
+
+async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
+    clean_redis: str,
+) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        root_task = TaskRequested.create("Root task for Redis integration lifecycle")
+
+        # 1. Authoritative registration establishes pending_dispatch and lineage
+        await gateway.register_root_task(root_task)
+
+        status = await gateway.get_status(root_task.task_id)
+        assert status == "pending_dispatch"
+
+        lineage = await gateway.get_lineage(root_task.task_id)
+        assert lineage is not None
+        assert isinstance(lineage, TaskLineage)
+        assert lineage.task_id == root_task.task_id
+        assert lineage.root_task_id == root_task.task_id
+        assert lineage.parent_task_id is None
+        assert lineage.is_root is True
+
+        # 2. Atomic dispatch pushes to target queue and sets status to pending
+        dispatch_target = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
+        await gateway.dispatch(root_task, dispatch_target)
+
+        dispatched_status = await gateway.get_status(root_task.task_id)
+        assert dispatched_status == "pending"
+
+        # Verify queue content in Redis
+        queued_items = await gateway._client.lrange(dispatch_target, 0, -1)
+        assert len(queued_items) == 1
+        enqueued_payload = json.loads(queued_items[0])
+        assert enqueued_payload["task_id"] == root_task.task_id
+        assert enqueued_payload["root_task_id"] == root_task.task_id
+        assert enqueued_payload["parent_task_id"] is None
+        assert enqueued_payload["version"] == 2
+
+        # 3. Update status transition
+        await gateway.update_status(root_task.task_id, "completed")
+        completed_status = await gateway.get_status(root_task.task_id)
+        assert completed_status == "completed"
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        root_task = TaskRequested.create("Root task for child atomicity test")
+        await gateway.register_root_task(root_task)
+
+        child_id = f"child_{uuid.uuid4().hex[:8]}"
+        child_task = TaskRequested(
+            task_id=child_id,
+            prompt="Child task for atomicity test",
+            root_task_id=root_task.task_id,
+            parent_task_id=root_task.task_id,
+            version=2,
+        )
+
+        # 1. Authoritative child registration
+        await gateway.register_child_task(child_task)
+
+        # Verify child lineage
+        child_lineage = await gateway.get_lineage(child_id)
+        assert child_lineage is not None
+        assert isinstance(child_lineage, TaskLineage)
+        assert child_lineage.task_id == child_id
+        assert child_lineage.root_task_id == root_task.task_id
+        assert child_lineage.parent_task_id == root_task.task_id
+        assert child_lineage.is_root is False
+
+        # Verify child status
+        child_status = await gateway.get_status(child_id)
+        assert child_status == "pending_dispatch"
+
+        # Verify parent index set contains child
+        children = await gateway.get_children(root_task.task_id)
+        assert children == [child_id]
+
+        # 2. Rejection of invalid tasks
+        with pytest.raises(ValueError, match="not a root task"):
+            await gateway.register_root_task(child_task)
+
+        with pytest.raises(ValueError, match="not a child task"):
+            await gateway.register_child_task(root_task)
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_deterministic_sorted_get_children_retrieval(
+    clean_redis: str,
+) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        root_task = TaskRequested.create("Root task for sorted children test")
+        await gateway.register_root_task(root_task)
+
+        # Register children in deliberately unsorted order
+        child_ids = [
+            f"child_z_{uuid.uuid4().hex[:6]}",
+            f"child_a_{uuid.uuid4().hex[:6]}",
+            f"child_m_{uuid.uuid4().hex[:6]}",
+        ]
+        for cid in child_ids:
+            child = TaskRequested(
+                task_id=cid,
+                prompt=f"Child prompt for {cid}",
+                root_task_id=root_task.task_id,
+                parent_task_id=root_task.task_id,
+                version=2,
+            )
+            await gateway.register_child_task(child)
+
+        # Verify retrieval is strictly sorted lexicographically
+        retrieved_children = await gateway.get_children(root_task.task_id)
+        assert retrieved_children == sorted(child_ids)
+
+        # Verify set membership duplicate safety
+        # Re-registering existing child should not duplicate in SADD
+        first_child = TaskRequested(
+            task_id=child_ids[0],
+            prompt="Duplicate registration test",
+            root_task_id=root_task.task_id,
+            parent_task_id=root_task.task_id,
+            version=2,
+        )
+        await gateway.register_child_task(first_child)
+        retrieved_after_duplicate = await gateway.get_children(root_task.task_id)
+        assert retrieved_after_duplicate == sorted(child_ids)
+
+        # Unknown parent returns empty list
+        empty_children = await gateway.get_children("nonexistent-parent-task-id")
+        assert empty_children == []
+    finally:
+        await gateway.aclose()

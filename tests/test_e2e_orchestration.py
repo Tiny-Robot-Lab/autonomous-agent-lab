@@ -8,7 +8,7 @@ unavailable capability handling -> runtime failover -> observability.
 
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import pytest
@@ -109,6 +109,42 @@ class InMemoryRedis:
         return s[:count] if count is not None else s
 
     async def aclose(self) -> None:
+        pass
+
+    def pipeline(self, transaction: bool = True) -> "InMemoryPipeline":
+        return InMemoryPipeline(self)
+
+
+class InMemoryPipeline:
+    def __init__(self, store: InMemoryRedis) -> None:
+        self._store = store
+        self._ops: list[tuple[Any, tuple, dict]] = []
+
+    def set(self, key: str, value: str) -> None:
+        self._ops.append((self._store.set, (key, value), {}))
+
+    def rpush(self, key: str, *values: str) -> None:
+        self._ops.append((self._store.rpush, (key, *values), {}))
+
+    def sadd(self, key: str, *members: str) -> None:
+        self._ops.append((self._store.sadd, (key, *members), {}))
+
+    async def execute(self) -> list[Any]:
+        results = []
+        for fn, args, kwargs in self._ops:
+            results.append(await fn(*args, **kwargs))
+        self._ops.clear()
+        return results
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         pass
 
 

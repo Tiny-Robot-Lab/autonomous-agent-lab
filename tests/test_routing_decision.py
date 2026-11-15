@@ -207,6 +207,7 @@ async def test_submit_task_records_routing_decision_on_dynamic_dispatch() -> Non
     finder = FakeCandidateFinder({"general": [candidate]})
 
     submit_task = SubmitTask(
+        task_store=queue,
         queue=queue,
         candidate_finder=finder,
         routing_recorder=recorder,
@@ -236,6 +237,7 @@ async def test_submit_task_records_routing_decision_for_research_intent() -> Non
     finder = FakeCandidateFinder({"research": [candidate]})
 
     submit_task = SubmitTask(
+        task_store=queue,
         queue=queue,
         candidate_finder=finder,
         routing_recorder=recorder,
@@ -265,6 +267,7 @@ async def test_submit_task_records_routing_decision_on_unavailable_capability() 
     finder = FakeCandidateFinder({"research": []})
 
     submit_task = SubmitTask(
+        task_store=queue,
         queue=queue,
         candidate_finder=finder,
         events=events,
@@ -294,6 +297,7 @@ async def test_submit_task_records_routing_decision_on_legacy_fallback() -> None
     recorder = FakeRoutingRecorder()
 
     submit_task = SubmitTask(
+        task_store=queue,
         queue=queue,
         candidate_finder=None,
         routing_recorder=recorder,
@@ -426,6 +430,7 @@ async def test_task_routing_endpoint_success_and_not_found() -> None:
 
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_queue=FakeTaskQueue(),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})

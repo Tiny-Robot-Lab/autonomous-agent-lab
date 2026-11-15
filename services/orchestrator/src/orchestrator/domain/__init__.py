@@ -35,7 +35,12 @@ from .router import (
     ResearchIntentCategory,
 )
 from .selection import CandidateSelectionPolicy, DeterministicSelectionPolicy
-from .task import Task
+from .task import (
+    DelegationDepthExceededError,
+    ParentTaskNotFoundError,
+    Task,
+    TaskLineage,
+)
 
 __all__ = [
     "DEFAULT_RESEARCH_KEYWORDS",
@@ -54,9 +59,11 @@ __all__ = [
     "AgentHeartbeat",
     "CandidateSelectionPolicy",
     "CapabilityUnavailableError",
+    "DelegationDepthExceededError",
     "DeterministicCapabilityRouter",
     "DeterministicSelectionPolicy",
     "LivenessPolicy",
+    "ParentTaskNotFoundError",
     "ResearchIntentCategory",
     "RoutingAssessment",
     "RoutingClarity",
@@ -64,6 +71,7 @@ __all__ = [
     "RoutingSignalType",
     "SignalStrength",
     "Task",
+    "TaskLineage",
     "evaluate_agent_record",
     "evaluate_availability",
     "parse_timestamp",

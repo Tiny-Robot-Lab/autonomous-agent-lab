@@ -82,7 +82,7 @@ async def test_general_submission_succeeds_when_eligible_general_candidate_exist
         {"general": [make_candidate("worker-1", "general")]}
     )
     events = FakeEventPublisher()
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     task = await submit_task.execute("Explain the difference between containers and VMs")
 
@@ -102,7 +102,7 @@ async def test_research_submission_succeeds_when_eligible_research_candidate_exi
         {"research": [make_candidate("research-1", "research")]}
     )
     events = FakeEventPublisher()
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     task = await submit_task.execute(
         "Research quantum key distribution breakthroughs",
@@ -125,7 +125,7 @@ async def test_automatically_resolved_capability_is_checked_for_availability() -
         {"general": [make_candidate("worker-1", "general")]}
     )
     events = FakeEventPublisher()
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         # Phase B requires external retrieval/freshness/source evidence rather than weak verbs alone
@@ -150,7 +150,7 @@ async def test_explicit_capability_override_is_checked_for_availability() -> Non
         {"general": [make_candidate("worker-1", "general")]}
     )
     events = FakeEventPublisher()
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute(
@@ -168,7 +168,7 @@ async def test_missing_capability_candidate_produces_structured_rejection() -> N
     queue = FakeTaskQueue()
     finder = FakeCandidateFinder({})  # Zero candidates for any capability
     events = FakeEventPublisher()
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute("Simple prompt")
@@ -199,7 +199,7 @@ async def test_only_busy_matching_agents_produces_rejection() -> None:
         ]
     )
     finder = FindCandidatesByCapability(reader)
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute("Simple general task")
@@ -226,7 +226,7 @@ async def test_only_stale_matching_agents_produces_rejection() -> None:
         ]
     )
     finder = FindCandidatesByCapability(reader)
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute("Simple general task")
@@ -253,7 +253,7 @@ async def test_only_offline_matching_agents_produces_rejection() -> None:
         ]
     )
     finder = FindCandidatesByCapability(reader)
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute("Simple general task")
@@ -267,7 +267,7 @@ async def test_only_offline_matching_agents_produces_rejection() -> None:
 async def test_rejected_tasks_are_not_enqueued() -> None:
     queue = FakeTaskQueue()
     finder = FakeCandidateFinder({})
-    submit_task = SubmitTask(queue, candidate_finder=finder)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder)
 
     for cap in (AgentCapability.GENERAL, AgentCapability.RESEARCH):
         with pytest.raises(CapabilityUnavailableError):
@@ -282,7 +282,7 @@ async def test_operational_unavailable_capability_event_is_emitted() -> None:
     queue = FakeTaskQueue()
     events = FakeEventPublisher()
     finder = FakeCandidateFinder({})
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     with pytest.raises(CapabilityUnavailableError) as exc_info:
         await submit_task.execute(
@@ -307,7 +307,7 @@ async def test_successful_submissions_retain_existing_enqueue_behavior() -> None
     finder = FakeCandidateFinder(
         {"general": [make_candidate("worker-1", "general")]}
     )
-    submit_task = SubmitTask(queue, candidate_finder=finder, events=events)
+    submit_task = SubmitTask(task_store=queue, queue=queue, candidate_finder=finder, events=events)
 
     msg = await submit_task.execute("Hello World")
 
