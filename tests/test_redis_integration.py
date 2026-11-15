@@ -414,6 +414,7 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
         first_child = TaskRequested(
             task_id=child_ids[0],
             prompt="Duplicate registration test",
+            created_at="2026-11-15T00:00:00+00:00",
             root_task_id=root_task.task_id,
             parent_task_id=root_task.task_id,
             version=2,
