@@ -25,6 +25,8 @@ def test_task_accepts_prompt() -> None:
         "Conduct a literature review of retrieval-augmented generation",
         "Deep dive into EV battery recycling technologies",
         "Find the published benchmarks comparing redis throughput",
+        "Research the current advantages and limitations of small local LLMs compared with cloud-hosted LLMs",
+        "Research consensus algorithms",
         "Survey available vector databases as of today",
         "Find recent CVEs for fault recovery models",
         "Provide citations for latency tradeoffs",
@@ -39,7 +41,6 @@ def test_deterministic_router_routes_research_prompts(prompt: str) -> None:
 @pytest.mark.parametrize(
     "prompt",
     [
-        "Research consensus algorithms",
         "Investigate distributed state synchronization",
         "Analyze data portability across clouds",
         "Research",

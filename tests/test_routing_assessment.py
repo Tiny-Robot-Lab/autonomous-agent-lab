@@ -134,7 +134,6 @@ class TestDeterministicAssessmentPolicy:
             "Research",
             "Compare",
             "Investigate",
-            "Research consensus algorithms",
             "Investigate distributed state synchronization",
             "Analyze data portability across clouds",
             "Compare local and cloud LLMs",
@@ -472,11 +471,6 @@ class TestDeterministicAssessmentPolicy:
                 AgentCapability.GENERAL,
                 RoutingClarity.CLEAR,
             ),
-            (
-                "Research consensus algorithms.",
-                AgentCapability.GENERAL,
-                RoutingClarity.AMBIGUOUS,
-            ),
         ],
     )
     def test_explicit_sources_and_citations_negative_regressions(
@@ -489,6 +483,89 @@ class TestDeterministicAssessmentPolicy:
         assessment = router.assess(prompt)
         assert assessment.provisional_capability == expected_capability
         assert assessment.clarity == expected_clarity
+        assert router.route(prompt) == expected_capability
+
+
+class TestImperativeResearchDirective:
+    """Bare direct imperative "Research ..." at prompt start is a strong Research signal."""
+
+    @pytest.fixture
+    def router(self) -> DeterministicCapabilityRouter:
+        return DeterministicCapabilityRouter()
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "Research the current advantages and limitations of small local LLMs compared with cloud-hosted LLMs.",
+            "Research consensus algorithms.",
+            "Research consensus algorithms in distributed systems",
+            "  Research the current advantages and limitations of small local LLMs compared with cloud-hosted LLMs.",
+            "Research: current advantages and limitations of small local LLMs compared with cloud-hosted LLMs.",
+        ],
+    )
+    def test_imperative_research_directive_routes_to_research(
+        self, router: DeterministicCapabilityRouter, prompt: str
+    ) -> None:
+        assessment = router.assess(prompt)
+
+        assert assessment.provisional_capability == AgentCapability.RESEARCH
+        assert assessment.clarity == RoutingClarity.CLEAR
+        assert any(
+            signal.signal_type == RoutingSignalType.EXPLICIT_RESEARCH_DIRECTIVE
+            and signal.strength == SignalStrength.STRONG
+            for signal in assessment.signals
+        )
+        assert router.route(prompt) == AgentCapability.RESEARCH
+
+    @pytest.mark.parametrize(
+        ("prompt", "expected_capability", "expected_clarity"),
+        [
+            (
+                "Explain what a research paper is.",
+                AgentCapability.GENERAL,
+                RoutingClarity.AMBIGUOUS,
+            ),
+            (
+                "Rewrite this research summary.",
+                AgentCapability.GENERAL,
+                RoutingClarity.CLEAR,
+            ),
+            (
+                "Review this research code repository.",
+                AgentCapability.GENERAL,
+                RoutingClarity.AMBIGUOUS,
+            ),
+            (
+                "Research this function and explain why the loop never terminates.",
+                AgentCapability.GENERAL,
+                RoutingClarity.CLEAR,
+            ),
+            (
+                "Research",
+                AgentCapability.GENERAL,
+                RoutingClarity.AMBIGUOUS,
+            ),
+            (
+                "Please research the current advantages of small local LLMs.",
+                AgentCapability.GENERAL,
+                RoutingClarity.AMBIGUOUS,
+            ),
+        ],
+    )
+    def test_imperative_directive_negatives_and_guards(
+        self,
+        router: DeterministicCapabilityRouter,
+        prompt: str,
+        expected_capability: AgentCapability,
+        expected_clarity: RoutingClarity,
+    ) -> None:
+        assessment = router.assess(prompt)
+        assert assessment.provisional_capability == expected_capability
+        assert assessment.clarity == expected_clarity
+        assert not any(
+            signal.signal_type == RoutingSignalType.EXPLICIT_RESEARCH_DIRECTIVE
+            for signal in assessment.signals
+        )
         assert router.route(prompt) == expected_capability
 
 
@@ -568,17 +645,17 @@ class TestSubmitTaskAssessingProtocol:
             routing_recorder=recorder,
         )
 
-        # 1. "Research consensus algorithms" has weak verb alone -> provisionally GENERAL / AMBIGUOUS
+        # 1. "Research consensus algorithms" is a bare imperative directive -> RESEARCH / CLEAR
         assessment = router.assess("Research consensus algorithms")
-        assert assessment.provisional_capability == AgentCapability.GENERAL
-        assert assessment.clarity == RoutingClarity.AMBIGUOUS
+        assert assessment.provisional_capability == AgentCapability.RESEARCH
+        assert assessment.clarity == RoutingClarity.CLEAR
 
         await submit.execute("Research consensus algorithms")
         assert recorder.record_routing_decision.call_count == 1
-        decision_general = recorder.record_routing_decision.call_args[0][0]
-        # Persisted prompt classification must NOT claim a Research route!
-        assert decision_general.prompt_classification == "general"
-        assert decision_general.required_capabilities == ["general"]
+        decision_research = recorder.record_routing_decision.call_args[0][0]
+        # Persisted prompt classification must reflect the Research route.
+        assert decision_research.prompt_classification == "research_and_investigation"
+        assert decision_research.required_capabilities == ["research"]
 
         # 2. Strong research prompt -> RESEARCH / CLEAR
         recorder.record_routing_decision.reset_mock()

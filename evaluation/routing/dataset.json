@@ -403,5 +403,14 @@
     "rationale": "Explicit demand to cite external sources comparing concurrency control mechanisms requires research retrieval.",
     "category": "explicit_sources_evidence",
     "tags": ["citations", "sources", "concurrency"]
+  },
+  {
+    "id": "eval-046",
+    "prompt": "Research the current advantages and limitations of small local LLMs compared with cloud-hosted LLMs.",
+    "expected_capability": "research",
+    "clarity": "clear",
+    "rationale": "A bare direct imperative ('Research ...') at the start of the prompt is an explicit research request; no local-task evidence suppresses the directive.",
+    "category": "clear_research",
+    "tags": ["imperative_directive", "llm_comparison"]
   }
 ]
