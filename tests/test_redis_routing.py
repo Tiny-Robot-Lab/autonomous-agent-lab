@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import redis.asyncio as redis
-from agent_contracts import InferenceExecutionTelemetry, TaskRequested
+from agent_contracts import (
+    AgentCapabilityMetadata,
+    InferenceExecutionTelemetry,
+    TaskRequested,
+    TaskResult,
+)
+from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
 from orchestrator.domain.capability import AgentCapability
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 from research_agent.domain.models import ResearchResult
@@ -89,6 +95,60 @@ def test_redis_bus_defaults_to_general_queue() -> None:
 def test_redis_bus_custom_queue_configuration() -> None:
     bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
     assert bus.queue_name == "agent.tasks.research"
+
+
+def test_analysis_redis_bus_defaults_to_analysis_queue() -> None:
+    bus = AnalysisRedisBus("redis://localhost:6379/0")
+    assert bus.queue_name == "agent.tasks.analysis"
+
+
+@pytest.mark.anyio
+async def test_analysis_redis_bus_consumes_from_configured_queue() -> None:
+    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis")
+    task = TaskRequested.create("Analyze supplied material")
+    bus.client.blpop = AsyncMock(return_value=("agent.tasks.analysis", task.to_json()))
+
+    consumed = await bus.next_task()
+
+    assert consumed.task_id == task.task_id
+    assert consumed.prompt == "Analyze supplied material"
+    bus.client.blpop.assert_awaited_once_with("agent.tasks.analysis", timeout=2)
+
+
+@pytest.mark.anyio
+async def test_analysis_redis_bus_registers_metadata_and_persists_task_result() -> None:
+    bus = AnalysisRedisBus("redis://localhost:6379/0")
+    bus.client.sadd = AsyncMock()
+    bus.client.hset = AsyncMock()
+    bus.client.set = AsyncMock()
+    metadata = AgentCapabilityMetadata(
+        agent_id="analysis-agent-1",
+        agent_type="analysis-agent",
+        capabilities=["analysis"],
+        providers={"analysis_engine": "deterministic"},
+        dispatch_target="agent.tasks.analysis",
+    )
+    result = TaskResult(task_id="analysis-task", output="Analysis report")
+
+    await bus.register(metadata)
+    await bus.save(result)
+
+    bus.client.sadd.assert_awaited_once_with("agent.ids", "analysis-agent-1")
+    assert bus.client.hset.await_args.args[0] == "agent.state:analysis-agent-1"
+    assert bus.client.hset.await_args.kwargs["mapping"]["capabilities"] == '["analysis"]'
+    assert (
+        bus.client.hset.await_args.kwargs["mapping"]["dispatch_target"]
+        == "agent.tasks.analysis"
+    )
+    bus.client.set.assert_awaited_once()
+    key, raw_result = bus.client.set.await_args.args
+    assert key == "task.result:analysis-task"
+    assert json.loads(raw_result) == {
+        "task_id": "analysis-task",
+        "status": "completed",
+        "output": "Analysis report",
+        "acknowledged": True,
+    }
 
 
 @pytest.mark.anyio

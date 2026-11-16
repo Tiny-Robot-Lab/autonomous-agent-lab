@@ -1,12 +1,12 @@
-# Architecture Specification: Autonomous Agent Lab
+# Tiny Agent Lab Architecture
 
 ## 1. Project Purpose & System Context
 
-**Autonomous Agent Lab** is an independent, host-agnostic experimental testbed designed for research into:
+**Tiny Agent Lab** is an independent, host-agnostic experimental testbed designed for research into:
 * Autonomous agent state machines and lifecycles.
 * Asynchronous message-driven agent-to-agent communication and task dispatching.
 * Dynamic capability-based routing and candidate discovery with liveness evaluation.
-* Specialized multi-agent execution (General Worker and Grounded Research Agent).
+* Specialized multi-agent execution (General Worker, Grounded Research Agent, and an independently dispatch-targeted Analysis Agent).
 * Model Context Protocol (MCP) and tool integrations.
 * Persistent state storage, decision recording, and real-time observability.
 * Clean Architecture concentric boundaries and credential isolation.
@@ -26,13 +26,14 @@ This repository is completely greenfield and independent. It maintains no coupli
 
 ### Current Hosting Model
 * **Runtime Containerization**: Docker Compose (`compose.yaml`).
-* **Network Topology**: Single bridge network (`agent_net`) with port mapping for the presentation dashboard (`8080:8080`) and internal DNS routing (`orchestrator`, `worker`, `research-agent`, `redis`).
+* **Network Topology**: Single bridge network (`agent_net`) with port mapping for the presentation dashboard (`8080:8080`) and internal DNS routing (`orchestrator`, `worker`, `research-agent`, `analysis-agent`, `redis`).
 * **Container Inventory**:
   1. `orchestrator`: Presentation API and dynamic capability orchestration engine.
   2. `worker`: General computation agent (`worker-1`) consuming `agent.tasks.general`.
   3. `research-agent`: Specialized autonomous research agent (`research-agent-1`) consuming `agent.tasks.research`.
-  4. `redis`: Append-Only File (AOF) state, message queue, and stream hub (`redis:7-alpine`).
-  5. `cloudflared`: Optional secure tunnel container for zero-port-forward remote ingress.
+  4. `analysis-agent`: Deterministic structural analysis agent (`analysis-agent-1`) consuming `agent.tasks.analysis`.
+  5. `redis`: Append-Only File (AOF) state, message queue, and stream hub (`redis:7-alpine`).
+  6. `cloudflared`: Optional secure tunnel container for zero-port-forward remote ingress.
 
 ### External System Boundaries
 * **Tavily Search API**: Grounded web search retrieval (`https://api.tavily.com/search`).
@@ -46,9 +47,9 @@ The codebase strictly enforces Clean Architecture concentric layering with inwar
 
 ### Architectural Layering & Dependency Inversion
 
-1. **Domain Layer (Center Ring)**: Pure business logic and domain invariants. Encapsulates intent routing rules (`DeterministicCapabilityRouter`), capability classifications (`AgentCapability`), and candidate selection policies (`DeterministicSelectionPolicy`). Contains zero dependencies on infrastructure, databases, or frameworks.
-2. **Application Layer (Use Cases & Ports)**: Orchestrates business flows (`SubmitTask`, `GetRoutingDecision`, `FindCandidatesByCapability`). Declares abstract Ports (Protocols) such as `TaskDispatcher`, `TaskQueue`, `StateReader`, `RoutingRecorder`, `ResultReader`, and `EventPublisher`. Does not know about Redis, HTTP, or external cloud providers.
-3. **Infrastructure Layer (Adapters)**: Implements application ports with concrete technologies. `RedisGateway` connects the orchestrator to Redis data structures; `RedisBus` connects workers to dispatch queues; `TavilySearchExecutor` and `CloudflareInferenceProvider` adapt external APIs.
+1. **Domain Layer (Center Ring)**: Pure business logic and domain invariants. Encapsulates intent routing rules (`DeterministicCapabilityRouter`), capability classifications (`AgentCapability`), candidate selection policies (`DeterministicSelectionPolicy`), and deterministic structural analysis of supplied text. Contains zero dependencies on infrastructure, databases, or frameworks.
+2. **Application Layer (Use Cases & Ports)**: Orchestrates business flows (`SubmitTask`, `GetRoutingDecision`, `FindCandidatesByCapability`, and Analysis Agent task processing). Declares abstract Ports (Protocols) such as `TaskDispatcher`, `TaskQueue`, `StateReader`, `RoutingRecorder`, `ResultReader`, `EventPublisher`, and `MaterialAnalyzer`. Does not know about Redis, HTTP, or external cloud providers.
+3. **Infrastructure Layer (Adapters)**: Implements application ports with concrete technologies. `RedisGateway` connects the orchestrator to Redis data structures; service-local `RedisBus` adapters connect agents to dispatch queues; `TavilySearchExecutor` and `CloudflareInferenceProvider` adapt external APIs.
 4. **Presentation Layer (Outer Ring)**: Exposes FastAPI REST endpoints (`/api/tasks`, `/api/tasks/{id}/routing`, `/api/tasks/{id}/result`, `/api/agents`, `/api/events`) and serves the Prototype Console single-page web application. Interacts exclusively with Application use cases and queries.
 5. **Shared Contracts (`agent_contracts`)**: Cross-boundary data primitives (`TaskRequested`, `TaskResult`, `RoutingDecision`, `CandidateEvaluation`, `AgentHeartbeat`, `AgentEvent`, `AgentCandidate`, `AgentAvailability`, `LivenessPolicy`). Technology-neutral dataclasses with strict versioning and automated credential sanitization.
 
@@ -89,7 +90,10 @@ The application adheres to the **Composition Root pattern** rather than scatteri
 5. **Decision Recording**: `SubmitTask` constructs a structured, immutable `RoutingDecision` capturing the task ID, prompt classification, required capabilities, candidate evaluations, selected agent ID, dispatch target queue, and selection rationale. It persists this record via `RoutingRecorder.record_routing_decision()` to `task.routing:{task_id}`.
 6. **Task Dispatch**: `SubmitTask` dispatches `TaskRequested` to the selected candidate's advertised target queue (e.g. `agent.tasks.research` or `agent.tasks.general`) via `TaskDispatcher`.
 
-### Flow 2: Worker Execution & Grounded Research Synthesis
+The Analysis Agent advertises `analysis` and `agent.tasks.analysis`, but it is not part of the `general | research` user-routing vocabulary. Producers that explicitly dispatch to the advertised target can reach it; normal task submission does not automatically select it.
+
+### Flow 2: Agent Execution
+
 1. **Task Dequeue**: The target agent's `RedisBus` performs an atomic `BLPOP` on its queue.
 2. **State Transition**: The agent transitions its state hash from `idle` to `working` and publishes an operational `working` event to `agent.events`.
 3. **Execution**:
@@ -99,6 +103,7 @@ The application adheres to the **Composition Root pattern** rather than scatteri
      b. **Context Formatting**: Assembles grounded search evidence into an explicit token-budgeted prompt.
      c. **LLM Synthesis**: Calls `CloudflareInferenceProvider` (`@cf/meta/llama-3.1-8b-instruct`) with strict instructions to generate structured findings and concise source citations.
      d. **Truncation Detection**: Checks completion metadata and response boundaries to prevent silent mid-sentence truncation.
+   - **Analysis Agent (`analysis-agent-1`)**: Deterministically counts paragraphs, sentences, and words; reports up to five repeated normalized content terms and question sentences; and states that it analyzed only the supplied material without retrieval. It does not claim factual verification or semantic understanding.
 4. **Result Storage**: The agent constructs a `TaskResult` (`status="completed"`, `output=...`) and persists it to `task.result:{task_id}`.
 5. **State Reset**: The agent transitions its state back to `idle` (`Waiting for work`) and publishes an `idle` event to `agent.events`.
 
@@ -114,7 +119,7 @@ The application adheres to the **Composition Root pattern** rather than scatteri
 ## 6. Service Communication & Contract Purity
 
 ### Network Boundaries
-1. Deployable services (`services/orchestrator`, `services/worker`, `services/research_agent`) are isolated containers on Docker network `agent_net`.
+1. Deployable services (`services/orchestrator`, `services/worker`, `services/research_agent`, `services/analysis_agent`) are isolated containers on Docker network `agent_net`.
 2. Direct Python imports across service boundaries are strictly forbidden. One service must never import from another service's internal code tree.
 3. Inter-service communication occurs exclusively through explicit asynchronous message passing and key-value state over Redis.
 
@@ -141,6 +146,7 @@ The application adheres to the **Composition Root pattern** rather than scatteri
 | :--- | :--- | :--- |
 | `agent.tasks.general` | Redis List (FIFO) | Dispatch queue for General Worker (`RPUSH` / `BLPOP`). |
 | `agent.tasks.research` | Redis List (FIFO) | Dispatch queue for Research Agent (`RPUSH` / `BLPOP`). |
+| `agent.tasks.analysis` | Redis List (FIFO) | Explicit dispatch queue for Analysis Agent (`RPUSH` / `BLPOP`). |
 | `agent.registry:{agent_id}` | Redis String / Hash | Static agent registration, capabilities, and target queue. |
 | `agent.heartbeat:{agent_id}` | Redis String / JSON | Periodic liveness pulse, execution state, and ISO timestamp. |
 | `task.routing:{task_id}` | Redis String / JSON | Structured `RoutingDecision` record (candidates, target, rationale). |
@@ -151,7 +157,7 @@ The application adheres to the **Composition Root pattern** rather than scatteri
 
 ## 8. Agent State Machine & Error Recovery
 
-The agents enforce an explicit state machine for task execution:
+The general Worker enforces this state machine for task execution. Specialist failure behavior is described separately below:
 
 ```text
        ┌──────────┐
@@ -174,9 +180,9 @@ The agents enforce an explicit state machine for task execution:
 1. **State vs. Event History**:
    * Current agent state is maintained in a Redis Hash / Heartbeat (`agent.heartbeat:{agent_id}`).
    * The complete chronological audit log is appended to a Redis Stream (`agent.events`).
-2. **Failure Recovery**:
-   * When task processing raises an exception, the agent appends an `error` event to `agent.events` retaining the failed `task_id` and error description.
-   * Crucially, the agent transitions its status back to `idle` (`Waiting for work`), ensuring the worker does not remain permanently trapped in an error status and can process subsequent tasks.
+2. **Failure State**:
+   * When task processing raises an exception, agents append an `error` event to `agent.events` retaining the failed `task_id`.
+   * The Worker subsequently publishes `idle`; the Research Agent and Analysis Agent do not immediately overwrite `error` with `idle`.
 3. **Transport Resilience**:
    * Redis operations are wrapped in exponential backoff policies (`retry_with_backoff[T]`).
    * Only transport errors (`ConnectionError`, `TimeoutError`, `OSError`) are retried. Non-transport defects fail immediately.
@@ -202,7 +208,7 @@ Testing follows the pyramid structure and relies on zero live infrastructure or 
 * **Domain Unit Tests** (`tests/test_domain.py`, `tests/test_routing_decision.py`): Invariant tests verifying prompt boundaries, intent routing, selection policies, and sensitive key scrubbing.
 * **Application Unit Tests** (`tests/test_application.py`, `tests/test_runtime_dispatch.py`, `tests/test_unavailable_capability.py`): Command and query validation using lightweight in-memory test doubles (`FakeTaskQueue`, `FakeStateReader`, `FakeCandidateFinder`).
 * **Contract Tests** (`tests/test_contracts.py`): Round-trip JSON and dictionary serialization/deserialization verification across all shared contracts.
-* **Worker & Research Agent Tests** (`tests/test_worker.py`, `tests/test_research_agent.py`): Verification of worker state progression (`working` → `idle`), research retrieval, Cloudflare synthesis, and truncation guard handling using mocked executors.
+* **Agent Tests** (`tests/test_worker.py`, `tests/test_research_agent.py`, `tests/test_analysis_agent.py`): Verification of worker state progression, research retrieval and synthesis, and deterministic analysis behavior and lifecycle.
 * **Presentation Tests** (`tests/test_presentation.py`): Endpoint testing using `create_app()` configured with in-memory test doubles—validating HTML structure, progression elements, HTTP 503 error schemas, and routing endpoint responses without live Redis connections.
 
 ---
@@ -212,7 +218,7 @@ Testing follows the pyramid structure and relies on zero live infrastructure or 
 ### Python Runtime Alignment
 * **Standard Rule**: **Use one explicitly supported Python minor version across local development, tests, and service containers.**
 * **Authoritative Runtime**: **Python 3.12** (`>=3.12,<3.13`).
-* **Parity**: Local virtual environment, Orchestrator container, Worker container, and Research Agent container all execute on CPython 3.12.x to prevent standard library drift.
+* **Parity**: Local virtual environment, Orchestrator container, Worker container, Research Agent container, and Analysis Agent container all execute on CPython 3.12.x to prevent standard library drift.
 
 ### Dependency Management
 * **Service Runtime Isolation**: Each service strictly maintains its own runtime dependencies in `services/<service>/requirements.txt`. Orchestrator web dependencies must never leak into worker containers.

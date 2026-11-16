@@ -13,6 +13,8 @@ from agent_contracts import (
     evaluate_agent_record,
     parse_heartbeat_interval,
 )
+from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
+from analysis_agent.main import run_analysis_agent
 from orchestrator.presentation.api import dashboard
 from research_agent.infrastructure.redis_bus import RedisBus as ResearchRedisBus
 from worker.infrastructure.redis_bus import RedisBus as WorkerRedisBus
@@ -229,6 +231,53 @@ async def test_research_agent_periodically_refreshes_liveness(
             assert hb.occurred_at != ""
 
 
+@pytest.mark.anyio
+async def test_analysis_agent_registers_and_periodically_refreshes_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AGENT_ID", raising=False)
+    monkeypatch.delenv("TASK_QUEUE", raising=False)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0.04")
+
+    with patch("analysis_agent.main.RedisBus") as mock_bus_cls, patch(
+        "analysis_agent.main.AnalysisProcessor"
+    ):
+        mock_bus = AsyncMock()
+        mock_bus.current_state = "idle"
+        mock_bus_cls.return_value = mock_bus
+
+        heartbeats: list[AgentHeartbeat] = []
+
+        async def capture_heartbeat(hb: AgentHeartbeat) -> None:
+            heartbeats.append(hb)
+
+        mock_bus.heartbeat.side_effect = capture_heartbeat
+
+        async def wait_and_cancel() -> None:
+            await asyncio.sleep(0.13)
+            raise asyncio.CancelledError()
+
+        mock_bus.next_task.side_effect = wait_and_cancel
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_analysis_agent()
+
+        mock_bus_cls.assert_called_once_with(
+            "redis://localhost:6379/0",
+            queue_name="agent.tasks.analysis",
+        )
+        mock_bus.register.assert_awaited_once()
+        metadata: AgentCapabilityMetadata = mock_bus.register.call_args[0][0]
+        assert metadata.agent_id == "analysis-agent-1"
+        assert metadata.agent_type == "analysis-agent"
+        assert metadata.capabilities == ["analysis"]
+        assert metadata.dispatch_target == "agent.tasks.analysis"
+        mock_bus.publish.assert_awaited_once()
+        assert len(heartbeats) >= 2
+        assert all(hb.agent_id == "analysis-agent-1" for hb in heartbeats)
+
+
 # ==============================================================================
 # 4. Availability Domain Eligibility & Preservation Tests
 # ==============================================================================
@@ -344,6 +393,20 @@ async def test_research_redis_bus_heartbeat_refreshes_timestamp_without_overwrit
     mapping = last_call[1]["mapping"]
     assert "state" not in mapping
     assert mapping["updated_at"] == hb.occurred_at
+
+
+@pytest.mark.anyio
+async def test_analysis_redis_bus_heartbeat_refreshes_timestamp_without_overwriting_state() -> None:
+    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis")
+    bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
+    bus.client.hset = AsyncMock()  # type: ignore[method-assign]
+
+    heartbeat = AgentHeartbeat.create("analysis-agent-1", execution_state="working")
+    await bus.heartbeat(heartbeat)
+
+    bus.client.hset.assert_awaited_once()
+    mapping = bus.client.hset.await_args.kwargs["mapping"]
+    assert mapping == {"updated_at": heartbeat.occurred_at}
 
 
 @pytest.mark.anyio

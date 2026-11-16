@@ -5,7 +5,15 @@ requires-python = ">=3.12,<3.13"
 license = "AGPL-3.0-only"
 
 [tool.pytest.ini_options]
-pythonpath = ["services/orchestrator/src", "services/worker/src", "services/research_agent/src", "packages/contracts/src", "packages/infrastructure/src", "packages/policy/src"]
+pythonpath = [
+    "services/orchestrator/src",
+    "services/worker/src",
+    "services/research_agent/src",
+    "services/analysis_agent/src",
+    "packages/contracts/src",
+    "packages/infrastructure/src",
+    "packages/policy/src",
+]
 testpaths = ["tests"]
 addopts = "-m 'not redis'"
 strict_markers = true
@@ -23,6 +31,7 @@ search-path = [
     "services/orchestrator/src",
     "services/worker/src",
     "services/research_agent/src",
+    "services/analysis_agent/src",
     "packages/contracts/src",
     "packages/infrastructure/src",
     "packages/policy/src",

@@ -57,10 +57,11 @@ Layer 1: Static / Hygiene (PR CI: Ruff lint, git diff --check)
 - **What it cannot prove**: Container packaging completeness, TCP socket behavior, Redis wire protocol compatibility, remote vendor API realities, or physical network latency.
 
 ### Layer 3: Container Boundary
-- **Mechanism**: Build service Dockerfiles (`services/orchestrator/Dockerfile`, `services/worker/Dockerfile`, `services/research_agent/Dockerfile`) and execute entrypoint runtime import smoke checks inside the built container images in PR CI:
+- **Mechanism**: Build service Dockerfiles (`services/orchestrator/Dockerfile`, `services/worker/Dockerfile`, `services/research_agent/Dockerfile`, `services/analysis_agent/Dockerfile`) and execute entrypoint runtime import smoke checks inside the built container images in PR CI:
   - `docker run --rm test-orchestrator python -c "import orchestrator.presentation.api"`
   - `docker run --rm test-worker python -c "import agent_policy, worker.main"`
   - `docker run --rm test-research-agent python -c "import agent_policy, research_agent.main"`
+  - `docker run --rm test-analysis-agent python -c "import analysis_agent.main"`
 - **Execution**: Runs on every pull request to `main`.
 - **Purpose**: Detect missing package copies, broken `PYTHONPATH` declarations, and container-specific dependency omissions before merge.
 - **What it proves**: Required application modules and third-party dependencies exist on the container filesystem and import successfully without runtime `ModuleNotFoundError` crashes.
@@ -165,13 +166,14 @@ Release validation on `home-core` provides empirical proof of platform stability
    ```bash
    docker compose up -d
    ```
-5. **Verify Service Health**: Inspect running containers (`docker compose ps`) and verify Orchestrator, Worker, and Research Agent become healthy and register on Redis.
+5. **Verify Service Health**: Inspect running containers (`docker compose ps`) and verify Orchestrator, Worker, Research Agent, and Analysis Agent start and register on Redis.
 6. **Verify Version Presentation**: Open the Prototype Console in a browser (`GET /`) and verify the console header visibly displays the expected release version (e.g., `v0.4.0`).
 7. **Execute GENERAL Task**: Submit a general reasoning or formatting task through the console. Verify automatic routing to `worker-1`, execution completion, and return to `idle`.
 8. **Execute RESEARCH Task**: Submit an information-seeking research prompt. Verify automatic routing to `research-agent-1`, Tavily retrieval execution, synthesis completion, and return to `idle`.
-9. **Verify Result & Telemetry Presentation**: Inspect the console output. Confirm formatted output, clickable source links for research results, persistent storage in Redis, and accurate attempt telemetry (provider name, model, attempt index, latency in milliseconds).
-10. **Verify Provider Selection & Probing**: Confirm the configured provider is probed truthfully and selected according to configured priority.
-11. **Record Unvalidated Boundaries**: Explicitly document any capability that was intentionally not exercised during the release run (e.g., live fallback or secondary providers).
+9. **Execute ANALYSIS Task**: Dispatch a `TaskRequested` directly to the advertised `agent.tasks.analysis` target. Verify deterministic structural output, a persisted `TaskResult`, and `working` then `idle` lifecycle events. This is not a console auto-routing test.
+10. **Verify Result & Telemetry Presentation**: Inspect the console output. Confirm formatted output, clickable source links for research results, persistent storage in Redis, and accurate attempt telemetry (provider name, model, attempt index, latency in milliseconds).
+11. **Verify Provider Selection & Probing**: Confirm the configured provider is probed truthfully and selected according to configured priority.
+12. **Record Unvalidated Boundaries**: Explicitly document any capability that was intentionally not exercised during the release run (e.g., live fallback or secondary providers).
 
 ### Multi-Provider Fallback Validation Guidance
 
