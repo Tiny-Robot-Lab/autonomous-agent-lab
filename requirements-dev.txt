@@ -3,6 +3,6 @@
 -r services/research_agent/requirements.txt
 -r services/analysis_agent/requirements.txt
 pytest>=9.0.0
-anyio>=4.0.0
+anyio>=4.16.0
 ruff>=0.17.3
 
