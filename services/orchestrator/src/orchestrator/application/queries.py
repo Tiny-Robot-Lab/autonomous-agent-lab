@@ -11,7 +11,7 @@ from agent_contracts.capabilities import DISALLOWED_METADATA_KEYS
 
 from orchestrator.domain.capability import AgentCapability
 
-from .ports import ResultReader, StateReader
+from .ports import AuthoritativeTaskStore, ResultReader, StateReader
 
 
 class GetAgentStates:
@@ -61,6 +61,24 @@ class GetTaskInferenceTelemetry:
         if not task_id or not str(task_id).strip():
             raise ValueError("task_id must not be empty")
         return await self._reader.task_inference_telemetry(str(task_id).strip())
+
+
+class GetTaskChildren:
+    """Query immediate child task IDs for an authoritative parent task."""
+
+    def __init__(self, task_store: AuthoritativeTaskStore) -> None:
+        self._task_store = task_store
+
+    async def execute(self, parent_task_id: str) -> list[str] | None:
+        if not parent_task_id or not str(parent_task_id).strip():
+            raise ValueError("task_id must not be empty")
+        clean_id = str(parent_task_id).strip()
+
+        lineage = await self._task_store.get_lineage(clean_id)
+        if lineage is None:
+            return None
+
+        return await self._task_store.get_children(clean_id)
 
 
 class FindCandidatesByCapability:

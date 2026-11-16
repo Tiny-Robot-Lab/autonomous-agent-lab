@@ -25,6 +25,7 @@ from orchestrator.application.queries import (
     GetAgentStates,
     GetRecentEvents,
     GetRoutingDecision,
+    GetTaskChildren,
     GetTaskInferenceTelemetry,
     GetTaskResult,
 )
@@ -120,6 +121,21 @@ async def task_telemetry(task_id: str, request: Request) -> dict[str, Any]:
             detail=f"Inference telemetry for task '{task_id}' not found",
         )
     return telemetry
+
+
+async def task_children(task_id: str, request: Request) -> dict[str, Any]:
+    get_task_children: GetTaskChildren = request.app.state.get_task_children
+    clean_id = str(task_id).strip()
+    try:
+        children = await get_task_children.execute(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if children is None:
+        raise HTTPException(status_code=404, detail=f"Task '{clean_id}' not found")
+    return {
+        "parent_task_id": clean_id,
+        "child_task_ids": children,
+    }
 
 
 async def candidates(capability: str, request: Request) -> list[dict[str, Any]]:
@@ -219,6 +235,7 @@ def create_app(
     get_task_inference_telemetry = (
         GetTaskInferenceTelemetry(reader) if reader else None
     )
+    get_task_children = GetTaskChildren(resolved_task_store)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -236,6 +253,7 @@ def create_app(
     app.state.get_task_result = get_task_result
     app.state.get_routing_decision = get_routing_decision
     app.state.get_task_inference_telemetry = get_task_inference_telemetry
+    app.state.get_task_children = get_task_children
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -260,6 +278,7 @@ def create_app(
     app.add_api_route("/api/tasks/{task_id}/result", task_result, methods=["GET"])
     app.add_api_route("/api/tasks/{task_id}/routing", task_routing, methods=["GET"])
     app.add_api_route("/api/tasks/{task_id}/telemetry", task_telemetry, methods=["GET"])
+    app.add_api_route("/api/tasks/{task_id}/children", task_children, methods=["GET"])
     app.add_api_route("/api/candidates", candidates, methods=["GET"])
 
     return app
