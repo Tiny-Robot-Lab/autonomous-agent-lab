@@ -14,6 +14,7 @@ from .queries import (
     GetAgentStates,
     GetRecentEvents,
     GetRoutingDecision,
+    GetTaskChildren,
     GetTaskResult,
     QueryAgentsByCapability,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "GetAgentStates",
     "GetRecentEvents",
     "GetRoutingDecision",
+    "GetTaskChildren",
     "GetTaskResult",
     "QueryAgentsByCapability",
     "RegisterChildTask",

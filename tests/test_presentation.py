@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from agent_contracts import TaskRequested
 from fastapi import HTTPException
 from orchestrator.config import Settings
 from orchestrator.domain.capability import AgentCapability
@@ -12,6 +13,7 @@ from orchestrator.presentation.api import (
     dashboard,
     events,
     health,
+    task_children,
     task_result,
     task_telemetry,
 )
@@ -559,6 +561,120 @@ async def test_presentation_task_routing_endpoint_not_found() -> None:
 
     assert exc_info.value.status_code == 404
     assert "not found" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_presentation_task_children_endpoint() -> None:
+    fake_queue = FakeTaskQueue()
+    root = TaskRequested.create("Root parent task")
+    await fake_queue.register_root_task(root)
+
+    child1 = TaskRequested(
+        task_id="child-b",
+        prompt="Child B",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    child2 = TaskRequested(
+        task_id="child-a",
+        prompt="Child A",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    await fake_queue.register_child_task(child1)
+    await fake_queue.register_child_task(child2)
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_queue=fake_queue,
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    # 1. 200 with ordered child IDs
+    res = await task_children(root.task_id, request=req)
+    assert res["parent_task_id"] == root.task_id
+    assert res["child_task_ids"] == ["child-a", "child-b"]
+
+    # 2. 200 with empty child_task_ids
+    empty_root = TaskRequested.create("Empty root")
+    await fake_queue.register_root_task(empty_root)
+    res_empty = await task_children(empty_root.task_id, request=req)
+    assert res_empty["parent_task_id"] == empty_root.task_id
+    assert res_empty["child_task_ids"] == []
+
+    # 3. 404 for unknown authoritative parent
+    with pytest.raises(HTTPException) as exc_404:
+        await task_children("nonexistent-id", request=req)
+    assert exc_404.value.status_code == 404
+
+    # 4. 400 for whitespace-only task ID
+    with pytest.raises(HTTPException) as exc_400:
+        await task_children("   ", request=req)
+    assert exc_400.value.status_code == 400
+
+    # 5. response echoes cleaned parent_task_id
+    res_clean = await task_children(f"  {empty_root.task_id}  ", request=req)
+    assert res_clean["parent_task_id"] == empty_root.task_id
+
+
+@pytest.mark.anyio
+async def test_presentation_task_children_asgi_route() -> None:
+    import httpx
+
+    fake_queue = FakeTaskQueue()
+    root = TaskRequested.create("Root parent task")
+    await fake_queue.register_root_task(root)
+
+    child1 = TaskRequested(
+        task_id="child-b",
+        prompt="Child B",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    child2 = TaskRequested(
+        task_id="child-a",
+        prompt="Child A",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    await fake_queue.register_child_task(child1)
+    await fake_queue.register_child_task(child2)
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_queue=fake_queue,
+        state_reader=FakeStateReader(),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. 200 shape and data
+        res_200 = await client.get(f"/api/tasks/{root.task_id}/children")
+        assert res_200.status_code == 200
+        assert res_200.json() == {
+            "parent_task_id": root.task_id,
+            "child_task_ids": ["child-a", "child-b"],
+        }
+
+        # 2. 404 for unknown parent
+        res_404 = await client.get("/api/tasks/unknown-parent-id/children")
+        assert res_404.status_code == 404
+        assert "not found" in res_404.json()["detail"].lower()
+
+        # 3. 400 for whitespace-only parent
+        res_400 = await client.get("/api/tasks/%20%20/children")
+        assert res_400.status_code == 400
+        assert "task_id must not be empty" in res_400.json()["detail"].lower()
 
 
 @pytest.mark.anyio

@@ -20,6 +20,8 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         self.statuses: dict[str, str] = {}
         self.lineages: dict[str, TaskLineage] = {}
         self.children: dict[str, set[str]] = {}
+        self.fail_get_lineage: bool = False
+        self.fail_get_children: bool = False
 
     async def register_root_task(
         self, task: TaskRequested, initial_status: str = "pending_dispatch"
@@ -44,9 +46,13 @@ class FakeTaskQueue(AuthoritativeTaskStore):
             self.children.setdefault(task.parent_task_id, set()).add(task.task_id)
 
     async def get_lineage(self, task_id: str) -> TaskLineage | None:
+        if self.fail_get_lineage:
+            raise RuntimeError("Simulated get_lineage storage failure")
         return self.lineages.get(task_id.strip())
 
     async def get_children(self, parent_task_id: str) -> list[str]:
+        if self.fail_get_children:
+            raise RuntimeError("Simulated get_children storage failure")
         return sorted(self.children.get(parent_task_id.strip(), set()))
 
     async def update_status(self, task_id: str, status: str) -> None:
@@ -449,4 +455,84 @@ async def test_get_task_inference_telemetry_query_empty_task_id_raises() -> None
         await query.execute("")
     with pytest.raises(ValueError, match="task_id must not be empty"):
         await query.execute("   ")
+
+
+@pytest.mark.anyio
+async def test_get_task_children_query_lifecycle() -> None:
+    from orchestrator.application.queries import GetTaskChildren
+
+    store = FakeTaskQueue()
+    root = TaskRequested.create("Root task")
+    await store.register_root_task(root)
+
+    child1 = TaskRequested(
+        task_id="child-b",
+        prompt="Child B",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    child2 = TaskRequested(
+        task_id="child-a",
+        prompt="Child A",
+        created_at=root.created_at,
+        root_task_id=root.task_id,
+        parent_task_id=root.task_id,
+        version=2,
+    )
+    await store.register_child_task(child1)
+    await store.register_child_task(child2)
+
+    query = GetTaskChildren(store)
+
+    # 1. Successful query with lexicographical sorting
+    children = await query.execute(root.task_id)
+    assert children == ["child-a", "child-b"]
+
+    # 2. Existing parent with zero children returns []
+    empty_root = TaskRequested.create("Empty root")
+    await store.register_root_task(empty_root)
+    assert await query.execute(empty_root.task_id) == []
+
+    # 3. Child queried as parent returns []
+    assert await query.execute(child1.task_id) == []
+
+    # 4. Unknown parent returns None
+    assert await query.execute("unknown-parent") is None
+
+    # 5. Empty/blank task_id raises ValueError
+    with pytest.raises(ValueError, match="task_id must not be empty"):
+        await query.execute("")
+    with pytest.raises(ValueError, match="task_id must not be empty"):
+        await query.execute("   ")
+
+    # 6. Stripping surrounding whitespace
+    assert await query.execute(f"  {root.task_id}  ") == ["child-a", "child-b"]
+
+
+@pytest.mark.anyio
+async def test_get_task_children_get_lineage_failure_propagates() -> None:
+    from orchestrator.application.queries import GetTaskChildren
+
+    store = FakeTaskQueue()
+    store.fail_get_lineage = True
+
+    query = GetTaskChildren(store)
+    with pytest.raises(RuntimeError, match="Simulated get_lineage storage failure"):
+        await query.execute("root-1")
+
+
+@pytest.mark.anyio
+async def test_get_task_children_get_children_failure_propagates() -> None:
+    from orchestrator.application.queries import GetTaskChildren
+
+    store = FakeTaskQueue()
+    root = TaskRequested.create("Root task")
+    await store.register_root_task(root)
+    store.fail_get_children = True
+
+    query = GetTaskChildren(store)
+    with pytest.raises(RuntimeError, match="Simulated get_children storage failure"):
+        await query.execute(root.task_id)
 
