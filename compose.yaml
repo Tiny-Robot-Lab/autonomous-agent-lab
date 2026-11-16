@@ -83,6 +83,21 @@ services:
     networks: [agent_net]
     restart: unless-stopped
 
+  analysis-agent:
+    build:
+      context: .
+      dockerfile: services/analysis_agent/Dockerfile
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AGENT_ID: analysis-agent-1
+      TASK_QUEUE: ${ANALYSIS_TASK_QUEUE:-agent.tasks.analysis}
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [agent_net]
+    restart: unless-stopped
+
   cloudflared:
     image: cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate run

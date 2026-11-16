@@ -41,6 +41,19 @@ def test_research_agent_dockerfile_packaging() -> None:
     assert "PYTHONPATH=/app/src:/app/contracts:/app/policy:/app/infrastructure" in env_line
 
 
+def test_analysis_agent_dockerfile_packaging() -> None:
+    dockerfile = (REPO_ROOT / "services" / "analysis_agent" / "Dockerfile").read_text()
+    lines = dockerfile.splitlines()
+
+    copy_lines = [line.strip() for line in lines if line.strip().startswith("COPY packages/")]
+    assert copy_lines == ["COPY packages/contracts/src /app/contracts"]
+
+    env_line = next(line for line in lines if "PYTHONPATH=" in line)
+    assert "PYTHONPATH=/app/src:/app/contracts" in env_line
+    assert "packages/policy" not in dockerfile
+    assert "packages/infrastructure" not in dockerfile
+
+
 def test_orchestrator_dockerfile_preserves_boundaries() -> None:
     dockerfile = (REPO_ROOT / "services" / "orchestrator" / "Dockerfile").read_text()
     lines = dockerfile.splitlines()

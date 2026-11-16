@@ -8,11 +8,17 @@ from urllib.parse import urlparse
 import pytest
 import redis.asyncio as redis
 from agent_contracts import (
+    AgentCapabilityMetadata,
     AgentEvent,
     InferenceExecutionTelemetry,
     TaskRequested,
     TaskResult,
 )
+from analysis_agent.application.processor import AnalysisProcessor
+from analysis_agent.infrastructure.deterministic_analyzer import (
+    DeterministicMaterialAnalyzer,
+)
+from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
 from orchestrator.domain.task import TaskLineage
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
@@ -142,6 +148,69 @@ async def test_redis_task_dispatch_and_consumption_round_trip(clean_redis: str) 
         # 4. Verify queue is now empty
         remaining = await gateway._client.llen(queue_name)
         assert remaining == 0
+    finally:
+        await gateway.aclose()
+        await bus.aclose()
+
+
+async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
+    clean_redis: str,
+) -> None:
+    gateway = RedisGateway(clean_redis)
+    bus = AnalysisRedisBus(clean_redis)
+    agent_id = f"analysis-agent-{uuid.uuid4().hex[:8]}"
+    metadata = AgentCapabilityMetadata(
+        agent_id=agent_id,
+        agent_type="analysis-agent",
+        capabilities=["analysis"],
+        providers={"analysis_engine": "deterministic"},
+        dispatch_target="agent.tasks.analysis",
+    )
+    task = TaskRequested.create(
+        "The rover maps caves. The rover records samples. Does the map show water?"
+    )
+    processor = AnalysisProcessor(
+        agent_id,
+        bus,
+        DeterministicMaterialAnalyzer(),
+        bus,
+    )
+
+    try:
+        await bus.register(metadata)
+        await bus.publish(AgentEvent.create(agent_id, "idle", "Waiting for work"))
+        await gateway.dispatch(task, target="agent.tasks.analysis")
+
+        consumed = await asyncio.wait_for(bus.next_task(), timeout=2.0)
+        await processor.run_once(consumed)
+
+        registered = await gateway.agents()
+        agent = next(agent for agent in registered if agent["agent_id"] == agent_id)
+        assert agent["agent_type"] == "analysis-agent"
+        assert agent["capabilities"] == ["analysis"]
+        assert agent["dispatch_target"] == "agent.tasks.analysis"
+
+        result = await gateway.get_result(task.task_id)
+        assert result is not None
+        assert result["status"] == "completed"
+        assert result["output"] == (
+            "Analysis report\n"
+            "Paragraphs: 1\n"
+            "Sentences: 3\n"
+            "Words: 13\n"
+            "Repeated terms: rover (2)\n"
+            "Question sentences:\n"
+            "- Does the map show water?\n"
+            "Scope: Only supplied material was analyzed; no retrieval was performed."
+        )
+
+        events = await gateway.events(limit=10)
+        task_states = [
+            event["state"]
+            for event in events
+            if event.get("task_id") == task.task_id
+        ]
+        assert task_states == ["idle", "working"]
     finally:
         await gateway.aclose()
         await bus.aclose()
