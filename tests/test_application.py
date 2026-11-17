@@ -1,7 +1,13 @@
 from typing import Any
 
 import pytest
-from agent_contracts import TaskRequested
+from agent_contracts import (
+    RootAuthorityRecord,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
+    TaskRequested,
+)
 from orchestrator.application.ports import AuthoritativeTaskStore
 from orchestrator.application.queries import (
     GetAgentStates,
@@ -20,6 +26,10 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         self.statuses: dict[str, str] = {}
         self.lineages: dict[str, TaskLineage] = {}
         self.children: dict[str, set[str]] = {}
+        self.inputs: dict[tuple[str, int], TaskInput] = {}
+        self.artifacts: dict[tuple[str, str, int], StageArtifact] = {}
+        self.continuations: dict[tuple[str, int], TaskContinuation] = {}
+        self.authorities: dict[str, RootAuthorityRecord] = {}
         self.fail_get_lineage: bool = False
         self.fail_get_children: bool = False
 
@@ -31,6 +41,19 @@ class FakeTaskQueue(AuthoritativeTaskStore):
             task_id=task.task_id,
             root_task_id=task.root_task_id,
             parent_task_id=None,
+        )
+        self.inputs[(task.task_id, 1)] = TaskInput(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            created_at=task.created_at,
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        )
+        self.authorities[task.task_id] = RootAuthorityRecord.create_default(
+            root_task_id=task.task_id,
+            created_at=task.created_at,
         )
 
     async def register_child_task(
@@ -60,6 +83,36 @@ class FakeTaskQueue(AuthoritativeTaskStore):
 
     async def get_status(self, task_id: str) -> str | None:
         return self.statuses.get(task_id.strip())
+
+    async def save_task_input(self, task_input: TaskInput) -> None:
+        self.inputs[(task_input.task_id, task_input.input_version)] = task_input
+
+    async def get_task_input(
+        self, task_id: str, input_version: int = 1
+    ) -> TaskInput | None:
+        return self.inputs.get((task_id.strip(), input_version))
+
+    async def save_stage_artifact(self, artifact: StageArtifact) -> None:
+        self.artifacts[(artifact.producing_task_id, artifact.artifact_id, artifact.artifact_version)] = artifact
+
+    async def get_stage_artifact(
+        self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
+    ) -> StageArtifact | None:
+        return self.artifacts.get((producing_task_id.strip(), artifact_id.strip(), artifact_version))
+
+    async def save_continuation(self, continuation: TaskContinuation) -> None:
+        self.continuations[(continuation.parent_task_id, continuation.continuation_version)] = continuation
+
+    async def get_continuation(
+        self, parent_task_id: str, continuation_version: int = 1
+    ) -> TaskContinuation | None:
+        return self.continuations.get((parent_task_id.strip(), continuation_version))
+
+    async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
+        self.authorities[authority.root_task_id] = authority
+
+    async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
+        return self.authorities.get(root_task_id.strip())
 
     async def enqueue(
         self,

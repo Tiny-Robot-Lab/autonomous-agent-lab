@@ -11,6 +11,10 @@ from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
     InferenceExecutionTelemetry,
+    RootAuthorityRecord,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
     TaskResult,
 )
@@ -19,7 +23,16 @@ from analysis_agent.infrastructure.deterministic_analyzer import (
     DeterministicMaterialAnalyzer,
 )
 from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
-from orchestrator.domain.task import TaskLineage
+from orchestrator.domain.task import (
+    ConflictingContinuationError,
+    ConflictingRootAuthorityError,
+    ConflictingRootTaskRegistrationError,
+    ConflictingStageArtifactError,
+    ConflictingTaskInputError,
+    CorruptAuthoritativeRecordError,
+    NonContiguousVersionError,
+    TaskLineage,
+)
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from research_agent.domain.models import ResearchResult
@@ -86,7 +99,7 @@ async def clean_redis(redis_url: str) -> AsyncGenerator[str, None]:
     sanitized_url = _sanitize_redis_url(redis_url)
     try:
         await asyncio.wait_for(client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError, TimeoutError) as exc:
+    except (redis.ConnectionError, OSError) as exc:
         await client.aclose()
         pytest.fail(
             f"Configured Redis endpoint is unreachable at {sanitized_url} within 1.0s timeout: {exc}"
@@ -365,7 +378,7 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
     try:
         root_task = TaskRequested.create("Root task for Redis integration lifecycle")
 
-        # 1. Authoritative registration establishes pending_dispatch and lineage
+        # 1. Authoritative registration establishes pending_dispatch, lineage, TaskInput v1, and RootAuthority
         await gateway.register_root_task(root_task)
 
         status = await gateway.get_status(root_task.task_id)
@@ -378,6 +391,24 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
         assert lineage.root_task_id == root_task.task_id
         assert lineage.parent_task_id is None
         assert lineage.is_root is True
+
+        # Verify durable TaskInput v1 and default RootAuthorityRecord persisted
+        input_record = await gateway.get_task_input(root_task.task_id, 1)
+        assert input_record is not None
+        assert input_record.prompt == root_task.prompt
+        assert input_record.task_id == root_task.task_id
+
+        authority = await gateway.get_root_authority(root_task.task_id)
+        assert authority is not None
+        assert authority.root_task_id == root_task.task_id
+        assert authority.max_delegation_depth == 1
+        assert authority.max_delegation_waves == 1
+
+        # Verify reference-safety: no TTL set on authoritative keys
+        assert await gateway._client.ttl(f"task.status:{root_task.task_id}") == -1
+        assert await gateway._client.ttl(f"task.lineage:{root_task.task_id}") == -1
+        assert await gateway._client.ttl(f"task.input:{root_task.task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.authority:{root_task.task_id}") == -1
 
         # 2. Atomic dispatch pushes to target queue and sets status to pending
         dispatch_target = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
@@ -495,5 +526,407 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
         # Unknown parent returns empty list
         empty_children = await gateway.get_children("nonexistent-parent-task-id")
         assert empty_children == []
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        task_id = f"task_{uuid.uuid4().hex[:8]}"
+        now = "2026-11-16T12:00:00+00:00"
+
+        # 1. TaskInput write-once and retrieval
+        task_input = TaskInput(
+            task_id=task_id,
+            prompt="Durable input prompt",
+            created_at=now,
+            input_version=1,
+        )
+        await gateway.save_task_input(task_input)
+
+        retrieved_input = await gateway.get_task_input(task_id, 1)
+        assert retrieved_input == task_input
+
+        # Idempotent write
+        await gateway.save_task_input(task_input)
+
+        # Conflicting write fails
+        conflict_input = TaskInput(
+            task_id=task_id,
+            prompt="Conflicting prompt",
+            created_at=now,
+            input_version=1,
+        )
+        with pytest.raises(ConflictingTaskInputError):
+            await gateway.save_task_input(conflict_input)
+
+        # 2. StageArtifact write-once and retrieval
+        art_id = f"art_{uuid.uuid4().hex[:8]}"
+        artifact = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=task_id,
+            artifact_type="research_material",
+            content={"material": "findings alpha and beta"},
+            created_at=now,
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(artifact)
+
+        retrieved_art = await gateway.get_stage_artifact(task_id, art_id, 1)
+        assert retrieved_art == artifact
+
+        # Assert direct Redis wire contents for record payload and index set membership
+        raw_art_payload = await gateway._client.get(f"task.artifact:{task_id}:{art_id}:1")
+        assert raw_art_payload == artifact.to_json()
+        raw_index_members = await gateway._client.smembers(f"task.artifacts:{task_id}")
+        assert f"{art_id}:1" in raw_index_members
+
+        # Conflicting write fails
+        conflict_art = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=task_id,
+            artifact_type="research_material",
+            content={"material": "conflict findings"},
+            created_at=now,
+            artifact_version=1,
+        )
+        with pytest.raises(ConflictingStageArtifactError):
+            await gateway.save_stage_artifact(conflict_art)
+
+        # 3. TaskContinuation write-once and retrieval
+        child_id = f"child_{uuid.uuid4().hex[:8]}"
+        continuation = TaskContinuation(
+            parent_task_id=task_id,
+            child_task_id=child_id,
+            stage="incorporate_analysis_child",
+            control_fields={"analysis_focus": "check evidence"},
+            continuation_version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        await gateway.save_continuation(continuation)
+
+        retrieved_cont = await gateway.get_continuation(task_id, 1)
+        assert retrieved_cont == continuation
+
+        # Assert direct Redis wire contents for continuation record and latest pointer
+        raw_cont_payload = await gateway._client.get(f"task.continuation:{task_id}:1")
+        assert raw_cont_payload == continuation.to_json()
+        assert await gateway._client.get(f"task.continuation_latest:{task_id}") == "1"
+
+        # Conflicting write fails
+        conflict_cont = TaskContinuation(
+            parent_task_id=task_id,
+            child_task_id=f"child_{uuid.uuid4().hex[:8]}",
+            stage="incorporate_analysis_child",
+            control_fields={"analysis_focus": "conflict focus"},
+            continuation_version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        with pytest.raises(ConflictingContinuationError):
+            await gateway.save_continuation(conflict_cont)
+
+        # 4. RootAuthorityRecord write-once and retrieval
+        authority = RootAuthorityRecord.create_default(task_id, created_at=now)
+        await gateway.save_root_authority(authority)
+
+        retrieved_auth = await gateway.get_root_authority(task_id)
+        assert retrieved_auth == authority
+
+        # Conflicting write fails
+        conflict_auth = RootAuthorityRecord.create_default(
+            root_task_id=task_id,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        with pytest.raises(ConflictingRootAuthorityError):
+            await gateway.save_root_authority(conflict_auth)
+
+        # 5. Reference safety: verify NO TTL on all authoritative keys
+        assert await gateway._client.ttl(f"task.input:{task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.artifact:{task_id}:{art_id}:1") == -1
+        assert await gateway._client.ttl(f"task.artifacts:{task_id}") == -1
+        assert await gateway._client.ttl(f"task.continuation:{task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.continuation_latest:{task_id}") == -1
+        assert await gateway._client.ttl(f"task.authority:{task_id}") == -1
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_root_registration_marker_concurrency_and_partial_init(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        now = "2026-11-16T12:00:00+00:00"
+        task_id = f"root_{uuid.uuid4().hex[:8]}"
+        root_task = TaskRequested(
+            task_id=task_id,
+            prompt="Root registration concurrency test",
+            created_at=now,
+            root_task_id=task_id,
+            parent_task_id=None,
+            version=2,
+        )
+
+        # 1. Partial initialization rejection: status key alone exists
+        await gateway._client.set(
+            f"task.status:{task_id}",
+            json.dumps({"status": "pending_dispatch", "task_id": task_id}),
+        )
+        with pytest.raises(ConflictingRootTaskRegistrationError, match="inconsistent or partial"):
+            await gateway.register_root_task(root_task)
+        # Registration marker and remaining bundle keys must NOT have been written
+        assert await gateway._client.get(f"task.registration:{task_id}") is None
+        assert await gateway._client.get(f"task.lineage:{task_id}") is None
+        assert await gateway._client.get(f"task.input:{task_id}:1") is None
+        assert await gateway._client.get(f"task.authority:{task_id}") is None
+        await gateway._client.delete(f"task.status:{task_id}")
+
+        # Partial initialization rejection: registration marker alone exists
+        partial_id = f"root_{uuid.uuid4().hex[:8]}"
+        partial_task = TaskRequested(
+            task_id=partial_id,
+            prompt="Partial marker test",
+            created_at=now,
+            root_task_id=partial_id,
+            parent_task_id=None,
+            version=2,
+        )
+        await gateway._client.set(
+            f"task.registration:{partial_id}",
+            json.dumps({"registered_at": now, "task_id": partial_id}),
+        )
+        with pytest.raises(ConflictingRootTaskRegistrationError, match="inconsistent or partial"):
+            await gateway.register_root_task(partial_task)
+        assert await gateway._client.get(f"task.status:{partial_id}") is None
+        assert await gateway._client.get(f"task.lineage:{partial_id}") is None
+        assert await gateway._client.get(f"task.input:{partial_id}:1") is None
+        assert await gateway._client.get(f"task.authority:{partial_id}") is None
+        await gateway._client.delete(f"task.registration:{partial_id}")
+
+        # 2. Identical concurrency: 10 concurrent registrations of the same clean root task
+        ident_id = f"root_{uuid.uuid4().hex[:8]}"
+        clean_task = TaskRequested(
+            task_id=ident_id,
+            prompt="Concurrent root registration",
+            created_at=now,
+            root_task_id=ident_id,
+            parent_task_id=None,
+            version=2,
+        )
+        tasks = [gateway.register_root_task(clean_task) for _ in range(10)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(r is None for r in results)
+
+        # Verify all authoritative keys exist and have no TTL
+        marker_key = f"task.registration:{clean_task.task_id}"
+        status_key = f"task.status:{clean_task.task_id}"
+        lineage_key = f"task.lineage:{clean_task.task_id}"
+        input_key = f"task.input:{clean_task.task_id}:1"
+        authority_key = f"task.authority:{clean_task.task_id}"
+
+        raw_marker = await gateway._client.get(marker_key)
+        assert raw_marker is not None
+        assert await gateway._client.ttl(marker_key) == -1
+        assert await gateway._client.ttl(status_key) == -1
+        assert await gateway._client.ttl(lineage_key) == -1
+        assert await gateway._client.ttl(input_key) == -1
+        assert await gateway._client.ttl(authority_key) == -1
+
+        # Marker contains valid JSON with task_id
+        marker_data = json.loads(raw_marker)
+        assert marker_data["task_id"] == clean_task.task_id
+
+        # 3. Conflicting concurrent initialization: same task ID, conflicting immutable input
+        conflict_id = f"root_{uuid.uuid4().hex[:8]}"
+        task_a = TaskRequested(
+            task_id=conflict_id,
+            prompt="Candidate prompt A",
+            created_at=now,
+            root_task_id=conflict_id,
+            parent_task_id=None,
+            version=2,
+        )
+        task_b = TaskRequested(
+            task_id=conflict_id,
+            prompt="Conflicting candidate prompt B",
+            created_at=now,
+            root_task_id=conflict_id,
+            parent_task_id=None,
+            version=2,
+        )
+        conflict_results = await asyncio.gather(
+            gateway.register_root_task(task_a),
+            gateway.register_root_task(task_b),
+            return_exceptions=True,
+        )
+        successes = [r for r in conflict_results if r is None]
+        failures = [r for r in conflict_results if isinstance(r, ConflictingRootTaskRegistrationError)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+
+        # Verified stored bundle has exactly one accepted identity
+        persisted_input = await gateway.get_task_input(conflict_id, 1)
+        assert persisted_input is not None
+        assert persisted_input.prompt in (task_a.prompt, task_b.prompt)
+
+        # 4. Status advancement: status advances to 'running', replay must NOT reset it
+        await gateway.update_status(clean_task.task_id, "running")
+        assert await gateway.get_status(clean_task.task_id) == "running"
+
+        # Replay registration: succeeds idempotently, status remains 'running'
+        await gateway.register_root_task(clean_task)
+        assert await gateway.get_status(clean_task.task_id) == "running"
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_continuation_latest_pointer_corruption_and_regression(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        p_id = f"parent_{uuid.uuid4().hex[:8]}"
+        c_id = f"child_{uuid.uuid4().hex[:8]}"
+        now = "2026-11-16T12:00:00+00:00"
+
+        cont_v1 = TaskContinuation(
+            parent_task_id=p_id,
+            child_task_id=c_id,
+            stage="incorporate_analysis_child",
+            control_fields={"analysis_focus": "v1 focus"},
+            continuation_version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        cont_v2 = TaskContinuation(
+            parent_task_id=p_id,
+            child_task_id=c_id,
+            stage="incorporate_analysis_child",
+            control_fields={"analysis_focus": "v2 focus"},
+            continuation_version=2,
+            created_at=now,
+            updated_at=now,
+        )
+
+        # 1. v1 creation when latest pointer already exists -> CORRUPT_POINTER
+        latest_key = f"task.continuation_latest:{p_id}"
+        await gateway._client.set(latest_key, "1")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+            await gateway.save_continuation(cont_v1)
+        await gateway._client.delete(latest_key)
+
+        # Normal v1 creation succeeds
+        await gateway.save_continuation(cont_v1)
+        assert await gateway._client.get(latest_key) == "1"
+
+        # 2. v2 creation when latest pointer is missing -> CORRUPT_POINTER
+        await gateway._client.delete(latest_key)
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+            await gateway.save_continuation(cont_v2)
+
+        # 3. v2 creation when latest pointer is non-numeric -> CORRUPT_POINTER
+        await gateway._client.set(latest_key, "corrupt_string")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+            await gateway.save_continuation(cont_v2)
+
+        # 4. v2 creation when latest pointer >= 2 -> CORRUPT_POINTER
+        await gateway._client.set(latest_key, "2")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+            await gateway.save_continuation(cont_v2)
+
+        # Reset latest to 1 -> v2 creation succeeds
+        await gateway._client.set(latest_key, "1")
+        await gateway.save_continuation(cont_v2)
+        assert await gateway._client.get(latest_key) == "2"
+
+        # 5. Replay v1 when latest pointer has been corrupted/regressed to "0"
+        await gateway._client.set(latest_key, "0")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+            await gateway.save_continuation(cont_v1)
+        # Replay must NOT silently repair the corrupt pointer
+        assert await gateway._client.get(latest_key) == "0"
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        t_id = f"task_{uuid.uuid4().hex[:8]}"
+        now = "2026-11-16T12:00:00+00:00"
+
+        # 1. Version gaps
+        # TaskInput v1 then v3
+        inp_v1 = TaskInput(task_id=t_id, prompt="prompt v1", created_at=now, input_version=1)
+        inp_v3 = TaskInput(task_id=t_id, prompt="prompt v3", created_at=now, input_version=3)
+        await gateway.save_task_input(inp_v1)
+        with pytest.raises(NonContiguousVersionError, match="prior version 2 does not exist"):
+            await gateway.save_task_input(inp_v3)
+
+        # StageArtifact v1 then v3
+        art_id = f"art_{uuid.uuid4().hex[:8]}"
+        art_v1 = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=t_id,
+            artifact_type="research_material",
+            content={"material": "material v1"},
+            created_at=now,
+            artifact_version=1,
+        )
+        art_v3 = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=t_id,
+            artifact_type="research_material",
+            content={"material": "material v3"},
+            created_at=now,
+            artifact_version=3,
+        )
+        await gateway.save_stage_artifact(art_v1)
+        with pytest.raises(NonContiguousVersionError, match="prior version 2 does not exist"):
+            await gateway.save_stage_artifact(art_v3)
+
+        # 2. Corrupt payload retrieval
+        # Corrupt TaskInput
+        await gateway._client.set(f"task.input:{t_id}:1", "invalid { json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt TaskInput record"):
+            await gateway.get_task_input(t_id, 1)
+
+        # Corrupt StageArtifact
+        await gateway._client.set(f"task.artifact:{t_id}:{art_id}:1", '{"invalid": "schema"}')
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt StageArtifact record"):
+            await gateway.get_stage_artifact(t_id, art_id, 1)
+
+        # Corrupt TaskContinuation
+        await gateway._client.set(f"task.continuation:{t_id}:1", "corrupt text")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt TaskContinuation record"):
+            await gateway.get_continuation(t_id, 1)
+
+        # Corrupt RootAuthorityRecord
+        await gateway._client.set(f"task.authority:{t_id}", '{"broken": 999}')
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt RootAuthorityRecord"):
+            await gateway.get_root_authority(t_id)
+
+        # 3. Concurrency on same vs conflicting version write
+        t2_id = f"task_{uuid.uuid4().hex[:8]}"
+        inp_a = TaskInput(task_id=t2_id, prompt="concurrent prompt", created_at=now, input_version=1)
+        inp_b = TaskInput(task_id=t2_id, prompt="conflicting concurrent", created_at=now, input_version=1)
+
+        results = await asyncio.gather(
+            gateway.save_task_input(inp_a),
+            gateway.save_task_input(inp_a),
+            return_exceptions=True,
+        )
+        assert all(r is None for r in results)
+
+        # Conflicting concurrent writes
+        results_conflict = await asyncio.gather(
+            gateway.save_task_input(inp_a),
+            gateway.save_task_input(inp_b),
+            return_exceptions=True,
+        )
+        # One succeeded, one raised ConflictingTaskInputError
+        successes = [r for r in results_conflict if r is None]
+        failures = [r for r in results_conflict if isinstance(r, ConflictingTaskInputError)]
+        assert len(successes) == 1
+        assert len(failures) == 1
     finally:
         await gateway.aclose()

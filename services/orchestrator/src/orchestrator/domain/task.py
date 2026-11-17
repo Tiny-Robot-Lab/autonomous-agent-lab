@@ -10,6 +10,34 @@ class DelegationDepthExceededError(Exception):
     """Raised when delegation depth policy is violated (e.g. grandchild creation under depth-1)."""
 
 
+class ConflictingTaskInputError(Exception):
+    """Raised when attempting to overwrite an existing TaskInput version with conflicting data."""
+
+
+class ConflictingStageArtifactError(Exception):
+    """Raised when attempting to overwrite an existing StageArtifact version with conflicting data."""
+
+
+class ConflictingContinuationError(Exception):
+    """Raised when attempting to overwrite an existing TaskContinuation version with conflicting data."""
+
+
+class ConflictingRootAuthorityError(Exception):
+    """Raised when attempting to overwrite an existing RootAuthorityRecord with conflicting policy data."""
+
+
+class ConflictingRootTaskRegistrationError(Exception):
+    """Raised when attempting to register a root task with conflicting or partial state."""
+
+
+class NonContiguousVersionError(Exception):
+    """Raised when a versioned record write skips a contiguous sequence number (N > 1 without N - 1)."""
+
+
+class CorruptAuthoritativeRecordError(Exception):
+    """Raised when an authoritative record in storage is present but malformed or invalid."""
+
+
 @dataclass(frozen=True)
 class Task:
     prompt: str

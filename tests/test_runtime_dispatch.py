@@ -589,6 +589,7 @@ async def test_production_dynamic_dispatch_via_redis_gateway_never_depends_on_ca
     mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
     mock_pipe.__aexit__ = AsyncMock(return_value=None)
     gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+    gateway._client.eval = AsyncMock(return_value="OK")
 
     custom_target = "agent.tasks.production-custom-node"
     candidate = make_candidate("worker-prod", capability="general", dispatch_target=custom_target)
@@ -660,6 +661,7 @@ async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target()
     mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
     mock_pipe.__aexit__ = AsyncMock(return_value=None)
     gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+    gateway._client.eval = AsyncMock(return_value="OK")
 
     task = TaskRequested.create("Execute runtime task")
     target = "agent.tasks.custom-executor-1"
