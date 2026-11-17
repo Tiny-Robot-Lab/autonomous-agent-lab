@@ -111,6 +111,100 @@ class InMemoryRedis:
     async def aclose(self) -> None:
         pass
 
+    async def eval(self, script: str, numkeys: int, *keys_and_args: str) -> str:
+        keys = list(keys_and_args[:numkeys])
+        args = list(keys_and_args[numkeys:])
+
+        # Register root task
+        if len(keys) >= 4 and "task.status" in keys[0]:
+            status_key, lineage_key, input_key, authority_key = keys[:4]
+            status_json, lineage_json, input_json, authority_json = args[:4]
+            all_keys = [status_key, lineage_key, input_key, authority_key]
+            exists_count = sum(1 for k in all_keys if k in self._strings)
+            if exists_count == 0:
+                self._strings[status_key] = status_json
+                self._strings[lineage_key] = lineage_json
+                self._strings[input_key] = input_json
+                self._strings[authority_key] = authority_json
+                return "OK"
+            if exists_count == 4:
+                if (
+                    self._strings[lineage_key] == lineage_json
+                    and self._strings[input_key] == input_json
+                    and self._strings[authority_key] == authority_json
+                ):
+                    return "IDEMPOTENT"
+                return "CONFLICT"
+            return "PARTIAL_CONFLICT"
+
+        # Task input
+        if keys and "task.input" in keys[0]:
+            target_key = keys[0]
+            version = int(args[0])
+            payload = args[1]
+            if version > 1:
+                prior_key = keys[1]
+                if prior_key not in self._strings:
+                    return "NON_CONTIGUOUS"
+            if target_key not in self._strings:
+                self._strings[target_key] = payload
+                return "OK"
+            return "IDEMPOTENT" if self._strings[target_key] == payload else "CONFLICT"
+
+        # Stage artifact
+        if keys and "task.artifact" in keys[0]:
+            target_key = keys[0]
+            index_key = keys[1]
+            version = int(args[0])
+            payload = args[1]
+            index_member = args[2]
+            if version > 1:
+                prior_key = keys[2]
+                if prior_key not in self._strings:
+                    return "NON_CONTIGUOUS"
+            if target_key not in self._strings:
+                self._strings[target_key] = payload
+                await self.sadd(index_key, index_member)
+                return "OK"
+            if self._strings[target_key] == payload:
+                await self.sadd(index_key, index_member)
+                return "IDEMPOTENT"
+            return "CONFLICT"
+
+        # Continuation
+        if keys and "task.continuation" in keys[0]:
+            target_key = keys[0]
+            latest_key = keys[1]
+            version = int(args[0])
+            payload = args[1]
+            if version > 1:
+                prior_key = keys[2]
+                if prior_key not in self._strings:
+                    return "NON_CONTIGUOUS"
+            if target_key not in self._strings:
+                self._strings[target_key] = payload
+                cur_latest = int(self._strings.get(latest_key, 0))
+                if version > cur_latest:
+                    self._strings[latest_key] = str(version)
+                return "OK"
+            if self._strings[target_key] == payload:
+                cur_latest = int(self._strings.get(latest_key, 0))
+                if version > cur_latest:
+                    self._strings[latest_key] = str(version)
+                return "IDEMPOTENT"
+            return "CONFLICT"
+
+        # Root authority
+        if keys and "task.authority" in keys[0]:
+            target_key = keys[0]
+            payload = args[0]
+            if target_key not in self._strings:
+                self._strings[target_key] = payload
+                return "OK"
+            return "IDEMPOTENT" if self._strings[target_key] == payload else "CONFLICT"
+
+        return "OK"
+
     def pipeline(self, transaction: bool = True) -> "InMemoryPipeline":
         return InMemoryPipeline(self)
 

@@ -1,9 +1,22 @@
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from .task_input import _check_no_secret_bearing_keys
+from .serialization import (
+    canonical_json_dumps,
+    check_no_credential_bearing_keys,
+    freeze_value,
+    to_plain_json_structure,
+)
+
+MAX_STAGE_ARTIFACT_BYTES: int = 64 * 1024  # 64 KiB canonical UTF-8 limit
+
+ALLOWED_ARTIFACT_TYPES: frozenset[str] = frozenset({
+    "research_material",
+    "analysis_summary",
+})
 
 
 @dataclass(frozen=True)
@@ -14,6 +27,8 @@ class StageArtifact:
     - Retains intermediate research or turn material across turns;
     - Keyed by (producing_task_id, artifact_id, artifact_version);
     - Sealed and write-once;
+    - Bounded to 64 KiB canonical serialized UTF-8;
+    - Constrained to allowlisted artifact types (research_material, analysis_summary);
     - Provenance metadata identifies producing task, turn/assignment, schema, and version;
     - Referenced by continuation and child TaskInput rather than copying content into control state.
     """
@@ -21,12 +36,12 @@ class StageArtifact:
     artifact_id: str
     producing_task_id: str
     artifact_type: str
-    content: dict[str, Any] | str
+    content: Mapping[str, Any]
     created_at: str
     producing_turn_id: str | None = None
     artifact_version: int = 1
     sealed: bool = True
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -55,7 +70,12 @@ class StageArtifact:
 
         if not isinstance(self.artifact_type, str) or not self.artifact_type.strip():
             raise ValueError("artifact_type must be a non-empty string")
-        object.__setattr__(self, "artifact_type", self.artifact_type.strip())
+        clean_type = self.artifact_type.strip()
+        if clean_type not in ALLOWED_ARTIFACT_TYPES:
+            raise ValueError(
+                f"Unknown artifact_type: '{clean_type}'. Allowed types: {sorted(ALLOWED_ARTIFACT_TYPES)}"
+            )
+        object.__setattr__(self, "artifact_type", clean_type)
 
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ValueError("created_at must be a non-empty string")
@@ -64,24 +84,29 @@ class StageArtifact:
         if type(self.sealed) is not bool or not self.sealed:
             raise ValueError("sealed must be True for committed stage artifacts")
 
-        if isinstance(self.content, str):
-            clean_content = self.content.strip()
-            if not clean_content:
-                raise ValueError("content string must not be empty")
-            object.__setattr__(self, "content", clean_content)
-        elif isinstance(self.content, dict):
-            try:
-                json.dumps(self.content)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"content dict must be JSON-serializable: {exc}") from exc
-            object.__setattr__(self, "content", dict(self.content))
-        else:
-            raise TypeError(f"content must be a dict or str, got {type(self.content).__name__}")
+        if not isinstance(self.content, (dict, Mapping)):
+            raise TypeError(f"content must be a dict or Mapping, got {type(self.content).__name__}")
+        if not self.content:
+            raise ValueError("content must not be empty")
+        check_no_credential_bearing_keys(self.content, "StageArtifact content")
+        object.__setattr__(self, "content", freeze_value(self.content))
 
-        if not isinstance(self.metadata, dict):
-            raise TypeError(f"metadata must be a dict, got {type(self.metadata).__name__}")
-        _check_no_secret_bearing_keys(self.metadata, "StageArtifact metadata")
-        object.__setattr__(self, "metadata", dict(self.metadata))
+        if not isinstance(self.metadata, (dict, Mapping)):
+            raise TypeError(f"metadata must be a dict or Mapping, got {type(self.metadata).__name__}")
+        check_no_credential_bearing_keys(self.metadata, "StageArtifact metadata")
+        object.__setattr__(self, "metadata", freeze_value(self.metadata))
+
+        # Size bound enforcement
+        serialized = self.to_json()
+        byte_len = len(serialized.encode("utf-8"))
+        if byte_len > MAX_STAGE_ARTIFACT_BYTES:
+            raise ValueError(
+                f"StageArtifact byte size ({byte_len} bytes) exceeds maximum allowed bound "
+                f"of {MAX_STAGE_ARTIFACT_BYTES} bytes"
+            )
+
+    def byte_size(self) -> int:
+        return len(self.to_json().encode("utf-8"))
 
     @classmethod
     def create(
@@ -89,10 +114,10 @@ class StageArtifact:
         artifact_id: str,
         producing_task_id: str,
         artifact_type: str,
-        content: dict[str, Any] | str,
+        content: Mapping[str, Any],
         producing_turn_id: str | None = None,
         artifact_version: int = 1,
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "StageArtifact":
         return cls(
             artifact_id=artifact_id,
@@ -103,26 +128,26 @@ class StageArtifact:
             created_at=datetime.now(UTC).isoformat(),
             artifact_version=artifact_version,
             sealed=True,
-            metadata=dict(metadata or {}),
+            metadata=metadata or {},
             version=1,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_id": self.artifact_id,
-            "producing_task_id": self.producing_task_id,
-            "producing_turn_id": self.producing_turn_id,
             "artifact_type": self.artifact_type,
             "artifact_version": self.artifact_version,
+            "content": to_plain_json_structure(self.content),
             "created_at": self.created_at,
+            "metadata": to_plain_json_structure(self.metadata),
+            "producing_task_id": self.producing_task_id,
+            "producing_turn_id": self.producing_turn_id,
             "sealed": self.sealed,
-            "content": self.content if isinstance(self.content, str) else dict(self.content),
-            "metadata": dict(self.metadata),
             "version": self.version,
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return canonical_json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StageArtifact":
@@ -131,14 +156,14 @@ class StageArtifact:
 
         allowed_fields = {
             "artifact_id",
-            "producing_task_id",
-            "producing_turn_id",
             "artifact_type",
             "artifact_version",
-            "created_at",
-            "sealed",
             "content",
+            "created_at",
             "metadata",
+            "producing_task_id",
+            "producing_turn_id",
+            "sealed",
             "version",
         }
         unexpected_fields = data.keys() - allowed_fields
@@ -160,19 +185,23 @@ class StageArtifact:
                 raise ValueError(f"{field_name} is required")
 
         metadata = data.get("metadata", {})
-        if not isinstance(metadata, dict):
-            raise TypeError("metadata must be a dict")
+        if not isinstance(metadata, (dict, Mapping)):
+            raise TypeError("metadata must be a dict or Mapping")
+
+        content = data["content"]
+        if not isinstance(content, (dict, Mapping)):
+            raise TypeError(f"content must be a dict or Mapping, got {type(content).__name__}")
 
         return cls(
             artifact_id=data["artifact_id"],
             producing_task_id=data["producing_task_id"],
             producing_turn_id=data.get("producing_turn_id"),
             artifact_type=data["artifact_type"],
-            content=data["content"],
+            content=content,
             created_at=data["created_at"],
             artifact_version=data.get("artifact_version", 1),
             sealed=data.get("sealed", True),
-            metadata=dict(metadata),
+            metadata=metadata,
             version=version,
         )
 

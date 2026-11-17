@@ -1,25 +1,16 @@
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-FORBIDDEN_SECRET_KEY_SUBSTRINGS: tuple[str, ...] = (
-    "secret",
-    "token",
-    "key",
-    "password",
-    "credential",
-    "auth",
+from .artifact_reference import ArtifactReference
+from .serialization import (
+    canonical_json_dumps,
+    check_no_credential_bearing_keys,
+    freeze_value,
+    to_plain_json_structure,
 )
-
-
-def _check_no_secret_bearing_keys(mapping: dict[str, Any], context: str) -> None:
-    for k in mapping:
-        lower_k = str(k).lower()
-        if any(substr in lower_k for substr in FORBIDDEN_SECRET_KEY_SUBSTRINGS):
-            raise ValueError(
-                f"Secret-bearing key '{k}' is forbidden in {context}"
-            )
 
 
 @dataclass(frozen=True)
@@ -27,18 +18,18 @@ class TaskInput:
     """Immutable, versioned record of task input.
 
     Governed by ADR-0007:
-    - Retains durable access to the original task input independently of transient queue payloads;
+    - Retains durable access to original task input independently of transient queue payloads;
     - Keyed by (task_id, input_version);
     - Write-once immutability per version;
-    - May reference immutable task-scoped artifacts.
+    - May reference immutable task-scoped stage artifacts.
     """
 
     task_id: str
     prompt: str
     created_at: str
     input_version: int = 1
-    artifact_references: tuple[str, ...] = ()
-    metadata: dict[str, Any] = field(default_factory=dict)
+    artifact_references: tuple[ArtifactReference, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -70,21 +61,26 @@ class TaskInput:
         object.__setattr__(self, "created_at", self.created_at.strip())
 
         if isinstance(self.artifact_references, (list, tuple)):
-            clean_refs: list[str] = []
+            clean_refs: list[ArtifactReference] = []
             for ref in self.artifact_references:
-                if not isinstance(ref, str) or not ref.strip():
-                    raise ValueError("artifact_references elements must be non-empty strings")
-                clean_refs.append(ref.strip())
+                if isinstance(ref, ArtifactReference):
+                    clean_refs.append(ref)
+                elif isinstance(ref, dict):
+                    clean_refs.append(ArtifactReference.from_dict(ref))
+                else:
+                    raise TypeError(
+                        f"artifact_references elements must be ArtifactReference or dict, got {type(ref).__name__}"
+                    )
             object.__setattr__(self, "artifact_references", tuple(clean_refs))
         else:
             raise TypeError(
                 f"artifact_references must be a tuple or list, got {type(self.artifact_references).__name__}"
             )
 
-        if not isinstance(self.metadata, dict):
-            raise TypeError(f"metadata must be a dict, got {type(self.metadata).__name__}")
-        _check_no_secret_bearing_keys(self.metadata, "TaskInput metadata")
-        object.__setattr__(self, "metadata", dict(self.metadata))
+        if not isinstance(self.metadata, (dict, Mapping)):
+            raise TypeError(f"metadata must be a dict or Mapping, got {type(self.metadata).__name__}")
+        check_no_credential_bearing_keys(self.metadata, "TaskInput metadata")
+        object.__setattr__(self, "metadata", freeze_value(self.metadata))
 
     @classmethod
     def create(
@@ -92,8 +88,8 @@ class TaskInput:
         task_id: str,
         prompt: str,
         input_version: int = 1,
-        artifact_references: tuple[str, ...] | list[str] = (),
-        metadata: dict[str, Any] | None = None,
+        artifact_references: tuple[ArtifactReference, ...] | list[Any] = (),
+        metadata: Mapping[str, Any] | None = None,
     ) -> "TaskInput":
         return cls(
             task_id=task_id,
@@ -101,23 +97,23 @@ class TaskInput:
             created_at=datetime.now(UTC).isoformat(),
             input_version=input_version,
             artifact_references=tuple(artifact_references),
-            metadata=dict(metadata or {}),
+            metadata=metadata or {},
             version=1,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "task_id": self.task_id,
-            "input_version": self.input_version,
-            "prompt": self.prompt,
+            "artifact_references": [ref.to_dict() for ref in self.artifact_references],
             "created_at": self.created_at,
-            "artifact_references": list(self.artifact_references),
-            "metadata": dict(self.metadata),
+            "input_version": self.input_version,
+            "metadata": to_plain_json_structure(self.metadata),
+            "prompt": self.prompt,
+            "task_id": self.task_id,
             "version": self.version,
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return canonical_json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskInput":
@@ -125,12 +121,12 @@ class TaskInput:
             raise TypeError("data must be a dict")
 
         allowed_fields = {
-            "task_id",
-            "input_version",
-            "prompt",
-            "created_at",
             "artifact_references",
+            "created_at",
+            "input_version",
             "metadata",
+            "prompt",
+            "task_id",
             "version",
         }
         unexpected_fields = data.keys() - allowed_fields
@@ -158,8 +154,8 @@ class TaskInput:
             raise TypeError("artifact_references must be a list or tuple")
 
         metadata = data.get("metadata", {})
-        if not isinstance(metadata, dict):
-            raise TypeError("metadata must be a dict")
+        if not isinstance(metadata, (dict, Mapping)):
+            raise TypeError("metadata must be a dict or Mapping")
 
         return cls(
             task_id=data["task_id"],
@@ -167,7 +163,7 @@ class TaskInput:
             created_at=data["created_at"],
             input_version=data.get("input_version", 1),
             artifact_references=tuple(raw_refs),
-            metadata=dict(metadata),
+            metadata=metadata,
             version=version,
         )
 

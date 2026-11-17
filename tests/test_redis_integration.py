@@ -563,7 +563,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
         artifact = StageArtifact(
             artifact_id=art_id,
             producing_task_id=task_id,
-            artifact_type="material",
+            artifact_type="research_material",
             content={"findings": ["alpha", "beta"]},
             created_at=now,
             artifact_version=1,
@@ -577,7 +577,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
         conflict_art = StageArtifact(
             artifact_id=art_id,
             producing_task_id=task_id,
-            artifact_type="material",
+            artifact_type="research_material",
             content={"findings": ["conflict"]},
             created_at=now,
             artifact_version=1,
@@ -590,6 +590,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
         continuation = TaskContinuation(
             parent_task_id=task_id,
             child_task_id=child_id,
+            stage="incorporate_analysis_child",
             control_fields={"analysis_focus": "check evidence"},
             continuation_version=1,
             created_at=now,
@@ -604,6 +605,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
         conflict_cont = TaskContinuation(
             parent_task_id=task_id,
             child_task_id=f"child_{uuid.uuid4().hex[:8]}",
+            stage="incorporate_analysis_child",
             control_fields={"analysis_focus": "conflict focus"},
             continuation_version=1,
             created_at=now,
@@ -620,12 +622,9 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
         assert retrieved_auth == authority
 
         # Conflicting write fails
-        conflict_auth = RootAuthorityRecord(
+        conflict_auth = RootAuthorityRecord.create_default(
             root_task_id=task_id,
-            policy_context="custom",
-            max_delegation_waves=3,
-            created_at=now,
-            updated_at=now,
+            created_at="2026-01-01T00:00:00+00:00",
         )
         with pytest.raises(ConflictingRootAuthorityError):
             await gateway.save_root_authority(conflict_auth)

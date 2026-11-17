@@ -13,6 +13,7 @@ from agent_contracts import (
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    canonical_json_dumps,
 )
 
 from orchestrator.application.inference_history import (
@@ -24,8 +25,11 @@ from orchestrator.domain.capability import AgentCapability
 from orchestrator.domain.task import (
     ConflictingContinuationError,
     ConflictingRootAuthorityError,
+    ConflictingRootTaskRegistrationError,
     ConflictingStageArtifactError,
     ConflictingTaskInputError,
+    CorruptAuthoritativeRecordError,
+    NonContiguousVersionError,
     TaskLineage,
 )
 
@@ -44,6 +48,141 @@ CAPABILITY_QUEUE_MAP: dict[AgentCapability, str] = {
     AgentCapability.GENERAL: "agent.tasks.general",
     AgentCapability.RESEARCH: "agent.tasks.research",
 }
+
+REGISTER_ROOT_TASK_LUA = """
+local exists_status = redis.call('EXISTS', KEYS[1])
+local exists_lineage = redis.call('EXISTS', KEYS[2])
+local exists_input = redis.call('EXISTS', KEYS[3])
+local exists_authority = redis.call('EXISTS', KEYS[4])
+
+if exists_status == 0 and exists_lineage == 0 and exists_input == 0 and exists_authority == 0 then
+    redis.call('SET', KEYS[1], ARGV[1])
+    redis.call('SET', KEYS[2], ARGV[2])
+    redis.call('SET', KEYS[3], ARGV[3])
+    redis.call('SET', KEYS[4], ARGV[4])
+    return 'OK'
+end
+
+if exists_status == 1 and exists_lineage == 1 and exists_input == 1 and exists_authority == 1 then
+    local cur_status = redis.call('GET', KEYS[1])
+    local cur_lineage = redis.call('GET', KEYS[2])
+    local cur_input = redis.call('GET', KEYS[3])
+    local cur_authority = redis.call('GET', KEYS[4])
+    if cur_lineage == ARGV[2] and cur_input == ARGV[3] and cur_authority == ARGV[4] then
+        if cur_status == ARGV[1] or string.find(cur_status, ARGV[5], 1, true) then
+            return 'IDEMPOTENT'
+        end
+    end
+    return 'CONFLICT'
+end
+
+return 'PARTIAL_CONFLICT'
+"""
+
+SAVE_TASK_INPUT_LUA = """
+local target_key = KEYS[1]
+local version = tonumber(ARGV[1])
+local payload = ARGV[2]
+
+if version > 1 then
+    local prior_key = KEYS[2]
+    if (not prior_key) or redis.call('EXISTS', prior_key) == 0 then
+        return 'NON_CONTIGUOUS'
+    end
+end
+
+if redis.call('EXISTS', target_key) == 0 then
+    redis.call('SET', target_key, payload)
+    return 'OK'
+else
+    local existing = redis.call('GET', target_key)
+    if existing == payload then
+        return 'IDEMPOTENT'
+    else
+        return 'CONFLICT'
+    end
+end
+"""
+
+SAVE_STAGE_ARTIFACT_LUA = """
+local target_key = KEYS[1]
+local index_key = KEYS[2]
+local version = tonumber(ARGV[1])
+local payload = ARGV[2]
+local index_member = ARGV[3]
+
+if version > 1 then
+    local prior_key = KEYS[3]
+    if (not prior_key) or redis.call('EXISTS', prior_key) == 0 then
+        return 'NON_CONTIGUOUS'
+    end
+end
+
+if redis.call('EXISTS', target_key) == 0 then
+    redis.call('SET', target_key, payload)
+    redis.call('SADD', index_key, index_member)
+    return 'OK'
+else
+    local existing = redis.call('GET', target_key)
+    if existing == payload then
+        redis.call('SADD', index_key, index_member)
+        return 'IDEMPOTENT'
+    else
+        return 'CONFLICT'
+    end
+end
+"""
+
+SAVE_CONTINUATION_LUA = """
+local target_key = KEYS[1]
+local latest_key = KEYS[2]
+local version = tonumber(ARGV[1])
+local payload = ARGV[2]
+
+if version > 1 then
+    local prior_key = KEYS[3]
+    if (not prior_key) or redis.call('EXISTS', prior_key) == 0 then
+        return 'NON_CONTIGUOUS'
+    end
+end
+
+if redis.call('EXISTS', target_key) == 0 then
+    redis.call('SET', target_key, payload)
+    local cur_latest = redis.call('GET', latest_key)
+    if (not cur_latest) or (tonumber(cur_latest) < version) then
+        redis.call('SET', latest_key, tostring(version))
+    end
+    return 'OK'
+else
+    local existing = redis.call('GET', target_key)
+    if existing == payload then
+        local cur_latest = redis.call('GET', latest_key)
+        if (not cur_latest) or (tonumber(cur_latest) < version) then
+            redis.call('SET', latest_key, tostring(version))
+        end
+        return 'IDEMPOTENT'
+    else
+        return 'CONFLICT'
+    end
+end
+"""
+
+SAVE_ROOT_AUTHORITY_LUA = """
+local key = KEYS[1]
+local payload = ARGV[1]
+
+if redis.call('EXISTS', key) == 0 then
+    redis.call('SET', key, payload)
+    return 'OK'
+else
+    local existing = redis.call('GET', key)
+    if existing == payload then
+        return 'IDEMPOTENT'
+    else
+        return 'CONFLICT'
+    end
+end
+"""
 
 
 class RedisGateway:
@@ -65,42 +204,58 @@ class RedisGateway:
             metadata={},
             version=1,
         )
-        root_authority = RootAuthorityRecord(
+        root_authority = RootAuthorityRecord.create_default(
             root_task_id=task.task_id,
-            policy_context="default",
-            max_delegation_depth=1,
-            max_delegation_waves=1,
-            max_children_per_wave=1,
-            allowed_delegation_edges=(("research", "analysis"),),
-            grants_issued=0,
-            waves_consumed=0,
             created_at=task.created_at,
-            updated_at=task.created_at,
-            version=1,
         )
 
-        async with self._client.pipeline(transaction=True) as pipe:
-            pipe.set(
-                f"task.status:{task.task_id}",
-                json.dumps({"task_id": task.task_id, "status": initial_status}),
+        status_key = f"task.status:{task.task_id}"
+        lineage_key = f"task.lineage:{task.task_id}"
+        input_key = f"task.input:{task.task_id}:1"
+        authority_key = f"task.authority:{task.task_id}"
+
+        status_json = canonical_json_dumps({
+            "status": initial_status,
+            "task_id": task.task_id,
+        })
+        lineage_json = canonical_json_dumps({
+            "parent_task_id": None,
+            "root_task_id": task.root_task_id,
+            "task_id": task.task_id,
+        })
+        input_json = task_input.to_json()
+        authority_json = root_authority.to_json()
+        task_id_needle = f'"task_id":"{task.task_id}"'
+
+        raw_result = await self._client.eval(
+            REGISTER_ROOT_TASK_LUA,
+            4,
+            status_key,
+            lineage_key,
+            input_key,
+            authority_key,
+            status_json,
+            lineage_json,
+            input_json,
+            authority_json,
+            task_id_needle,
+        )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "CONFLICT":
+            raise ConflictingRootTaskRegistrationError(
+                f"Root task '{task.task_id}' already exists with conflicting state"
             )
-            pipe.set(
-                f"task.lineage:{task.task_id}",
-                json.dumps({
-                    "task_id": task.task_id,
-                    "root_task_id": task.root_task_id,
-                    "parent_task_id": None,
-                }),
+        if result == "PARTIAL_CONFLICT":
+            raise ConflictingRootTaskRegistrationError(
+                f"Root task '{task.task_id}' has inconsistent or partial authoritative state in storage"
             )
-            pipe.set(
-                f"task.input:{task.task_id}:1",
-                task_input.to_json(),
-            )
-            pipe.set(
-                f"task.authority:{task.task_id}",
-                root_authority.to_json(),
-            )
-            await pipe.execute()
+        raise RuntimeError(f"Unexpected Redis register_root_task result: {result}")
 
     async def register_child_task(
         self, task: TaskRequested, initial_status: str = "pending_dispatch"
@@ -116,14 +271,14 @@ class RedisGateway:
         async with self._client.pipeline(transaction=True) as pipe:
             pipe.set(
                 f"task.status:{task.task_id}",
-                json.dumps({"task_id": task.task_id, "status": initial_status}),
+                canonical_json_dumps({"status": initial_status, "task_id": task.task_id}),
             )
             pipe.set(
                 f"task.lineage:{task.task_id}",
-                json.dumps({
-                    "task_id": task.task_id,
-                    "root_task_id": task.root_task_id,
+                canonical_json_dumps({
                     "parent_task_id": task.parent_task_id,
+                    "root_task_id": task.root_task_id,
+                    "task_id": task.task_id,
                 }),
             )
             pipe.sadd(f"task.children:{task.parent_task_id}", task.task_id)
@@ -133,16 +288,19 @@ class RedisGateway:
         clean_task_id = str(task_id).strip()
         if not clean_task_id:
             return None
-        raw = await self._client.get(f"task.lineage:{clean_task_id}")
+        key = f"task.lineage:{clean_task_id}"
+        raw = await self._client.get(key)
         if raw is None:
             return None
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
-                return None
+                raise TypeError("Lineage payload must be a JSON object")
             return TaskLineage.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt TaskLineage record at key '{key}': {exc}"
+            ) from exc
 
     async def get_children(self, parent_task_id: str) -> list[str]:
         clean_parent_task_id = str(parent_task_id).strip()
@@ -164,37 +322,66 @@ class RedisGateway:
             raise ValueError("status must be a non-empty string")
         await self._client.set(
             f"task.status:{clean_task_id}",
-            json.dumps({"task_id": clean_task_id, "status": clean_status}),
+            canonical_json_dumps({"status": clean_status, "task_id": clean_task_id}),
         )
 
     async def get_status(self, task_id: str) -> str | None:
         clean_task_id = str(task_id).strip()
         if not clean_task_id:
             return None
-        raw = await self._client.get(f"task.status:{clean_task_id}")
+        key = f"task.status:{clean_task_id}"
+        raw = await self._client.get(key)
         if raw is None:
             return None
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
-            if isinstance(data, dict):
-                return data.get("status")
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return None
+            if isinstance(data, dict) and isinstance(data.get("status"), str):
+                return data["status"]
+            raise ValueError("Status record must be a JSON object containing a string 'status'")
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt task status record at key '{key}': {exc}"
+            ) from exc
 
     async def save_task_input(self, task_input: TaskInput) -> None:
-        key = f"task.input:{task_input.task_id}:{task_input.input_version}"
-        raw = await self._client.get(key)
-        if raw is not None:
-            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
-            existing = TaskInput.from_dict(existing_data)
-            if existing == task_input:
-                return
+        target_key = f"task.input:{task_input.task_id}:{task_input.input_version}"
+        payload = task_input.to_json()
+        if task_input.input_version == 1:
+            raw_result = await self._client.eval(
+                SAVE_TASK_INPUT_LUA,
+                1,
+                target_key,
+                task_input.input_version,
+                payload,
+            )
+        else:
+            prior_key = f"task.input:{task_input.task_id}:{task_input.input_version - 1}"
+            raw_result = await self._client.eval(
+                SAVE_TASK_INPUT_LUA,
+                2,
+                target_key,
+                prior_key,
+                task_input.input_version,
+                payload,
+            )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "NON_CONTIGUOUS":
+            raise NonContiguousVersionError(
+                f"Cannot save TaskInput version {task_input.input_version} for task "
+                f"'{task_input.task_id}' because prior version {task_input.input_version - 1} does not exist"
+            )
+        if result == "CONFLICT":
             raise ConflictingTaskInputError(
                 f"TaskInput for task '{task_input.task_id}' version {task_input.input_version} "
                 "already exists with conflicting data"
             )
-        await self._client.set(key, task_input.to_json())
+        raise RuntimeError(f"Unexpected Redis save_task_input result: {result}")
 
     async def get_task_input(
         self, task_id: str, input_version: int = 1
@@ -202,39 +389,72 @@ class RedisGateway:
         clean_task_id = str(task_id).strip()
         if not clean_task_id:
             return None
-        raw = await self._client.get(f"task.input:{clean_task_id}:{input_version}")
+        key = f"task.input:{clean_task_id}:{input_version}"
+        raw = await self._client.get(key)
         if raw is None:
             return None
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
-                return None
+                raise TypeError("Payload must be a JSON object")
             return TaskInput.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt TaskInput record at key '{key}': {exc}"
+            ) from exc
 
     async def save_stage_artifact(self, artifact: StageArtifact) -> None:
-        key = (
+        target_key = (
             f"task.artifact:{artifact.producing_task_id}:"
             f"{artifact.artifact_id}:{artifact.artifact_version}"
         )
-        raw = await self._client.get(key)
-        if raw is not None:
-            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
-            existing = StageArtifact.from_dict(existing_data)
-            if existing == artifact:
-                return
+        index_key = f"task.artifacts:{artifact.producing_task_id}"
+        payload = artifact.to_json()
+        index_member = f"{artifact.artifact_id}:{artifact.artifact_version}"
+        if artifact.artifact_version == 1:
+            raw_result = await self._client.eval(
+                SAVE_STAGE_ARTIFACT_LUA,
+                2,
+                target_key,
+                index_key,
+                artifact.artifact_version,
+                payload,
+                index_member,
+            )
+        else:
+            prior_key = (
+                f"task.artifact:{artifact.producing_task_id}:"
+                f"{artifact.artifact_id}:{artifact.artifact_version - 1}"
+            )
+            raw_result = await self._client.eval(
+                SAVE_STAGE_ARTIFACT_LUA,
+                3,
+                target_key,
+                index_key,
+                prior_key,
+                artifact.artifact_version,
+                payload,
+                index_member,
+            )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "NON_CONTIGUOUS":
+            raise NonContiguousVersionError(
+                f"Cannot save StageArtifact version {artifact.artifact_version} for task "
+                f"'{artifact.producing_task_id}', artifact '{artifact.artifact_id}' because "
+                f"prior version {artifact.artifact_version - 1} does not exist"
+            )
+        if result == "CONFLICT":
             raise ConflictingStageArtifactError(
                 f"StageArtifact '{artifact.artifact_id}' for task '{artifact.producing_task_id}' "
                 f"version {artifact.artifact_version} already exists with conflicting data"
             )
-        async with self._client.pipeline(transaction=True) as pipe:
-            pipe.set(key, artifact.to_json())
-            pipe.sadd(
-                f"task.artifacts:{artifact.producing_task_id}",
-                f"{artifact.artifact_id}:{artifact.artifact_version}",
-            )
-            await pipe.execute()
+        raise RuntimeError(f"Unexpected Redis save_stage_artifact result: {result}")
 
     async def get_stage_artifact(
         self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
@@ -250,33 +470,62 @@ class RedisGateway:
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
-                return None
+                raise TypeError("Payload must be a JSON object")
             return StageArtifact.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt StageArtifact record at key '{key}': {exc}"
+            ) from exc
 
     async def save_continuation(self, continuation: TaskContinuation) -> None:
-        key = (
+        target_key = (
             f"task.continuation:{continuation.parent_task_id}:"
             f"{continuation.continuation_version}"
         )
-        raw = await self._client.get(key)
-        if raw is not None:
-            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
-            existing = TaskContinuation.from_dict(existing_data)
-            if existing == continuation:
-                return
+        latest_key = f"task.continuation_latest:{continuation.parent_task_id}"
+        payload = continuation.to_json()
+        if continuation.continuation_version == 1:
+            raw_result = await self._client.eval(
+                SAVE_CONTINUATION_LUA,
+                2,
+                target_key,
+                latest_key,
+                continuation.continuation_version,
+                payload,
+            )
+        else:
+            prior_key = (
+                f"task.continuation:{continuation.parent_task_id}:"
+                f"{continuation.continuation_version - 1}"
+            )
+            raw_result = await self._client.eval(
+                SAVE_CONTINUATION_LUA,
+                3,
+                target_key,
+                latest_key,
+                prior_key,
+                continuation.continuation_version,
+                payload,
+            )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "NON_CONTIGUOUS":
+            raise NonContiguousVersionError(
+                f"Cannot save TaskContinuation version {continuation.continuation_version} "
+                f"for parent task '{continuation.parent_task_id}' because prior version "
+                f"{continuation.continuation_version - 1} does not exist"
+            )
+        if result == "CONFLICT":
             raise ConflictingContinuationError(
                 f"TaskContinuation for parent task '{continuation.parent_task_id}' "
                 f"version {continuation.continuation_version} already exists with conflicting data"
             )
-        async with self._client.pipeline(transaction=True) as pipe:
-            pipe.set(key, continuation.to_json())
-            pipe.set(
-                f"task.continuation_latest:{continuation.parent_task_id}",
-                str(continuation.continuation_version),
-            )
-            await pipe.execute()
+        raise RuntimeError(f"Unexpected Redis save_continuation result: {result}")
 
     async def get_continuation(
         self, parent_task_id: str, continuation_version: int = 1
@@ -291,24 +540,35 @@ class RedisGateway:
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
-                return None
+                raise TypeError("Payload must be a JSON object")
             return TaskContinuation.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt TaskContinuation record at key '{key}': {exc}"
+            ) from exc
 
     async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
-        key = f"task.authority:{authority.root_task_id}"
-        raw = await self._client.get(key)
-        if raw is not None:
-            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
-            existing = RootAuthorityRecord.from_dict(existing_data)
-            if existing == authority:
-                return
+        target_key = f"task.authority:{authority.root_task_id}"
+        payload = authority.to_json()
+        raw_result = await self._client.eval(
+            SAVE_ROOT_AUTHORITY_LUA,
+            1,
+            target_key,
+            payload,
+        )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "CONFLICT":
             raise ConflictingRootAuthorityError(
                 f"RootAuthorityRecord for root task '{authority.root_task_id}' "
                 "already exists with conflicting data"
             )
-        await self._client.set(key, authority.to_json())
+        raise RuntimeError(f"Unexpected Redis save_root_authority result: {result}")
 
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
         clean_root_task_id = str(root_task_id).strip()
@@ -321,10 +581,12 @@ class RedisGateway:
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
-                return None
+                raise TypeError("Payload must be a JSON object")
             return RootAuthorityRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt RootAuthorityRecord at key '{key}': {exc}"
+            ) from exc
 
     async def dispatch(self, task: TaskRequested, target: str) -> None:
         """Atomically enqueue task payload and establish pending status.

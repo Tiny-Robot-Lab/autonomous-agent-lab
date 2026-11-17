@@ -26,6 +26,18 @@ class ConflictingRootAuthorityError(Exception):
     """Raised when attempting to overwrite an existing RootAuthorityRecord with conflicting policy data."""
 
 
+class ConflictingRootTaskRegistrationError(Exception):
+    """Raised when attempting to register a root task with conflicting or partial state."""
+
+
+class NonContiguousVersionError(Exception):
+    """Raised when a versioned record write skips a contiguous sequence number (N > 1 without N - 1)."""
+
+
+class CorruptAuthoritativeRecordError(Exception):
+    """Raised when an authoritative record in storage is present but malformed or invalid."""
+
+
 @dataclass(frozen=True)
 class Task:
     prompt: str

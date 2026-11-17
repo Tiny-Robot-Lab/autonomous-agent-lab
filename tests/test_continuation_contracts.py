@@ -1,22 +1,28 @@
-import json
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 import pytest
 from agent_contracts import (
     ALL_TASK_LIFECYCLE_STATUSES,
+    ALLOWED_ARTIFACT_TYPES,
     ALLOWED_CONTINUATION_STAGES,
     CHILD_LIFECYCLE_STATUSES,
-    DEFAULT_MAX_CONTINUATION_BYTES,
-    FORBIDDEN_SECRET_KEY_SUBSTRINGS,
+    MAX_CONTINUATION_BYTES,
+    MAX_STAGE_ARTIFACT_BYTES,
     NONTERMINAL_TASK_LIFECYCLE_STATUSES,
     PARENT_LIFECYCLE_STATUSES,
     STAGE_CONTROL_FIELDS_ALLOWLIST,
     TERMINAL_TASK_LIFECYCLE_STATUSES,
+    ArtifactReference,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
     TaskInput,
     TaskLifecycleStatus,
+    canonical_json_dumps,
+    check_no_credential_bearing_keys,
+    freeze_value,
+    is_credential_bearing_key,
     validate_lifecycle_status,
 )
 
@@ -83,32 +89,134 @@ def test_validate_lifecycle_status() -> None:
 
 
 # ==============================================================================
-# 2. TaskInput Contract Tests
+# 2. Serialization and Credential Detection Tests
+# ==============================================================================
+
+
+def test_canonical_json_dumps_deterministic_and_compact() -> None:
+    data = {"z": 1, "a": 2, "m": {"b": 3, "a": 4}}
+    serialized = canonical_json_dumps(data)
+    # Keys must be sorted and separators compact (no spaces)
+    assert serialized == '{"a":2,"m":{"a":4,"b":3},"z":1}'
+
+
+def test_credential_bearing_key_detection() -> None:
+    # Forbidden tokens and compound keys
+    assert is_credential_bearing_key("api_key") is True
+    assert is_credential_bearing_key("apiKey") is True
+    assert is_credential_bearing_key("auth_token") is True
+    assert is_credential_bearing_key("client_secret") is True
+    assert is_credential_bearing_key("user_password") is True
+    assert is_credential_bearing_key("bearer") is True
+    assert is_credential_bearing_key("secret_field") is True
+
+    # Legitimate domain words must NOT be flagged
+    assert is_credential_bearing_key("author") is False
+    assert is_credential_bearing_key("authenticity") is False
+    assert is_credential_bearing_key("keyboard") is False
+    assert is_credential_bearing_key("key_findings") is False
+    assert is_credential_bearing_key("auth_method") is False
+    assert is_credential_bearing_key("author_name") is False
+
+
+def test_check_no_credential_bearing_keys_nested() -> None:
+    # Safe structure
+    safe_data = {
+        "author": "Alice",
+        "key_findings": ["finding1", "finding2"],
+        "nested": {"auth_method": "deterministic_check", "count": 10},
+    }
+    check_no_credential_bearing_keys(safe_data, context="test")
+
+    # Unsafe top-level
+    with pytest.raises(ValueError, match="Credential-bearing key 'api_key'"):
+        check_no_credential_bearing_keys({"api_key": "secret"}, context="test")
+
+    # Unsafe nested
+    with pytest.raises(ValueError, match="Credential-bearing key 'access_token'"):
+        check_no_credential_bearing_keys({"level1": {"access_token": "secret"}}, context="test")
+
+
+def test_freeze_value_deep_immutability() -> None:
+    mutable = {"a": [1, 2, {"b": 3}], "c": "text"}
+    frozen = freeze_value(mutable)
+    assert isinstance(frozen, MappingProxyType)
+    assert isinstance(frozen["a"], tuple)
+    assert isinstance(frozen["a"][2], MappingProxyType)
+
+    with pytest.raises(TypeError):
+        frozen["c"] = "mutated"  # type: ignore[index]
+
+
+# ==============================================================================
+# 3. ArtifactReference Tests
+# ==============================================================================
+
+
+def test_artifact_reference_valid_creation_and_roundtrip() -> None:
+    ref = ArtifactReference("p-task-1", "art-100", 2)
+    assert ref.producing_task_id == "p-task-1"
+    assert ref.artifact_id == "art-100"
+    assert ref.artifact_version == 2
+
+    d = ref.to_dict()
+    assert d == {
+        "artifact_id": "art-100",
+        "artifact_version": 2,
+        "producing_task_id": "p-task-1",
+    }
+    from_dict_ref = ArtifactReference.from_dict(d)
+    assert from_dict_ref == ref
+
+
+def test_artifact_reference_validation_errors() -> None:
+    with pytest.raises(ValueError, match="producing_task_id must be a non-empty string"):
+        ArtifactReference("   ", "art-1", 1)
+
+    with pytest.raises(ValueError, match="artifact_id must be a non-empty string"):
+        ArtifactReference("p-1", "   ", 1)
+
+    with pytest.raises(ValueError, match="artifact_version must be >= 1"):
+        ArtifactReference("p-1", "art-1", 0)
+
+    with pytest.raises(TypeError, match="artifact_version must be an int"):
+        ArtifactReference("p-1", "art-1", True)  # type: ignore[arg-type]
+
+
+# ==============================================================================
+# 4. TaskInput Contract Tests
 # ==============================================================================
 
 
 def test_task_input_valid_creation_and_roundtrip() -> None:
     now = datetime.now(UTC).isoformat()
+    ref1 = ArtifactReference("p-task-1", "art-1", 1)
+    ref2 = ArtifactReference("p-task-1", "art-2", 1)
     record = TaskInput(
         task_id="task-123",
         prompt="Analyze system telemetry",
         created_at=now,
         input_version=1,
-        artifact_references=("art-1", "art-2"),
-        metadata={"priority": "high", "domain": "infra"},
+        artifact_references=(ref1, ref2),
+        metadata={"priority": "high", "domain": "infra", "author": "system"},
         version=1,
     )
 
     assert record.task_id == "task-123"
     assert record.prompt == "Analyze system telemetry"
     assert record.input_version == 1
-    assert record.artifact_references == ("art-1", "art-2")
-    assert record.metadata == {"priority": "high", "domain": "infra"}
+    assert record.artifact_references == (ref1, ref2)
+    assert record.metadata["priority"] == "high"
     assert record.version == 1
+
+    # Immutability check
+    with pytest.raises(TypeError):
+        record.metadata["new_key"] = "forbidden"  # type: ignore[index]
 
     d = record.to_dict()
     assert d["task_id"] == "task-123"
-    assert d["artifact_references"] == ["art-1", "art-2"]
+    assert len(d["artifact_references"]) == 2
+    assert d["artifact_references"][0]["artifact_id"] == "art-1"
     assert d["input_version"] == 1
 
     from_dict_record = TaskInput.from_dict(d)
@@ -119,15 +227,16 @@ def test_task_input_valid_creation_and_roundtrip() -> None:
 
 
 def test_task_input_create_factory() -> None:
+    ref = ArtifactReference("task-456", "art-abc", 1)
     record = TaskInput.create(
         task_id="task-456",
         prompt="Execute evaluation benchmark",
         input_version=2,
-        artifact_references=["art-abc"],
+        artifact_references=[ref],
     )
     assert record.task_id == "task-456"
     assert record.input_version == 2
-    assert record.artifact_references == ("art-abc",)
+    assert record.artifact_references == (ref,)
     assert record.version == 1
     assert record.metadata == {}
 
@@ -164,16 +273,25 @@ def test_task_input_validation_errors() -> None:
         TaskInput(task_id="task-1", prompt="hello", created_at=now, version=True)  # type: ignore[arg-type]
 
 
-def test_task_input_rejects_secret_bearing_metadata_keys() -> None:
+def test_task_input_credential_detection() -> None:
     now = datetime.now(UTC).isoformat()
-    for token in FORBIDDEN_SECRET_KEY_SUBSTRINGS:
-        with pytest.raises(ValueError, match="Secret-bearing key"):
-            TaskInput(
-                task_id="task-1",
-                prompt="hello",
-                created_at=now,
-                metadata={f"user_{token}_id": "confidential"},
-            )
+    # Forbidden key
+    with pytest.raises(ValueError, match="Credential-bearing key 'api_key'"):
+        TaskInput(
+            task_id="task-1",
+            prompt="hello",
+            created_at=now,
+            metadata={"api_key": "confidential"},
+        )
+
+    # Allowed domain keys containing 'key' or 'auth'
+    record = TaskInput(
+        task_id="task-1",
+        prompt="hello",
+        created_at=now,
+        metadata={"author": "alice", "keyboard": "us", "auth_method": "deterministic"},
+    )
+    assert record.metadata["author"] == "alice"
 
 
 def test_task_input_from_dict_rejects_unexpected_fields() -> None:
@@ -191,7 +309,7 @@ def test_task_input_from_dict_rejects_unexpected_fields() -> None:
 
 
 # ==============================================================================
-# 3. StageArtifact Contract Tests
+# 5. StageArtifact Contract Tests
 # ==============================================================================
 
 
@@ -214,11 +332,17 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
     assert artifact.producing_task_id == "task-parent-1"
     assert artifact.producing_turn_id == "turn-claim-1"
     assert artifact.sealed is True
-    assert artifact.content == {"findings": ["finding-1", "finding-2"], "count": 2}
+    assert artifact.artifact_type == "research_material"
+    assert artifact.content == {"findings": ("finding-1", "finding-2"), "count": 2}
+
+    # Deep immutability
+    with pytest.raises(TypeError):
+        artifact.content["new_key"] = "fail"  # type: ignore[index]
 
     d = artifact.to_dict()
     assert d["artifact_id"] == "art-999"
     assert d["sealed"] is True
+    assert d["artifact_type"] == "research_material"
 
     from_dict_artifact = StageArtifact.from_dict(d)
     assert from_dict_artifact == artifact
@@ -227,72 +351,109 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
     assert from_json_artifact == artifact
 
 
-def test_stage_artifact_string_content_and_create_factory() -> None:
-    artifact = StageArtifact.create(
-        artifact_id="art-text-1",
-        producing_task_id="task-p2",
-        artifact_type="text_summary",
-        content="Summarized intermediate findings from turn 1.",
-        producing_turn_id="turn-abc",
-    )
-    assert artifact.artifact_id == "art-text-1"
-    assert artifact.content == "Summarized intermediate findings from turn 1."
-    assert artifact.sealed is True
+def test_stage_artifact_allowlisted_types() -> None:
+    now = datetime.now(UTC).isoformat()
+    for valid_type in ALLOWED_ARTIFACT_TYPES:
+        art = StageArtifact(
+            artifact_id="art-1",
+            producing_task_id="task-1",
+            artifact_type=valid_type,
+            content={"sample": "data"},
+            created_at=now,
+        )
+        assert art.artifact_type == valid_type
+
+    with pytest.raises(ValueError, match="Unknown artifact_type"):
+        StageArtifact(
+            artifact_id="art-1",
+            producing_task_id="task-1",
+            artifact_type="arbitrary_unallowlisted_type",
+            content={"sample": "data"},
+            created_at=now,
+        )
 
 
-def test_stage_artifact_validation_errors() -> None:
+def test_stage_artifact_content_must_be_non_empty_dict() -> None:
     now = datetime.now(UTC).isoformat()
 
-    # Sealed must be True
-    with pytest.raises(ValueError, match="sealed must be True"):
+    # Non-dict content rejected
+    with pytest.raises(TypeError, match="content must be a dict"):
         StageArtifact(
             artifact_id="art-1",
             producing_task_id="task-1",
-            artifact_type="type",
-            content="abc",
+            artifact_type="research_material",
+            content="string_content",  # type: ignore[arg-type]
             created_at=now,
-            sealed=False,
         )
 
-    # Empty content
-    with pytest.raises(ValueError, match="content string must not be empty"):
+    # Empty dict rejected
+    with pytest.raises(ValueError, match="content must not be empty"):
         StageArtifact(
             artifact_id="art-1",
             producing_task_id="task-1",
-            artifact_type="type",
-            content="   ",
+            artifact_type="research_material",
+            content={},
             created_at=now,
         )
 
-    # Empty artifact_id
-    with pytest.raises(ValueError, match="artifact_id must be a non-empty string"):
-        StageArtifact(
-            artifact_id="  ",
-            producing_task_id="task-1",
-            artifact_type="type",
-            content="abc",
-            created_at=now,
-        )
 
-    # Secret-bearing metadata rejected
-    with pytest.raises(ValueError, match="Secret-bearing key"):
+def test_stage_artifact_size_bound_64kib() -> None:
+    now = datetime.now(UTC).isoformat()
+    assert MAX_STAGE_ARTIFACT_BYTES == 65536
+
+    # Under 64 KiB
+    valid = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="task-1",
+        artifact_type="research_material",
+        content={"data": "a" * 1000},
+        created_at=now,
+    )
+    assert valid.byte_size() <= MAX_STAGE_ARTIFACT_BYTES
+
+    # Over 64 KiB
+    with pytest.raises(ValueError, match="exceeds maximum allowed bound of 65536 bytes"):
         StageArtifact(
             artifact_id="art-1",
             producing_task_id="task-1",
-            artifact_type="type",
-            content="abc",
+            artifact_type="research_material",
+            content={"data": "a" * 66000},
             created_at=now,
-            metadata={"auth_token": "secret"},
+        )
+
+
+def test_stage_artifact_credential_detection() -> None:
+    now = datetime.now(UTC).isoformat()
+    # Content with credential key
+    with pytest.raises(ValueError, match="Credential-bearing key 'client_secret'"):
+        StageArtifact(
+            artifact_id="art-1",
+            producing_task_id="task-1",
+            artifact_type="research_material",
+            content={"client_secret": "leak"},
+            created_at=now,
+        )
+
+    # Metadata with credential key
+    with pytest.raises(ValueError, match="Credential-bearing key 'access_token'"):
+        StageArtifact(
+            artifact_id="art-1",
+            producing_task_id="task-1",
+            artifact_type="research_material",
+            content={"valid": "content"},
+            metadata={"access_token": "leak"},
+            created_at=now,
         )
 
 
 # ==============================================================================
-# 4. TaskContinuation Contract Tests
+# 6. TaskContinuation Contract Tests
 # ==============================================================================
 
 
 def test_task_continuation_valid_creation_and_roundtrip() -> None:
     now = datetime.now(UTC).isoformat()
+    ref = ArtifactReference("parent-123", "art-1", 1)
     continuation = TaskContinuation(
         parent_task_id="parent-123",
         child_task_id="child-456",
@@ -304,7 +465,7 @@ def test_task_continuation_valid_creation_and_roundtrip() -> None:
             "child_intent": "analyze evidence density",
             "min_findings": 3,
         },
-        artifact_references=("art-1",),
+        artifact_references=(ref,),
         continuation_version=1,
         created_at=now,
         updated_at=now,
@@ -315,11 +476,17 @@ def test_task_continuation_valid_creation_and_roundtrip() -> None:
     assert continuation.child_task_id == "child-456"
     assert continuation.stage == "incorporate_analysis_child"
     assert continuation.continuation_version == 1
-    assert continuation.byte_size() <= DEFAULT_MAX_CONTINUATION_BYTES
+    assert continuation.byte_size() <= MAX_CONTINUATION_BYTES
+
+    # Deep immutability
+    with pytest.raises(TypeError):
+        continuation.control_fields["extra"] = "fail"  # type: ignore[index]
 
     d = continuation.to_dict()
     assert d["parent_task_id"] == "parent-123"
     assert d["control_fields"]["min_findings"] == 3
+    assert len(d["artifact_references"]) == 1
+    assert d["artifact_references"][0]["producing_task_id"] == "parent-123"
 
     from_dict_cont = TaskContinuation.from_dict(d)
     assert from_dict_cont == continuation
@@ -328,10 +495,26 @@ def test_task_continuation_valid_creation_and_roundtrip() -> None:
     assert from_json_cont == continuation
 
 
-def test_task_continuation_stage_allowlist() -> None:
+def test_task_continuation_cross_task_scoping_enforcement() -> None:
+    now = datetime.now(UTC).isoformat()
+    # Artifact produced by foreign task must be rejected
+    foreign_ref = ArtifactReference("foreign-task-999", "art-1", 1)
+    with pytest.raises(ValueError, match="Cross-task artifact reference rejected"):
+        TaskContinuation(
+            parent_task_id="parent-123",
+            child_task_id="child-456",
+            control_fields={"analysis_focus": "test"},
+            artifact_references=(foreign_ref,),
+            created_at=now,
+            updated_at=now,
+        )
+
+
+def test_task_continuation_stage_and_control_fields_allowlist() -> None:
     now = datetime.now(UTC).isoformat()
 
     assert "incorporate_analysis_child" in ALLOWED_CONTINUATION_STAGES
+    assert "incorporate_analysis_child" in STAGE_CONTROL_FIELDS_ALLOWLIST
 
     with pytest.raises(ValueError, match="Unknown continuation stage"):
         TaskContinuation(
@@ -341,13 +524,6 @@ def test_task_continuation_stage_allowlist() -> None:
             created_at=now,
             updated_at=now,
         )
-
-
-def test_task_continuation_control_fields_allowlist() -> None:
-    now = datetime.now(UTC).isoformat()
-    allowed = STAGE_CONTROL_FIELDS_ALLOWLIST["incorporate_analysis_child"]
-    assert "analysis_focus" in allowed
-    assert "material_summary" in allowed
 
     # Disallowed control field
     with pytest.raises(ValueError, match="Unallowlisted control fields for stage"):
@@ -361,15 +537,26 @@ def test_task_continuation_control_fields_allowlist() -> None:
         )
 
 
-def test_task_continuation_rejects_secret_bearing_control_fields() -> None:
+def test_task_continuation_size_bound_16kib() -> None:
     now = datetime.now(UTC).isoformat()
-    # If someone tries to pass a field with 'key', 'token', 'auth'
-    with pytest.raises(ValueError):
+    assert MAX_CONTINUATION_BYTES == 16384
+
+    # Fits within 16 KiB
+    valid = TaskContinuation(
+        parent_task_id="parent-1",
+        child_task_id="child-1",
+        control_fields={"material_summary": "x" * 500},
+        created_at=now,
+        updated_at=now,
+    )
+    assert valid.byte_size() <= MAX_CONTINUATION_BYTES
+
+    # Exceeds 16 KiB
+    with pytest.raises(ValueError, match="exceeds maximum bound of 16384 bytes"):
         TaskContinuation(
             parent_task_id="parent-1",
             child_task_id="child-1",
-            stage="incorporate_analysis_child",
-            control_fields={"analysis_focus": "test", "auth_token": "leak"},
+            control_fields={"material_summary": "x" * 17000},
             created_at=now,
             updated_at=now,
         )
@@ -386,56 +573,8 @@ def test_task_continuation_rejects_self_child_parent() -> None:
         )
 
 
-def test_task_continuation_size_bound_enforcement() -> None:
-    now = datetime.now(UTC).isoformat()
-
-    # Fits within 16 KiB
-    valid = TaskContinuation(
-        parent_task_id="parent-1",
-        child_task_id="child-1",
-        control_fields={"material_summary": "x" * 500},
-        created_at=now,
-        updated_at=now,
-    )
-    assert valid.byte_size() < DEFAULT_MAX_CONTINUATION_BYTES
-
-    # Exceeds 16 KiB (16384 bytes)
-    with pytest.raises(ValueError, match="exceeds maximum bound of 16384 bytes"):
-        TaskContinuation(
-            parent_task_id="parent-1",
-            child_task_id="child-1",
-            control_fields={"material_summary": "x" * 17000},
-            created_at=now,
-            updated_at=now,
-        )
-
-
-def test_task_continuation_from_dict_and_from_json_size_bound() -> None:
-    now = datetime.now(UTC).isoformat()
-    payload = {
-        "parent_task_id": "parent-1",
-        "child_task_id": "child-1",
-        "input_version": 1,
-        "continuation_capability": "research",
-        "stage": "incorporate_analysis_child",
-        "control_fields": {"material_summary": "x" * 500},
-        "artifact_references": [],
-        "continuation_version": 1,
-        "created_at": now,
-        "updated_at": now,
-        "version": 1,
-    }
-
-    # Custom strict max_bytes (e.g. 100 bytes)
-    with pytest.raises(ValueError, match="exceeds maximum bound of 100 bytes"):
-        TaskContinuation.from_dict(payload, max_bytes=100)
-
-    with pytest.raises(ValueError, match="exceeds maximum bound of 100 bytes"):
-        TaskContinuation.from_json(json.dumps(payload), max_bytes=100)
-
-
 # ==============================================================================
-# 5. RootAuthorityRecord Contract Tests
+# 7. RootAuthorityRecord Contract Tests
 # ==============================================================================
 
 
@@ -487,40 +626,68 @@ def test_root_authority_create_default() -> None:
     assert auth.version == 1
 
 
-def test_root_authority_validation_errors() -> None:
+def test_root_authority_baseline_invariants_enforced() -> None:
     now = datetime.now(UTC).isoformat()
 
-    # Secret in policy_context rejected
-    with pytest.raises(ValueError, match="policy_context contains forbidden secret-bearing token"):
+    # policy_context != 'default'
+    with pytest.raises(ValueError, match="policy_context must be 'default'"):
         RootAuthorityRecord(
             root_task_id="root-1",
-            policy_context="contains_api_token_here",
+            policy_context="escalated_context",
             created_at=now,
             updated_at=now,
         )
 
-    # Negative bounds rejected
-    with pytest.raises(ValueError, match="max_delegation_depth must be >= 1"):
+    # max_delegation_depth != 1
+    with pytest.raises(ValueError, match="max_delegation_depth must be 1"):
         RootAuthorityRecord(
             root_task_id="root-1",
-            max_delegation_depth=0,
+            max_delegation_depth=2,
             created_at=now,
             updated_at=now,
         )
 
-    with pytest.raises(ValueError, match="grants_issued must be >= 0"):
+    # max_delegation_waves != 1
+    with pytest.raises(ValueError, match="max_delegation_waves must be 1"):
         RootAuthorityRecord(
             root_task_id="root-1",
-            grants_issued=-1,
+            max_delegation_waves=2,
             created_at=now,
             updated_at=now,
         )
 
-    # Empty edge element rejected
-    with pytest.raises(ValueError, match="delegation edge elements must be non-empty strings"):
+    # max_children_per_wave != 1
+    with pytest.raises(ValueError, match="max_children_per_wave must be 1"):
         RootAuthorityRecord(
             root_task_id="root-1",
-            allowed_delegation_edges=(("research", "   "),),
+            max_children_per_wave=2,
+            created_at=now,
+            updated_at=now,
+        )
+
+    # grants_issued != 0
+    with pytest.raises(ValueError, match="grants_issued must be 0 at ingestion"):
+        RootAuthorityRecord(
+            root_task_id="root-1",
+            grants_issued=1,
+            created_at=now,
+            updated_at=now,
+        )
+
+    # waves_consumed != 0
+    with pytest.raises(ValueError, match="waves_consumed must be 0 at ingestion"):
+        RootAuthorityRecord(
+            root_task_id="root-1",
+            waves_consumed=1,
+            created_at=now,
+            updated_at=now,
+        )
+
+    # allowed_delegation_edges != (("research", "analysis"),)
+    with pytest.raises(ValueError, match="allowed_delegation_edges must be"):
+        RootAuthorityRecord(
+            root_task_id="root-1",
+            allowed_delegation_edges=(("general", "analysis"),),
             created_at=now,
             updated_at=now,
         )

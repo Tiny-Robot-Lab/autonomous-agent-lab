@@ -1,3 +1,4 @@
+from .artifact_reference import ArtifactReference
 from .availability import (
     AgentAvailability,
     AgentAvailabilityState,
@@ -43,14 +44,25 @@ from .messages import (
 from .results import InferenceResponse, TaskResult
 from .root_authority import RootAuthorityRecord
 from .routing import RoutingDecision, RoutingProvenance
-from .stage_artifact import StageArtifact
+from .serialization import (
+    canonical_json_dumps,
+    check_no_credential_bearing_keys,
+    freeze_value,
+    is_credential_bearing_key,
+    to_plain_json_structure,
+)
+from .stage_artifact import (
+    ALLOWED_ARTIFACT_TYPES,
+    MAX_STAGE_ARTIFACT_BYTES,
+    StageArtifact,
+)
 from .task_continuation import (
     ALLOWED_CONTINUATION_STAGES,
-    DEFAULT_MAX_CONTINUATION_BYTES,
+    MAX_CONTINUATION_BYTES,
     STAGE_CONTROL_FIELDS_ALLOWLIST,
     TaskContinuation,
 )
-from .task_input import FORBIDDEN_SECRET_KEY_SUBSTRINGS, TaskInput
+from .task_input import TaskInput
 from .tool_authorization import (
     ToolAuditDeliveryOutcome,
     ToolAuthorizationContext,
@@ -87,12 +99,13 @@ from .tools import (
 from .version import __version__
 
 __all__ = [
+    "ALLOWED_ARTIFACT_TYPES",
     "ALLOWED_CONTINUATION_STAGES",
     "ALL_TASK_LIFECYCLE_STATUSES",
     "CHILD_LIFECYCLE_STATUSES",
     "DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS",
-    "DEFAULT_MAX_CONTINUATION_BYTES",
-    "FORBIDDEN_SECRET_KEY_SUBSTRINGS",
+    "MAX_CONTINUATION_BYTES",
+    "MAX_STAGE_ARTIFACT_BYTES",
     "NONTERMINAL_TASK_LIFECYCLE_STATUSES",
     "PARENT_LIFECYCLE_STATUSES",
     "STAGE_CONTROL_FIELDS_ALLOWLIST",
@@ -105,6 +118,7 @@ __all__ = [
     "AgentExecutionState",
     "AgentHeartbeat",
     "AllInferenceProvidersFailedError",
+    "ArtifactReference",
     "FallbackEligibleInferenceError",
     "FallbackTransition",
     "HeartbeatRunner",
@@ -154,10 +168,15 @@ __all__ = [
     "ToolSelectionKind",
     "ToolSelector",
     "__version__",
+    "canonical_json_dumps",
+    "check_no_credential_bearing_keys",
     "evaluate_agent_record",
     "evaluate_availability",
+    "freeze_value",
+    "is_credential_bearing_key",
     "parse_health_probe_timeout",
     "parse_heartbeat_interval",
     "parse_timestamp",
+    "to_plain_json_structure",
     "validate_lifecycle_status",
 ]

@@ -1,11 +1,18 @@
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from .task_input import _check_no_secret_bearing_keys
+from .artifact_reference import ArtifactReference
+from .serialization import (
+    canonical_json_dumps,
+    check_no_credential_bearing_keys,
+    freeze_value,
+    to_plain_json_structure,
+)
 
-DEFAULT_MAX_CONTINUATION_BYTES: int = 16 * 1024  # 16 KiB provisional default
+MAX_CONTINUATION_BYTES: int = 16 * 1024  # 16 KiB fixed canonical UTF-8 limit
 
 ALLOWED_CONTINUATION_STAGES: frozenset[str] = frozenset({
     "incorporate_analysis_child",
@@ -29,10 +36,11 @@ class TaskContinuation:
     Governed by ADR-0007:
     - Task-owned continuation checkpoint;
     - Distinct from TaskRequested and TaskResult;
-    - Bounded size (16 KiB UTF-8 default, test-enforced);
+    - Bounded to fixed 16 KiB canonical UTF-8;
     - Stage-specific allowlist of control fields;
     - Strictly references TaskInput and stage artifacts rather than duplicating payloads;
-    - Forbids process memory, credentials, raw prompts, child outputs, and secret-bearing keys;
+    - Enforces cross-task authorization on referenced artifacts;
+    - Forbids process memory, credentials, raw prompts, child outputs, and credential-bearing keys;
     - Versioned and write-once per continuation_version.
     """
 
@@ -43,8 +51,8 @@ class TaskContinuation:
     input_version: int = 1
     continuation_capability: str = "research"
     stage: str = "incorporate_analysis_child"
-    control_fields: dict[str, Any] = field(default_factory=dict)
-    artifact_references: tuple[str, ...] = ()
+    control_fields: Mapping[str, Any] = field(default_factory=dict)
+    artifact_references: tuple[ArtifactReference, ...] = ()
     continuation_version: int = 1
     version: int = 1
 
@@ -101,19 +109,31 @@ class TaskContinuation:
         object.__setattr__(self, "updated_at", self.updated_at.strip())
 
         if isinstance(self.artifact_references, (list, tuple)):
-            clean_refs: list[str] = []
+            clean_refs: list[ArtifactReference] = []
             for ref in self.artifact_references:
-                if not isinstance(ref, str) or not ref.strip():
-                    raise ValueError("artifact_references elements must be non-empty strings")
-                clean_refs.append(ref.strip())
+                if isinstance(ref, ArtifactReference):
+                    parsed_ref = ref
+                elif isinstance(ref, dict):
+                    parsed_ref = ArtifactReference.from_dict(ref)
+                else:
+                    raise TypeError(
+                        f"artifact_references elements must be ArtifactReference or dict, got {type(ref).__name__}"
+                    )
+                # Cross-task scoping validation: must belong to the parent task
+                if parsed_ref.producing_task_id != clean_parent:
+                    raise ValueError(
+                        f"Cross-task artifact reference rejected: artifact producing task "
+                        f"'{parsed_ref.producing_task_id}' does not match parent task '{clean_parent}'"
+                    )
+                clean_refs.append(parsed_ref)
             object.__setattr__(self, "artifact_references", tuple(clean_refs))
         else:
             raise TypeError(
                 f"artifact_references must be a tuple or list, got {type(self.artifact_references).__name__}"
             )
 
-        if not isinstance(self.control_fields, dict):
-            raise TypeError(f"control_fields must be a dict, got {type(self.control_fields).__name__}")
+        if not isinstance(self.control_fields, (dict, Mapping)):
+            raise TypeError(f"control_fields must be a dict or Mapping, got {type(self.control_fields).__name__}")
 
         allowed_controls = STAGE_CONTROL_FIELDS_ALLOWLIST.get(clean_stage, frozenset())
         unallowlisted = self.control_fields.keys() - allowed_controls
@@ -123,16 +143,16 @@ class TaskContinuation:
                 f"Allowed control fields: {sorted(allowed_controls)}"
             )
 
-        _check_no_secret_bearing_keys(self.control_fields, "TaskContinuation control_fields")
-        object.__setattr__(self, "control_fields", dict(self.control_fields))
+        check_no_credential_bearing_keys(self.control_fields, "TaskContinuation control_fields")
+        object.__setattr__(self, "control_fields", freeze_value(self.control_fields))
 
-        # Size bound enforcement
+        # Fixed 16 KiB size bound enforcement
         serialized = self.to_json()
         byte_len = len(serialized.encode("utf-8"))
-        if byte_len > DEFAULT_MAX_CONTINUATION_BYTES:
+        if byte_len > MAX_CONTINUATION_BYTES:
             raise ValueError(
                 f"TaskContinuation byte size ({byte_len} bytes) exceeds maximum bound "
-                f"of {DEFAULT_MAX_CONTINUATION_BYTES} bytes"
+                f"of {MAX_CONTINUATION_BYTES} bytes"
             )
 
     def byte_size(self) -> int:
@@ -146,8 +166,8 @@ class TaskContinuation:
         input_version: int = 1,
         continuation_capability: str = "research",
         stage: str = "incorporate_analysis_child",
-        control_fields: dict[str, Any] | None = None,
-        artifact_references: tuple[str, ...] | list[str] = (),
+        control_fields: Mapping[str, Any] | None = None,
+        artifact_references: tuple[ArtifactReference, ...] | list[Any] = (),
         continuation_version: int = 1,
     ) -> "TaskContinuation":
         now = datetime.now(UTC).isoformat()
@@ -157,7 +177,7 @@ class TaskContinuation:
             input_version=input_version,
             continuation_capability=continuation_capability,
             stage=stage,
-            control_fields=dict(control_fields or {}),
+            control_fields=control_fields or {},
             artifact_references=tuple(artifact_references),
             continuation_version=continuation_version,
             created_at=now,
@@ -167,39 +187,37 @@ class TaskContinuation:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "parent_task_id": self.parent_task_id,
+            "artifact_references": [ref.to_dict() for ref in self.artifact_references],
             "child_task_id": self.child_task_id,
-            "input_version": self.input_version,
             "continuation_capability": self.continuation_capability,
-            "stage": self.stage,
-            "control_fields": dict(self.control_fields),
-            "artifact_references": list(self.artifact_references),
             "continuation_version": self.continuation_version,
+            "control_fields": to_plain_json_structure(self.control_fields),
             "created_at": self.created_at,
+            "input_version": self.input_version,
+            "parent_task_id": self.parent_task_id,
+            "stage": self.stage,
             "updated_at": self.updated_at,
             "version": self.version,
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return canonical_json_dumps(self.to_dict())
 
     @classmethod
-    def from_dict(
-        cls, data: dict[str, Any], max_bytes: int = DEFAULT_MAX_CONTINUATION_BYTES
-    ) -> "TaskContinuation":
+    def from_dict(cls, data: dict[str, Any]) -> "TaskContinuation":
         if not isinstance(data, dict):
             raise TypeError("data must be a dict")
 
         allowed_fields = {
-            "parent_task_id",
-            "child_task_id",
-            "input_version",
-            "continuation_capability",
-            "stage",
-            "control_fields",
             "artifact_references",
+            "child_task_id",
+            "continuation_capability",
             "continuation_version",
+            "control_fields",
             "created_at",
+            "input_version",
+            "parent_task_id",
+            "stage",
             "updated_at",
             "version",
         }
@@ -226,16 +244,16 @@ class TaskContinuation:
             raise TypeError("artifact_references must be a list or tuple")
 
         control_fields = data.get("control_fields", {})
-        if not isinstance(control_fields, dict):
-            raise TypeError("control_fields must be a dict")
+        if not isinstance(control_fields, (dict, Mapping)):
+            raise TypeError("control_fields must be a dict or Mapping")
 
-        record = cls(
+        return cls(
             parent_task_id=data["parent_task_id"],
             child_task_id=data["child_task_id"],
             input_version=data.get("input_version", 1),
             continuation_capability=data.get("continuation_capability", "research"),
             stage=data.get("stage", "incorporate_analysis_child"),
-            control_fields=dict(control_fields),
+            control_fields=control_fields,
             artifact_references=tuple(raw_refs),
             continuation_version=data.get("continuation_version", 1),
             created_at=data["created_at"],
@@ -243,21 +261,6 @@ class TaskContinuation:
             version=version,
         )
 
-        if record.byte_size() > max_bytes:
-            raise ValueError(
-                f"TaskContinuation byte size ({record.byte_size()} bytes) exceeds maximum bound "
-                f"of {max_bytes} bytes"
-            )
-        return record
-
     @classmethod
-    def from_json(
-        cls, value: str, max_bytes: int = DEFAULT_MAX_CONTINUATION_BYTES
-    ) -> "TaskContinuation":
-        byte_len = len(value.encode("utf-8"))
-        if byte_len > max_bytes:
-            raise ValueError(
-                f"TaskContinuation JSON byte size ({byte_len} bytes) exceeds maximum bound "
-                f"of {max_bytes} bytes"
-            )
-        return cls.from_dict(json.loads(value), max_bytes=max_bytes)
+    def from_json(cls, value: str) -> "TaskContinuation":
+        return cls.from_dict(json.loads(value))
