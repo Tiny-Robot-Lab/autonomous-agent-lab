@@ -10,7 +10,7 @@ from agent_contracts import InferenceHealthStatus, InferenceProviderHealth
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
-DEFAULT_CLOUDFLARE_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+DEFAULT_CLOUDFLARE_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 
 
 def _matches_exact_model(candidate: Any, target_model: str) -> bool:
@@ -251,8 +251,8 @@ class CloudflareHealthProbe:
                 )
 
         # Authenticated API reachability was established via catalog search, but exact model
-        # metadata could not be verified in catalog or schema (e.g. executable alias like
-        # @cf/meta/llama-3.1-8b-instruct). Return DEGRADED to preserve eligibility for
+        # metadata could not be verified in catalog or schema (e.g. an unverified executable alias).
+        # Return DEGRADED to preserve eligibility for
         # runtime execution while truthfully reflecting unverified metadata status.
         err_suffix = f" (schema lookup: {err_details})" if err_details else ""
         return InferenceProviderHealth(

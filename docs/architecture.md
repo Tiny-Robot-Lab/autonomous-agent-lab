@@ -37,7 +37,7 @@ This repository is completely greenfield and independent. It maintains no coupli
 
 ### External System Boundaries
 * **Tavily Search API**: Grounded web search retrieval (`https://api.tavily.com/search`).
-* **Cloudflare Workers AI**: Serverless LLM synthesis (`@cf/meta/llama-3.1-8b-instruct`) with strict output token budget.
+* **Cloudflare Workers AI**: Serverless LLM synthesis (`@cf/mistralai/mistral-small-3.1-24b-instruct`) with strict output token budget.
 
 ---
 
@@ -101,7 +101,7 @@ The Analysis Agent advertises `analysis` and `agent.tasks.analysis`, but it is n
    - **Research Agent (`research-agent-1`)**:
      a. **Retrieval**: Queries `TavilySearchExecutor` (`https://api.tavily.com/search`) for grounded web content and source URLs.
      b. **Context Formatting**: Assembles grounded search evidence into an explicit token-budgeted prompt.
-     c. **LLM Synthesis**: Calls `CloudflareInferenceProvider` (`@cf/meta/llama-3.1-8b-instruct`) with strict instructions to generate structured findings and concise source citations.
+     c. **LLM Synthesis**: Calls `CloudflareInferenceProvider` (`@cf/mistralai/mistral-small-3.1-24b-instruct`) with strict instructions to generate structured findings and concise source citations.
      d. **Truncation Detection**: Checks completion metadata and response boundaries to prevent silent mid-sentence truncation.
    - **Analysis Agent (`analysis-agent-1`)**: Deterministically counts paragraphs, sentences, and words; reports up to five repeated normalized content terms and question sentences; and states that it analyzed only the supplied material without retrieval. It does not claim factual verification or semantic understanding.
 4. **Result Storage**: The agent constructs a `TaskResult` (`status="completed"`, `output=...`) and persists it to `task.result:{task_id}`.

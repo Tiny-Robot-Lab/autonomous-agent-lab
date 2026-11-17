@@ -364,3 +364,17 @@ Following the initial single-provider deployment validation, live cross-provider
 - **Explicit Limitations**:
   - Live fallback has now been operationally demonstrated on `home-core` for the `payment_required` failure class across a two-provider chain (`gemini → cloudflare`).
   - This does **NOT** generalize into proof that every provider failure class (e.g., rate limits, upstream 5xx outages, transport timeouts) or every provider ordering (e.g., `cloudflare → gemini` or 3+ providers) has been live-tested on deployment hosts.
+
+---
+
+## Cloudflare Default Model Maintenance Note (Post-v0.5.0)
+
+Following live `home-core` reproduction where the deprecated `@cf/meta/llama-3.1-8b-instruct` model could not be verified by catalog probe (resulting in `DEGRADED` status and causing `HEALTHY` Gemini to be prioritized as attempt 0), the Cloudflare Workers AI default model was updated across runtime services to:
+
+- **Model**: `@cf/mistralai/mistral-small-3.1-24b-instruct`
+- **Max Tokens**: `1024`
+
+### Validation Summary (Non-Normative Maintenance Note)
+- **General Task Validation**: Verified on `home-core` with primary Cloudflare attempt 0 succeeding (measured latency ~1330.6 ms) without fallback.
+- **Research Task Validation**: Verified on `home-core` with Tavily retrieval and primary Cloudflare attempt 0 synthesis succeeding (measured latency ~8593.5 ms) without fallback.
+- **Secondary Fallback**: Preserves configured multi-provider priority (`INFERENCE_PROVIDER=cloudflare,gemini`) where both providers probe `HEALTHY`, prioritizing Cloudflare as attempt 0 and maintaining Gemini as secondary fallback.
