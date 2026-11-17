@@ -1,6 +1,15 @@
 from typing import Any, Protocol, runtime_checkable
 
-from agent_contracts import AgentCandidate, AgentEvent, RoutingDecision, TaskRequested
+from agent_contracts import (
+    AgentCandidate,
+    AgentEvent,
+    RootAuthorityRecord,
+    RoutingDecision,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
+    TaskRequested,
+)
 
 from orchestrator.domain.advisor import AdvisorRecommendation
 from orchestrator.domain.assessment import RoutingAssessment
@@ -62,6 +71,28 @@ class AuthoritativeTaskStore(Protocol):
     async def update_status(self, task_id: str, status: str) -> None: ...
 
     async def get_status(self, task_id: str) -> str | None: ...
+
+    async def save_task_input(self, task_input: TaskInput) -> None: ...
+
+    async def get_task_input(
+        self, task_id: str, input_version: int = 1
+    ) -> TaskInput | None: ...
+
+    async def save_stage_artifact(self, artifact: StageArtifact) -> None: ...
+
+    async def get_stage_artifact(
+        self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
+    ) -> StageArtifact | None: ...
+
+    async def save_continuation(self, continuation: TaskContinuation) -> None: ...
+
+    async def get_continuation(
+        self, parent_task_id: str, continuation_version: int = 1
+    ) -> TaskContinuation | None: ...
+
+    async def save_root_authority(self, authority: RootAuthorityRecord) -> None: ...
+
+    async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None: ...
 
 
 class StateReader(Protocol):

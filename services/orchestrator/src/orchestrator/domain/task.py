@@ -10,6 +10,22 @@ class DelegationDepthExceededError(Exception):
     """Raised when delegation depth policy is violated (e.g. grandchild creation under depth-1)."""
 
 
+class ConflictingTaskInputError(Exception):
+    """Raised when attempting to overwrite an existing TaskInput version with conflicting data."""
+
+
+class ConflictingStageArtifactError(Exception):
+    """Raised when attempting to overwrite an existing StageArtifact version with conflicting data."""
+
+
+class ConflictingContinuationError(Exception):
+    """Raised when attempting to overwrite an existing TaskContinuation version with conflicting data."""
+
+
+class ConflictingRootAuthorityError(Exception):
+    """Raised when attempting to overwrite an existing RootAuthorityRecord with conflicting policy data."""
+
+
 @dataclass(frozen=True)
 class Task:
     prompt: str

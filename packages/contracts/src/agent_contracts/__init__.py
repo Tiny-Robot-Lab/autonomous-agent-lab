@@ -24,6 +24,15 @@ from .inference_health import (
     InferenceProviderHealth,
     parse_health_probe_timeout,
 )
+from .lifecycle import (
+    ALL_TASK_LIFECYCLE_STATUSES,
+    CHILD_LIFECYCLE_STATUSES,
+    NONTERMINAL_TASK_LIFECYCLE_STATUSES,
+    PARENT_LIFECYCLE_STATUSES,
+    TERMINAL_TASK_LIFECYCLE_STATUSES,
+    TaskLifecycleStatus,
+    validate_lifecycle_status,
+)
 from .messages import (
     AgentEvent,
     FallbackTransition,
@@ -32,7 +41,16 @@ from .messages import (
     ToolExecutionTelemetry,
 )
 from .results import InferenceResponse, TaskResult
+from .root_authority import RootAuthorityRecord
 from .routing import RoutingDecision, RoutingProvenance
+from .stage_artifact import StageArtifact
+from .task_continuation import (
+    ALLOWED_CONTINUATION_STAGES,
+    DEFAULT_MAX_CONTINUATION_BYTES,
+    STAGE_CONTROL_FIELDS_ALLOWLIST,
+    TaskContinuation,
+)
+from .task_input import FORBIDDEN_SECRET_KEY_SUBSTRINGS, TaskInput
 from .tool_authorization import (
     ToolAuditDeliveryOutcome,
     ToolAuthorizationContext,
@@ -69,7 +87,16 @@ from .tools import (
 from .version import __version__
 
 __all__ = [
+    "ALLOWED_CONTINUATION_STAGES",
+    "ALL_TASK_LIFECYCLE_STATUSES",
+    "CHILD_LIFECYCLE_STATUSES",
     "DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_CONTINUATION_BYTES",
+    "FORBIDDEN_SECRET_KEY_SUBSTRINGS",
+    "NONTERMINAL_TASK_LIFECYCLE_STATUSES",
+    "PARENT_LIFECYCLE_STATUSES",
+    "STAGE_CONTROL_FIELDS_ALLOWLIST",
+    "TERMINAL_TASK_LIFECYCLE_STATUSES",
     "AgentAvailability",
     "AgentAvailabilityState",
     "AgentCandidate",
@@ -90,8 +117,13 @@ __all__ = [
     "LivenessPolicy",
     "NonFallbackInferenceError",
     "ProviderFailureSummary",
+    "RootAuthorityRecord",
     "RoutingDecision",
     "RoutingProvenance",
+    "StageArtifact",
+    "TaskContinuation",
+    "TaskInput",
+    "TaskLifecycleStatus",
     "TaskRequested",
     "TaskResult",
     "Tool",
@@ -127,4 +159,5 @@ __all__ = [
     "parse_health_probe_timeout",
     "parse_heartbeat_interval",
     "parse_timestamp",
+    "validate_lifecycle_status",
 ]

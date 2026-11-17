@@ -9,6 +9,10 @@ from agent_contracts import (
     AgentAvailabilityState,
     AgentCandidate,
     AgentExecutionState,
+    RootAuthorityRecord,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
 )
 from fastapi import Request
@@ -16,12 +20,17 @@ from orchestrator.application.ports import AuthoritativeTaskStore, TaskDispatche
 from orchestrator.application.use_cases import RegisterChildTask, SubmitTask
 from orchestrator.config import Settings
 from orchestrator.domain.task import (
+    ConflictingContinuationError,
+    ConflictingRootAuthorityError,
+    ConflictingStageArtifactError,
+    ConflictingTaskInputError,
     DelegationDepthExceededError,
     ParentTaskNotFoundError,
     TaskLineage,
 )
 from orchestrator.infrastructure.redis_adapter import RedisGateway
-from orchestrator.presentation.api import TaskInput, create_app, create_task
+from orchestrator.presentation.api import TaskInput as ApiTaskInput
+from orchestrator.presentation.api import create_app, create_task
 
 from tests.test_application import FakeTaskQueue
 
@@ -33,6 +42,10 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.statuses: dict[str, str] = {}
         self.lineages: dict[str, TaskLineage] = {}
         self.children: dict[str, set[str]] = {}
+        self.inputs: dict[tuple[str, int], TaskInput] = {}
+        self.artifacts: dict[tuple[str, str, int], StageArtifact] = {}
+        self.continuations: dict[tuple[str, int], TaskContinuation] = {}
+        self.authorities: dict[str, RootAuthorityRecord] = {}
         self.fail_next_registration: bool = False
         self.root_registrations: list[tuple[TaskRequested, str]] = []
         self.child_registrations: list[tuple[TaskRequested, str]] = []
@@ -50,6 +63,19 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             task_id=task.task_id,
             root_task_id=task.root_task_id,
             parent_task_id=None,
+        )
+        self.inputs[(task.task_id, 1)] = TaskInput(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            created_at=task.created_at,
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        )
+        self.authorities[task.task_id] = RootAuthorityRecord.create_default(
+            root_task_id=task.task_id,
+            created_at=task.created_at,
         )
         self.root_registrations.append((task, initial_status))
 
@@ -85,6 +111,68 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
 
     async def get_status(self, task_id: str) -> str | None:
         return self.statuses.get(task_id.strip())
+
+    async def save_task_input(self, task_input: TaskInput) -> None:
+        key = (task_input.task_id, task_input.input_version)
+        if key in self.inputs:
+            if self.inputs[key] == task_input:
+                return
+            raise ConflictingTaskInputError(
+                f"TaskInput for task '{task_input.task_id}' version {task_input.input_version} "
+                "already exists with conflicting data"
+            )
+        self.inputs[key] = task_input
+
+    async def get_task_input(
+        self, task_id: str, input_version: int = 1
+    ) -> TaskInput | None:
+        return self.inputs.get((task_id.strip(), input_version))
+
+    async def save_stage_artifact(self, artifact: StageArtifact) -> None:
+        key = (artifact.producing_task_id, artifact.artifact_id, artifact.artifact_version)
+        if key in self.artifacts:
+            if self.artifacts[key] == artifact:
+                return
+            raise ConflictingStageArtifactError(
+                f"StageArtifact '{artifact.artifact_id}' for task '{artifact.producing_task_id}' "
+                f"version {artifact.artifact_version} already exists with conflicting data"
+            )
+        self.artifacts[key] = artifact
+
+    async def get_stage_artifact(
+        self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
+    ) -> StageArtifact | None:
+        return self.artifacts.get((producing_task_id.strip(), artifact_id.strip(), artifact_version))
+
+    async def save_continuation(self, continuation: TaskContinuation) -> None:
+        key = (continuation.parent_task_id, continuation.continuation_version)
+        if key in self.continuations:
+            if self.continuations[key] == continuation:
+                return
+            raise ConflictingContinuationError(
+                f"TaskContinuation for parent task '{continuation.parent_task_id}' "
+                f"version {continuation.continuation_version} already exists with conflicting data"
+            )
+        self.continuations[key] = continuation
+
+    async def get_continuation(
+        self, parent_task_id: str, continuation_version: int = 1
+    ) -> TaskContinuation | None:
+        return self.continuations.get((parent_task_id.strip(), continuation_version))
+
+    async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
+        key = authority.root_task_id
+        if key in self.authorities:
+            if self.authorities[key] == authority:
+                return
+            raise ConflictingRootAuthorityError(
+                f"RootAuthorityRecord for root task '{authority.root_task_id}' "
+                "already exists with conflicting data"
+            )
+        self.authorities[key] = authority
+
+    async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
+        return self.authorities.get(root_task_id.strip())
 
 
 class MockAtomicDispatcher(TaskDispatcher):
@@ -243,7 +331,7 @@ async def test_production_composition_wires_redis_gateway_as_authoritative_store
 
     # Dispatch a root task through API layer
     req = Request({"type": "http", "app": app})
-    res = await create_task(TaskInput(prompt="Inspect cluster state"), request=req)
+    res = await create_task(ApiTaskInput(prompt="Inspect cluster state"), request=req)
 
     assert res["status"] == "accepted"
     task_id = res["task_id"]
@@ -636,6 +724,25 @@ async def test_redis_gateway_register_root_uses_atomic_pipeline_with_transaction
             "parent_task_id": None,
         }),
     )
+    mock_pipe.set.assert_any_call(
+        f"task.input:{task.task_id}:1",
+        TaskInput(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            created_at=task.created_at,
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        ).to_json(),
+    )
+    mock_pipe.set.assert_any_call(
+        f"task.authority:{task.task_id}",
+        RootAuthorityRecord.create_default(
+            root_task_id=task.task_id,
+            created_at=task.created_at,
+        ).to_json(),
+    )
     mock_pipe.execute.assert_awaited_once()
 
 
@@ -660,3 +767,347 @@ async def test_simulated_dispatch_pipeline_failure_does_not_expose_queued_task_o
 
     # Gateway client pipeline was invoked with transaction=True
     gateway._client.pipeline.assert_called_once_with(transaction=True)
+
+
+# ==============================================================================
+# 6. Durable TaskInput, StageArtifact, Continuation & Authority Storage Tests
+# ==============================================================================
+
+
+@pytest.mark.anyio
+async def test_in_memory_task_input_write_once_semantics() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    input_v1 = TaskInput(
+        task_id="t-1",
+        prompt="Initial prompt",
+        created_at=now,
+        input_version=1,
+    )
+
+    # 1. Initial write
+    await store.save_task_input(input_v1)
+    retrieved = await store.get_task_input("t-1", input_version=1)
+    assert retrieved == input_v1
+
+    # 2. Idempotent write succeeds
+    await store.save_task_input(input_v1)
+
+    # 3. Conflicting write for same version raises ConflictingTaskInputError
+    conflicting = TaskInput(
+        task_id="t-1",
+        prompt="Conflicting prompt",
+        created_at=now,
+        input_version=1,
+    )
+    with pytest.raises(ConflictingTaskInputError, match="already exists with conflicting data"):
+        await store.save_task_input(conflicting)
+
+    # 4. New version succeeds
+    input_v2 = TaskInput(
+        task_id="t-1",
+        prompt="Updated prompt v2",
+        created_at=now,
+        input_version=2,
+    )
+    await store.save_task_input(input_v2)
+    assert await store.get_task_input("t-1", input_version=2) == input_v2
+    assert await store.get_task_input("t-1", input_version=1) == input_v1
+
+
+@pytest.mark.anyio
+async def test_in_memory_stage_artifact_write_once_semantics() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    art_v1 = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="t-parent",
+        artifact_type="material",
+        content={"key": "val1"},
+        created_at=now,
+        artifact_version=1,
+    )
+
+    await store.save_stage_artifact(art_v1)
+    retrieved = await store.get_stage_artifact("t-parent", "art-1", artifact_version=1)
+    assert retrieved == art_v1
+
+    # Idempotent write
+    await store.save_stage_artifact(art_v1)
+
+    # Conflicting write
+    conflicting = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="t-parent",
+        artifact_type="material",
+        content={"key": "val-conflict"},
+        created_at=now,
+        artifact_version=1,
+    )
+    with pytest.raises(ConflictingStageArtifactError, match="already exists with conflicting data"):
+        await store.save_stage_artifact(conflicting)
+
+
+@pytest.mark.anyio
+async def test_in_memory_continuation_write_once_semantics() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    cont_v1 = TaskContinuation(
+        parent_task_id="p-1",
+        child_task_id="c-1",
+        input_version=1,
+        stage="incorporate_analysis_child",
+        control_fields={"analysis_focus": "focus-1"},
+        continuation_version=1,
+        created_at=now,
+        updated_at=now,
+    )
+
+    await store.save_continuation(cont_v1)
+    retrieved = await store.get_continuation("p-1", continuation_version=1)
+    assert retrieved == cont_v1
+
+    # Idempotent write
+    await store.save_continuation(cont_v1)
+
+    # Conflicting write
+    conflicting = TaskContinuation(
+        parent_task_id="p-1",
+        child_task_id="c-different",
+        input_version=1,
+        stage="incorporate_analysis_child",
+        control_fields={"analysis_focus": "focus-conflict"},
+        continuation_version=1,
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(ConflictingContinuationError, match="already exists with conflicting data"):
+        await store.save_continuation(conflicting)
+
+
+@pytest.mark.anyio
+async def test_in_memory_root_authority_write_once_semantics() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    auth = RootAuthorityRecord(
+        root_task_id="r-1",
+        policy_context="default",
+        created_at=now,
+        updated_at=now,
+    )
+
+    await store.save_root_authority(auth)
+    retrieved = await store.get_root_authority("r-1")
+    assert retrieved == auth
+
+    # Idempotent write
+    await store.save_root_authority(auth)
+
+    # Conflicting write
+    conflicting = RootAuthorityRecord(
+        root_task_id="r-1",
+        policy_context="custom",
+        max_delegation_waves=2,
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(ConflictingRootAuthorityError, match="already exists with conflicting data"):
+        await store.save_root_authority(conflicting)
+
+
+@pytest.mark.anyio
+async def test_submit_task_root_ingestion_persists_durable_input_and_authority() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    queue = FakeTaskQueue()
+    submit = SubmitTask(task_store=store, queue=queue)
+
+    task_requested = await submit.execute("Analyze system resilience under node failure")
+    task_id = task_requested.task_id
+
+    # 1. Authoritative status and lineage exist
+    assert await store.get_status(task_id) == "pending"
+    lineage = await store.get_lineage(task_id)
+    assert lineage is not None
+    assert lineage.is_root
+    assert lineage.root_task_id == task_id
+
+    # 2. Durable TaskInput v1 exists independently of queue message
+    input_record = await store.get_task_input(task_id, input_version=1)
+    assert input_record is not None
+    assert input_record.task_id == task_id
+    assert input_record.prompt == "Analyze system resilience under node failure"
+    assert input_record.input_version == 1
+
+    # 3. Default RootAuthorityRecord exists
+    authority = await store.get_root_authority(task_id)
+    assert authority is not None
+    assert authority.root_task_id == task_id
+    assert authority.max_delegation_depth == 1
+    assert authority.max_delegation_waves == 1
+    assert authority.grants_issued == 0
+    assert authority.waves_consumed == 0
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_task_input_roundtrip_and_conflict() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    record = TaskInput(
+        task_id="t-1",
+        prompt="Test prompt",
+        created_at=now,
+        input_version=1,
+    )
+
+    # 1. Initial write (key doesn't exist)
+    gateway._client.get = AsyncMock(return_value=None)
+    gateway._client.set = AsyncMock()
+
+    await gateway.save_task_input(record)
+    gateway._client.set.assert_awaited_once_with(
+        "task.input:t-1:1",
+        record.to_json(),
+    )
+
+    # 2. Idempotent write (key exists with matching JSON)
+    gateway._client.get = AsyncMock(return_value=record.to_json())
+    gateway._client.set.reset_mock()
+    await gateway.save_task_input(record)
+    gateway._client.set.assert_not_awaited()
+
+    # 3. Conflicting write (key exists with different prompt)
+    different = TaskInput(
+        task_id="t-1",
+        prompt="Different prompt",
+        created_at=now,
+        input_version=1,
+    )
+    with pytest.raises(ConflictingTaskInputError, match="already exists with conflicting data"):
+        await gateway.save_task_input(different)
+
+    # 4. Retrieval
+    gateway._client.get = AsyncMock(return_value=record.to_json())
+    retrieved = await gateway.get_task_input("t-1", 1)
+    assert retrieved == record
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    art = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="t-1",
+        artifact_type="material",
+        content={"data": "sample"},
+        created_at=now,
+        artifact_version=1,
+    )
+
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.sadd = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+
+    # 1. Save artifact (does not exist yet)
+    gateway._client.get = AsyncMock(return_value=None)
+    await gateway.save_stage_artifact(art)
+
+    mock_pipe.set.assert_called_once_with("task.artifact:t-1:art-1:1", art.to_json())
+    mock_pipe.sadd.assert_called_once_with("task.artifacts:t-1", "art-1:1")
+    mock_pipe.execute.assert_awaited_once()
+
+    # 2. Idempotent write
+    gateway._client.get = AsyncMock(return_value=art.to_json())
+    mock_pipe.reset_mock()
+    await gateway.save_stage_artifact(art)
+    mock_pipe.set.assert_not_called()
+
+    # 3. Conflicting write
+    conflict = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="t-1",
+        artifact_type="material",
+        content={"data": "conflicting_sample"},
+        created_at=now,
+        artifact_version=1,
+    )
+    with pytest.raises(ConflictingStageArtifactError, match="already exists with conflicting data"):
+        await gateway.save_stage_artifact(conflict)
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_continuation_roundtrip_and_conflict() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    cont = TaskContinuation(
+        parent_task_id="p-1",
+        child_task_id="c-1",
+        control_fields={"analysis_focus": "sample focus"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+
+    # 1. Save continuation
+    gateway._client.get = AsyncMock(return_value=None)
+    await gateway.save_continuation(cont)
+
+    mock_pipe.set.assert_any_call("task.continuation:p-1:1", cont.to_json())
+    mock_pipe.set.assert_any_call("task.continuation_latest:p-1", "1")
+    mock_pipe.execute.assert_awaited_once()
+
+    # 2. Idempotent write
+    gateway._client.get = AsyncMock(return_value=cont.to_json())
+    mock_pipe.reset_mock()
+    await gateway.save_continuation(cont)
+    mock_pipe.set.assert_not_called()
+
+    # 3. Conflicting write
+    conflict = TaskContinuation(
+        parent_task_id="p-1",
+        child_task_id="c-different",
+        control_fields={"analysis_focus": "different focus"},
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(ConflictingContinuationError, match="already exists with conflicting data"):
+        await gateway.save_continuation(conflict)
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_root_authority_roundtrip_and_conflict() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    auth = RootAuthorityRecord.create_default("root-abc", created_at=now)
+
+    # 1. Save authority
+    gateway._client.get = AsyncMock(return_value=None)
+    gateway._client.set = AsyncMock()
+    await gateway.save_root_authority(auth)
+    gateway._client.set.assert_awaited_once_with("task.authority:root-abc", auth.to_json())
+
+    # 2. Idempotent write
+    gateway._client.get = AsyncMock(return_value=auth.to_json())
+    gateway._client.set.reset_mock()
+    await gateway.save_root_authority(auth)
+    gateway._client.set.assert_not_awaited()
+
+    # 3. Conflicting write
+    conflict = RootAuthorityRecord(
+        root_task_id="root-abc",
+        policy_context="custom_policy",
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(ConflictingRootAuthorityError, match="already exists with conflicting data"):
+        await gateway.save_root_authority(conflict)

@@ -11,6 +11,10 @@ from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
     InferenceExecutionTelemetry,
+    RootAuthorityRecord,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
     TaskResult,
 )
@@ -19,7 +23,13 @@ from analysis_agent.infrastructure.deterministic_analyzer import (
     DeterministicMaterialAnalyzer,
 )
 from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
-from orchestrator.domain.task import TaskLineage
+from orchestrator.domain.task import (
+    ConflictingContinuationError,
+    ConflictingRootAuthorityError,
+    ConflictingStageArtifactError,
+    ConflictingTaskInputError,
+    TaskLineage,
+)
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from research_agent.domain.models import ResearchResult
@@ -365,7 +375,7 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
     try:
         root_task = TaskRequested.create("Root task for Redis integration lifecycle")
 
-        # 1. Authoritative registration establishes pending_dispatch and lineage
+        # 1. Authoritative registration establishes pending_dispatch, lineage, TaskInput v1, and RootAuthority
         await gateway.register_root_task(root_task)
 
         status = await gateway.get_status(root_task.task_id)
@@ -378,6 +388,24 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
         assert lineage.root_task_id == root_task.task_id
         assert lineage.parent_task_id is None
         assert lineage.is_root is True
+
+        # Verify durable TaskInput v1 and default RootAuthorityRecord persisted
+        input_record = await gateway.get_task_input(root_task.task_id, 1)
+        assert input_record is not None
+        assert input_record.prompt == root_task.prompt
+        assert input_record.task_id == root_task.task_id
+
+        authority = await gateway.get_root_authority(root_task.task_id)
+        assert authority is not None
+        assert authority.root_task_id == root_task.task_id
+        assert authority.max_delegation_depth == 1
+        assert authority.max_delegation_waves == 1
+
+        # Verify reference-safety: no TTL set on authoritative keys
+        assert await gateway._client.ttl(f"task.status:{root_task.task_id}") == -1
+        assert await gateway._client.ttl(f"task.lineage:{root_task.task_id}") == -1
+        assert await gateway._client.ttl(f"task.input:{root_task.task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.authority:{root_task.task_id}") == -1
 
         # 2. Atomic dispatch pushes to target queue and sets status to pending
         dispatch_target = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
@@ -495,5 +523,117 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
         # Unknown parent returns empty list
         empty_children = await gateway.get_children("nonexistent-parent-task-id")
         assert empty_children == []
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        task_id = f"task_{uuid.uuid4().hex[:8]}"
+        now = "2026-11-16T12:00:00+00:00"
+
+        # 1. TaskInput write-once and retrieval
+        task_input = TaskInput(
+            task_id=task_id,
+            prompt="Durable input prompt",
+            created_at=now,
+            input_version=1,
+        )
+        await gateway.save_task_input(task_input)
+
+        retrieved_input = await gateway.get_task_input(task_id, 1)
+        assert retrieved_input == task_input
+
+        # Idempotent write
+        await gateway.save_task_input(task_input)
+
+        # Conflicting write fails
+        conflict_input = TaskInput(
+            task_id=task_id,
+            prompt="Conflicting prompt",
+            created_at=now,
+            input_version=1,
+        )
+        with pytest.raises(ConflictingTaskInputError):
+            await gateway.save_task_input(conflict_input)
+
+        # 2. StageArtifact write-once and retrieval
+        art_id = f"art_{uuid.uuid4().hex[:8]}"
+        artifact = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=task_id,
+            artifact_type="material",
+            content={"findings": ["alpha", "beta"]},
+            created_at=now,
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(artifact)
+
+        retrieved_art = await gateway.get_stage_artifact(task_id, art_id, 1)
+        assert retrieved_art == artifact
+
+        # Conflicting write fails
+        conflict_art = StageArtifact(
+            artifact_id=art_id,
+            producing_task_id=task_id,
+            artifact_type="material",
+            content={"findings": ["conflict"]},
+            created_at=now,
+            artifact_version=1,
+        )
+        with pytest.raises(ConflictingStageArtifactError):
+            await gateway.save_stage_artifact(conflict_art)
+
+        # 3. TaskContinuation write-once and retrieval
+        child_id = f"child_{uuid.uuid4().hex[:8]}"
+        continuation = TaskContinuation(
+            parent_task_id=task_id,
+            child_task_id=child_id,
+            control_fields={"analysis_focus": "check evidence"},
+            continuation_version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        await gateway.save_continuation(continuation)
+
+        retrieved_cont = await gateway.get_continuation(task_id, 1)
+        assert retrieved_cont == continuation
+
+        # Conflicting write fails
+        conflict_cont = TaskContinuation(
+            parent_task_id=task_id,
+            child_task_id=f"child_{uuid.uuid4().hex[:8]}",
+            control_fields={"analysis_focus": "conflict focus"},
+            continuation_version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        with pytest.raises(ConflictingContinuationError):
+            await gateway.save_continuation(conflict_cont)
+
+        # 4. RootAuthorityRecord write-once and retrieval
+        authority = RootAuthorityRecord.create_default(task_id, created_at=now)
+        await gateway.save_root_authority(authority)
+
+        retrieved_auth = await gateway.get_root_authority(task_id)
+        assert retrieved_auth == authority
+
+        # Conflicting write fails
+        conflict_auth = RootAuthorityRecord(
+            root_task_id=task_id,
+            policy_context="custom",
+            max_delegation_waves=3,
+            created_at=now,
+            updated_at=now,
+        )
+        with pytest.raises(ConflictingRootAuthorityError):
+            await gateway.save_root_authority(conflict_auth)
+
+        # 5. Reference safety: verify NO TTL on all authoritative keys
+        assert await gateway._client.ttl(f"task.input:{task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.artifact:{task_id}:{art_id}:1") == -1
+        assert await gateway._client.ttl(f"task.continuation:{task_id}:1") == -1
+        assert await gateway._client.ttl(f"task.authority:{task_id}") == -1
     finally:
         await gateway.aclose()

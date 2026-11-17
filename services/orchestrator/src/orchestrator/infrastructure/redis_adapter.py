@@ -7,7 +7,11 @@ from agent_contracts import (
     AgentEvent,
     FallbackTransition,
     InferenceExecutionTelemetry,
+    RootAuthorityRecord,
     RoutingDecision,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
 )
 
@@ -17,7 +21,13 @@ from orchestrator.application.inference_history import (
 )
 from orchestrator.application.ports import TelemetryStorageError
 from orchestrator.domain.capability import AgentCapability
-from orchestrator.domain.task import TaskLineage
+from orchestrator.domain.task import (
+    ConflictingContinuationError,
+    ConflictingRootAuthorityError,
+    ConflictingStageArtifactError,
+    ConflictingTaskInputError,
+    TaskLineage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +55,30 @@ class RedisGateway:
     ) -> None:
         if task.parent_task_id is not None or task.root_task_id != task.task_id:
             raise ValueError(f"Task '{task.task_id}' is not a root task")
+
+        task_input = TaskInput(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            created_at=task.created_at,
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        )
+        root_authority = RootAuthorityRecord(
+            root_task_id=task.task_id,
+            policy_context="default",
+            max_delegation_depth=1,
+            max_delegation_waves=1,
+            max_children_per_wave=1,
+            allowed_delegation_edges=(("research", "analysis"),),
+            grants_issued=0,
+            waves_consumed=0,
+            created_at=task.created_at,
+            updated_at=task.created_at,
+            version=1,
+        )
+
         async with self._client.pipeline(transaction=True) as pipe:
             pipe.set(
                 f"task.status:{task.task_id}",
@@ -57,6 +91,14 @@ class RedisGateway:
                     "root_task_id": task.root_task_id,
                     "parent_task_id": None,
                 }),
+            )
+            pipe.set(
+                f"task.input:{task.task_id}:1",
+                task_input.to_json(),
+            )
+            pipe.set(
+                f"task.authority:{task.task_id}",
+                root_authority.to_json(),
             )
             await pipe.execute()
 
@@ -139,6 +181,150 @@ class RedisGateway:
         except (json.JSONDecodeError, TypeError):
             pass
         return None
+
+    async def save_task_input(self, task_input: TaskInput) -> None:
+        key = f"task.input:{task_input.task_id}:{task_input.input_version}"
+        raw = await self._client.get(key)
+        if raw is not None:
+            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            existing = TaskInput.from_dict(existing_data)
+            if existing == task_input:
+                return
+            raise ConflictingTaskInputError(
+                f"TaskInput for task '{task_input.task_id}' version {task_input.input_version} "
+                "already exists with conflicting data"
+            )
+        await self._client.set(key, task_input.to_json())
+
+    async def get_task_input(
+        self, task_id: str, input_version: int = 1
+    ) -> TaskInput | None:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return None
+        raw = await self._client.get(f"task.input:{clean_task_id}:{input_version}")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return TaskInput.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    async def save_stage_artifact(self, artifact: StageArtifact) -> None:
+        key = (
+            f"task.artifact:{artifact.producing_task_id}:"
+            f"{artifact.artifact_id}:{artifact.artifact_version}"
+        )
+        raw = await self._client.get(key)
+        if raw is not None:
+            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            existing = StageArtifact.from_dict(existing_data)
+            if existing == artifact:
+                return
+            raise ConflictingStageArtifactError(
+                f"StageArtifact '{artifact.artifact_id}' for task '{artifact.producing_task_id}' "
+                f"version {artifact.artifact_version} already exists with conflicting data"
+            )
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(key, artifact.to_json())
+            pipe.sadd(
+                f"task.artifacts:{artifact.producing_task_id}",
+                f"{artifact.artifact_id}:{artifact.artifact_version}",
+            )
+            await pipe.execute()
+
+    async def get_stage_artifact(
+        self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
+    ) -> StageArtifact | None:
+        clean_task_id = str(producing_task_id).strip()
+        clean_artifact_id = str(artifact_id).strip()
+        if not clean_task_id or not clean_artifact_id:
+            return None
+        key = f"task.artifact:{clean_task_id}:{clean_artifact_id}:{artifact_version}"
+        raw = await self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return StageArtifact.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    async def save_continuation(self, continuation: TaskContinuation) -> None:
+        key = (
+            f"task.continuation:{continuation.parent_task_id}:"
+            f"{continuation.continuation_version}"
+        )
+        raw = await self._client.get(key)
+        if raw is not None:
+            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            existing = TaskContinuation.from_dict(existing_data)
+            if existing == continuation:
+                return
+            raise ConflictingContinuationError(
+                f"TaskContinuation for parent task '{continuation.parent_task_id}' "
+                f"version {continuation.continuation_version} already exists with conflicting data"
+            )
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(key, continuation.to_json())
+            pipe.set(
+                f"task.continuation_latest:{continuation.parent_task_id}",
+                str(continuation.continuation_version),
+            )
+            await pipe.execute()
+
+    async def get_continuation(
+        self, parent_task_id: str, continuation_version: int = 1
+    ) -> TaskContinuation | None:
+        clean_parent_task_id = str(parent_task_id).strip()
+        if not clean_parent_task_id:
+            return None
+        key = f"task.continuation:{clean_parent_task_id}:{continuation_version}"
+        raw = await self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return TaskContinuation.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
+        key = f"task.authority:{authority.root_task_id}"
+        raw = await self._client.get(key)
+        if raw is not None:
+            existing_data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            existing = RootAuthorityRecord.from_dict(existing_data)
+            if existing == authority:
+                return
+            raise ConflictingRootAuthorityError(
+                f"RootAuthorityRecord for root task '{authority.root_task_id}' "
+                "already exists with conflicting data"
+            )
+        await self._client.set(key, authority.to_json())
+
+    async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
+        clean_root_task_id = str(root_task_id).strip()
+        if not clean_root_task_id:
+            return None
+        key = f"task.authority:{clean_root_task_id}"
+        raw = await self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return RootAuthorityRecord.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
     async def dispatch(self, task: TaskRequested, target: str) -> None:
         """Atomically enqueue task payload and establish pending status.
