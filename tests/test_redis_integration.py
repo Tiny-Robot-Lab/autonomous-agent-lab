@@ -99,7 +99,7 @@ async def clean_redis(redis_url: str) -> AsyncGenerator[str, None]:
     sanitized_url = _sanitize_redis_url(redis_url)
     try:
         await asyncio.wait_for(client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError, TimeoutError) as exc:
+    except (redis.ConnectionError, OSError) as exc:
         await client.aclose()
         pytest.fail(
             f"Configured Redis endpoint is unreachable at {sanitized_url} within 1.0s timeout: {exc}"
@@ -725,7 +725,8 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
         input_key = f"task.input:{clean_task.task_id}:1"
         authority_key = f"task.authority:{clean_task.task_id}"
 
-        assert await gateway._client.get(marker_key) is not None
+        raw_marker = await gateway._client.get(marker_key)
+        assert raw_marker is not None
         assert await gateway._client.ttl(marker_key) == -1
         assert await gateway._client.ttl(status_key) == -1
         assert await gateway._client.ttl(lineage_key) == -1
@@ -733,7 +734,7 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
         assert await gateway._client.ttl(authority_key) == -1
 
         # Marker contains valid JSON with task_id
-        marker_data = json.loads(await gateway._client.get(marker_key))
+        marker_data = json.loads(raw_marker)
         assert marker_data["task_id"] == clean_task.task_id
 
         # 3. Conflicting concurrent initialization: same task ID, conflicting immutable input
