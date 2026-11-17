@@ -657,8 +657,16 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
 async def test_redis_root_registration_marker_concurrency_and_partial_init(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
     try:
+        now = "2026-11-16T12:00:00+00:00"
         task_id = f"root_{uuid.uuid4().hex[:8]}"
-        root_task = TaskRequested.create("Root registration concurrency test", task_id=task_id)
+        root_task = TaskRequested(
+            task_id=task_id,
+            prompt="Root registration concurrency test",
+            created_at=now,
+            root_task_id=task_id,
+            parent_task_id=None,
+            version=2,
+        )
 
         # 1. Partial initialization rejection: status key alone exists
         await gateway._client.set(
@@ -667,14 +675,48 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
         )
         with pytest.raises(ConflictingRootTaskRegistrationError, match="inconsistent or partial"):
             await gateway.register_root_task(root_task)
-        # Registration marker must NOT have been written
+        # Registration marker and remaining bundle keys must NOT have been written
         assert await gateway._client.get(f"task.registration:{task_id}") is None
+        assert await gateway._client.get(f"task.lineage:{task_id}") is None
+        assert await gateway._client.get(f"task.input:{task_id}:1") is None
+        assert await gateway._client.get(f"task.authority:{task_id}") is None
         await gateway._client.delete(f"task.status:{task_id}")
 
-        # 2. Concurrency: 10 concurrent registrations of the clean root task
-        clean_task = TaskRequested.create("Concurrent root registration", task_id=f"root_{uuid.uuid4().hex[:8]}")
+        # Partial initialization rejection: registration marker alone exists
+        partial_id = f"root_{uuid.uuid4().hex[:8]}"
+        partial_task = TaskRequested(
+            task_id=partial_id,
+            prompt="Partial marker test",
+            created_at=now,
+            root_task_id=partial_id,
+            parent_task_id=None,
+            version=2,
+        )
+        await gateway._client.set(
+            f"task.registration:{partial_id}",
+            json.dumps({"registered_at": now, "task_id": partial_id}),
+        )
+        with pytest.raises(ConflictingRootTaskRegistrationError, match="inconsistent or partial"):
+            await gateway.register_root_task(partial_task)
+        assert await gateway._client.get(f"task.status:{partial_id}") is None
+        assert await gateway._client.get(f"task.lineage:{partial_id}") is None
+        assert await gateway._client.get(f"task.input:{partial_id}:1") is None
+        assert await gateway._client.get(f"task.authority:{partial_id}") is None
+        await gateway._client.delete(f"task.registration:{partial_id}")
+
+        # 2. Identical concurrency: 10 concurrent registrations of the same clean root task
+        ident_id = f"root_{uuid.uuid4().hex[:8]}"
+        clean_task = TaskRequested(
+            task_id=ident_id,
+            prompt="Concurrent root registration",
+            created_at=now,
+            root_task_id=ident_id,
+            parent_task_id=None,
+            version=2,
+        )
         tasks = [gateway.register_root_task(clean_task) for _ in range(10)]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(r is None for r in results)
 
         # Verify all authoritative keys exist and have no TTL
         marker_key = f"task.registration:{clean_task.task_id}"
@@ -694,7 +736,40 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
         marker_data = json.loads(await gateway._client.get(marker_key))
         assert marker_data["task_id"] == clean_task.task_id
 
-        # 3. Status advancement: status advances to 'running', replay must NOT reset it
+        # 3. Conflicting concurrent initialization: same task ID, conflicting immutable input
+        conflict_id = f"root_{uuid.uuid4().hex[:8]}"
+        task_a = TaskRequested(
+            task_id=conflict_id,
+            prompt="Candidate prompt A",
+            created_at=now,
+            root_task_id=conflict_id,
+            parent_task_id=None,
+            version=2,
+        )
+        task_b = TaskRequested(
+            task_id=conflict_id,
+            prompt="Conflicting candidate prompt B",
+            created_at=now,
+            root_task_id=conflict_id,
+            parent_task_id=None,
+            version=2,
+        )
+        conflict_results = await asyncio.gather(
+            gateway.register_root_task(task_a),
+            gateway.register_root_task(task_b),
+            return_exceptions=True,
+        )
+        successes = [r for r in conflict_results if r is None]
+        failures = [r for r in conflict_results if isinstance(r, ConflictingRootTaskRegistrationError)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+
+        # Verified stored bundle has exactly one accepted identity
+        persisted_input = await gateway.get_task_input(conflict_id, 1)
+        assert persisted_input is not None
+        assert persisted_input.prompt in (task_a.prompt, task_b.prompt)
+
+        # 4. Status advancement: status advances to 'running', replay must NOT reset it
         await gateway.update_status(clean_task.task_id, "running")
         assert await gateway.get_status(clean_task.task_id) == "running"
 
