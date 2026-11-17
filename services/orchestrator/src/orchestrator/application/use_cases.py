@@ -1,7 +1,22 @@
-from datetime import UTC, datetime
+import hmac
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import uuid4
 
-from agent_contracts import AgentEvent, RoutingDecision, RoutingProvenance, TaskRequested
+from agent_contracts import (
+    ActiveClaim,
+    AgentEvent,
+    ClaimTaskResponse,
+    DelegationGrant,
+    RoutingDecision,
+    RoutingProvenance,
+    StageArtifact,
+    TaskAssignment,
+    TaskInputReference,
+    TaskRequested,
+    normalize_canonical_utc_timestamp,
+)
 
 from orchestrator.domain.advisor import (
     AdvisorError,
@@ -11,12 +26,22 @@ from orchestrator.domain.advisor import (
 )
 from orchestrator.domain.assessment import RoutingAssessment, RoutingClarity
 from orchestrator.domain.capability import AgentCapability, CapabilityUnavailableError
+from orchestrator.domain.principal import (
+    RuntimePrincipal,
+    compute_assignment_verifier_digest,
+    derive_assignment_proof,
+    derive_proof_subkeys,
+    encode_canonical_proof_identity,
+    parse_master_secret,
+    verify_assignment_proof,
+)
 from orchestrator.domain.router import DeterministicCapabilityRouter
 from orchestrator.domain.selection import (
     CandidateSelectionPolicy,
     DeterministicSelectionPolicy,
 )
 from orchestrator.domain.task import (
+    CorruptAuthoritativeRecordError,
     DelegationDepthExceededError,
     ParentTaskNotFoundError,
     Task,
@@ -27,10 +52,15 @@ from .ports import (
     AuthoritativeTaskStore,
     CandidateFinder,
     CapabilityRouter,
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
     EventPublisher,
+    InvalidClaimProofError,
     RoutingAdvisor,
     RoutingRecorder,
+    TaskAlreadyClaimedError,
     TaskDispatcher,
+    TaskNotClaimableError,
     TaskQueue,
 )
 
@@ -413,3 +443,398 @@ class RegisterChildTask:
         await self._task_store.register_child_task(child_task, initial_status="pending_dispatch")
 
         return child_task
+
+
+class UnauthorizedPrincipalError(Exception):
+    """Raised when an unauthenticated, invalid, or inactive principal attempts an operation."""
+
+
+class CapabilityMismatchError(Exception):
+    """Raised when an authenticated principal attempts to claim work for an unauthorized capability."""
+
+
+class ClaimTask:
+    """Authenticated platform pull-claim use case for task turns.
+
+    Governed by ADR-0007 (Decision 7) and Issue #220:
+    - Atomically verifies task claimability, capability compatibility, and absence of active claim;
+    - Transitions task to 'working';
+    - Mints TaskAssignment, fencing epoch, delivery lease, and detached assignment proof;
+    - Emits narrow one-turn research -> analysis grant for eligible Research root claims;
+    - Idempotent for repeated requests with same (principal_id, request_id).
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+        delivery_lease_seconds: float = 30.0,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("ClaimTask requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._delivery_lease_seconds = float(delivery_lease_seconds)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        request_id: str,
+        capability: str,
+        execution_kind: str = "initial",
+    ) -> ClaimTaskResponse:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        clean_cap = capability.strip()
+        if not principal.has_capability(clean_cap):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' is not authorized for capability '{clean_cap}'"
+            )
+
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            raise ValueError("task_id must be a non-empty string")
+
+        clean_request_id = str(request_id).strip()
+        if not clean_request_id:
+            raise ValueError("request_id must be a non-empty string")
+
+        clean_kind = execution_kind.strip()
+
+        # 1. Authoritative lineage lookup
+        lineage = await self._task_store.get_lineage(clean_task_id)
+        if lineage is None:
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' not found")
+
+        # 2. Execution kind validation
+        if clean_kind == "initial":
+            if not lineage.is_root:
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' is not a root task for initial claim")
+        elif clean_kind == "delegated_child":
+            if lineage.is_root:
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' is a root task, not a delegated child")
+        elif clean_kind == "resumed_continuation":
+            if not lineage.is_root:
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' is not a root task for resumption")
+        else:
+            raise ValueError(f"Invalid execution_kind: '{clean_kind}'")
+
+        now_dt = self._clock()
+        now_iso = normalize_canonical_utc_timestamp(now_dt)
+        expires_at = normalize_canonical_utc_timestamp(
+            now_dt + timedelta(seconds=self._delivery_lease_seconds)
+        )
+
+        # 3. Check current fencing epoch
+        cur_epoch = await self._task_store.get_fencing_epoch(clean_task_id)
+        candidate_epoch = cur_epoch + 1
+
+        # 4. Check for eligible root grant
+        grant: DelegationGrant | None = None
+        assignment_id = f"assign-{uuid4()}"
+        turn_id = f"turn-{uuid4()}"
+        if clean_kind == "initial" and clean_cap == "research" and lineage.is_root:
+            root_authority = await self._task_store.get_root_authority(clean_task_id)
+            if root_authority and ("research", "analysis") in root_authority.allowed_delegation_edges:
+                grant_id = f"grant-{uuid4()}"
+                grant = DelegationGrant(
+                    grant_id=grant_id,
+                    root_task_id=clean_task_id,
+                    issued_to_assignment_id=assignment_id,
+                    issued_to_principal_id=principal.principal_id,
+                    fencing_epoch=candidate_epoch,
+                    turn_id=turn_id,
+                    issued_at=now_iso,
+                )
+
+        claim_id = f"claim-{uuid4()}"
+
+        # 5. Build candidate canonical proof identity & derive proof + verifier digest
+        canonical_identity = encode_canonical_proof_identity(
+            assignment_id=assignment_id,
+            claim_id=claim_id,
+            task_id=clean_task_id,
+            root_task_id=lineage.root_task_id,
+            turn_id=turn_id,
+            runtime_principal_id=principal.principal_id,
+            bound_agent_id=principal.bound_agent_id,
+            assigned_capability=clean_cap,
+            execution_kind=clean_kind,
+            continuation_version=None,
+            fencing_epoch=candidate_epoch,
+            request_id=clean_request_id,
+            delivery_expires_at=expires_at,
+            delegation_grant_id=grant.grant_id if grant else None,
+        )
+        proof = derive_assignment_proof(self._token_key, canonical_identity)
+        verifier_digest = compute_assignment_verifier_digest(self._verifier_key, proof)
+
+        candidate_claim = ActiveClaim(
+            task_id=clean_task_id,
+            assignment_id=assignment_id,
+            claim_id=claim_id,
+            root_task_id=lineage.root_task_id,
+            turn_id=turn_id,
+            runtime_principal_id=principal.principal_id,
+            bound_agent_id=principal.bound_agent_id,
+            assigned_capability=clean_cap,
+            execution_kind=clean_kind,
+            fencing_epoch=candidate_epoch,
+            proof_digest=verifier_digest,
+            request_id=clean_request_id,
+            claimed_at=now_iso,
+            delivery_expires_at=expires_at,
+            delegation_grant_id=grant.grant_id if grant else None,
+        )
+
+        active_claim, is_replay = await self._task_store.atomic_claim_task(
+            task_id=clean_task_id,
+            claim=candidate_claim,
+            grant=grant,
+            now=now_iso,
+        )
+
+        if is_replay:
+            if active_claim.state != "claimed_unacknowledged":
+                raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' assignment is already acknowledged")
+            if active_claim.delivery_expires_at <= now_iso:
+                raise ClaimDeliveryLeaseExpiredError(
+                    f"Delivery lease for assignment '{active_claim.assignment_id}' has expired"
+                )
+
+            replay_identity = encode_canonical_proof_identity(
+                assignment_id=active_claim.assignment_id,
+                claim_id=active_claim.claim_id,
+                task_id=active_claim.task_id,
+                root_task_id=active_claim.root_task_id,
+                turn_id=active_claim.turn_id,
+                runtime_principal_id=active_claim.runtime_principal_id,
+                bound_agent_id=active_claim.bound_agent_id,
+                assigned_capability=active_claim.assigned_capability,
+                execution_kind=active_claim.execution_kind,
+                continuation_version=active_claim.continuation_version,
+                fencing_epoch=active_claim.fencing_epoch,
+                request_id=active_claim.request_id,
+                delivery_expires_at=active_claim.delivery_expires_at,
+                delegation_grant_id=active_claim.delegation_grant_id,
+            )
+            proof = derive_assignment_proof(self._token_key, replay_identity)
+            computed_verifier = compute_assignment_verifier_digest(self._verifier_key, proof)
+            if not hmac.compare_digest(computed_verifier, active_claim.proof_digest):
+                raise CorruptAuthoritativeRecordError("Replayed claim verifier digest mismatch")
+
+        task_input_ref = TaskInputReference(task_id=clean_task_id, input_version=1)
+
+        assignment = TaskAssignment(
+            assignment_id=active_claim.assignment_id,
+            claim_id=active_claim.claim_id,
+            task_id=active_claim.task_id,
+            root_task_id=active_claim.root_task_id,
+            turn_id=active_claim.turn_id,
+            runtime_principal_id=active_claim.runtime_principal_id,
+            bound_agent_id=active_claim.bound_agent_id,
+            execution_kind=active_claim.execution_kind,
+            assigned_capability=active_claim.assigned_capability,
+            fencing_epoch=active_claim.fencing_epoch,
+            claimed_at=active_claim.claimed_at,
+            delivery_expires_at=active_claim.delivery_expires_at,
+            task_input_reference=task_input_ref,
+            continuation_version=active_claim.continuation_version,
+            pinned_artifact_references=(),
+            delegation_grant_id=active_claim.delegation_grant_id,
+        )
+
+        return ClaimTaskResponse(
+            assignment=assignment,
+            assignment_proof=proof,
+        )
+
+
+class AcknowledgeAssignment:
+    """Authenticated assignment acknowledgement use case.
+
+    Governed by ADR-0007 (Decision 7) and Issue #220:
+    - Transitions an active claim from 'claimed_unacknowledged' to 'acknowledged';
+    - Verifies principal identity, assignment ID, and detached proof digest;
+    - Idempotent on repeated calls for already-acknowledged assignments;
+    - Rejects expired delivery leases.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("AcknowledgeAssignment requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+    ) -> ActiveClaim:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        clean_task_id = str(task_id).strip()
+        clean_assign_id = str(assignment_id).strip()
+        if not clean_task_id or not clean_assign_id:
+            raise ValueError("task_id and assignment_id must be non-empty strings")
+
+        claim = await self._task_store.get_active_claim(clean_task_id)
+        if claim is None or claim.assignment_id != clean_assign_id:
+            raise ClaimNotFoundError(
+                f"Active claim for assignment '{clean_assign_id}' on task '{clean_task_id}' not found"
+            )
+
+        if claim.runtime_principal_id != principal.principal_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assign_id}' is not owned by principal '{principal.principal_id}'"
+            )
+
+        if claim.bound_agent_id != principal.bound_agent_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assign_id}' is bound to agent '{claim.bound_agent_id}', not '{principal.bound_agent_id}'"
+            )
+
+        if not principal.has_capability(claim.assigned_capability):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks capability '{claim.assigned_capability}'"
+            )
+
+        cur_epoch = await self._task_store.get_fencing_epoch(clean_task_id)
+        if claim.fencing_epoch != cur_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{clean_assign_id}': claim={claim.fencing_epoch}, current={cur_epoch}"
+            )
+
+        if not verify_assignment_proof(self._verifier_key, assignment_proof, claim.proof_digest):
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        now_iso = normalize_canonical_utc_timestamp(self._clock())
+        return await self._task_store.acknowledge_claim(
+            task_id=clean_task_id,
+            assignment_id=clean_assign_id,
+            principal_id=principal.principal_id,
+            acknowledged_at=now_iso,
+        )
+
+
+class StageArtifactUseCase:
+    """Authenticated artifact staging and sealing use case.
+
+    Governed by ADR-0007 (Decisions 8, 10) and Issue #220:
+    - Verifies active assignment, principal, and detached proof;
+    - Requires assignment to be in 'acknowledged' claim state;
+    - Platform derives and stamps provenance from the active assignment;
+    - Caller-asserted provenance or identity is strictly ignored;
+    - Only the currently assigned task may receive staged artifacts;
+    - Seals and persists immutable StageArtifact via AuthoritativeTaskStore.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("StageArtifactUseCase requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        artifact_id: str,
+        artifact_type: str,
+        content: Mapping[str, Any],
+        artifact_version: int = 1,
+        payload_schema_version: int = 1,
+    ) -> StageArtifact:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        clean_task_id = str(task_id).strip()
+        clean_assign_id = str(assignment_id).strip()
+        if not clean_task_id or not clean_assign_id:
+            raise ValueError("task_id and assignment_id must be non-empty strings")
+
+        claim = await self._task_store.get_active_claim(clean_task_id)
+        if claim is None or claim.assignment_id != clean_assign_id:
+            raise ClaimNotFoundError(
+                f"Active claim for assignment '{clean_assign_id}' on task '{clean_task_id}' not found"
+            )
+
+        if claim.runtime_principal_id != principal.principal_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assign_id}' is not owned by principal '{principal.principal_id}'"
+            )
+
+        if claim.bound_agent_id != principal.bound_agent_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assign_id}' is bound to agent '{claim.bound_agent_id}', not '{principal.bound_agent_id}'"
+            )
+
+        if not principal.has_capability(claim.assigned_capability):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks capability '{claim.assigned_capability}'"
+            )
+
+        cur_epoch = await self._task_store.get_fencing_epoch(clean_task_id)
+        if claim.fencing_epoch != cur_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{clean_assign_id}': claim={claim.fencing_epoch}, current={cur_epoch}"
+            )
+
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Assignment must be acknowledged before staging artifacts")
+
+        if not verify_assignment_proof(self._verifier_key, assignment_proof, claim.proof_digest):
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        now_iso = normalize_canonical_utc_timestamp(self._clock())
+
+        # Platform-stamped provenance
+        provenance = {
+            "assignment_id": claim.assignment_id,
+            "bound_agent_id": claim.bound_agent_id,
+            "fencing_epoch": claim.fencing_epoch,
+            "producing_task_id": claim.task_id,
+            "runtime_principal_id": claim.runtime_principal_id,
+            "stamped_at": now_iso,
+            "turn_id": claim.turn_id,
+        }
+
+        artifact = StageArtifact(
+            artifact_id=artifact_id,
+            producing_task_id=claim.task_id,
+            artifact_type=artifact_type,
+            content=content,
+            created_at=now_iso,
+            producing_turn_id=claim.turn_id,
+            artifact_version=artifact_version,
+            payload_schema_version=payload_schema_version,
+            sealed=True,
+            metadata=provenance,
+        )
+
+        await self._task_store.save_stage_artifact(artifact)
+        return artifact

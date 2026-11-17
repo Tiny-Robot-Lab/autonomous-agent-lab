@@ -1,20 +1,43 @@
 from typing import Any, Protocol, runtime_checkable
 
 from agent_contracts import (
+    ActiveClaim,
     AgentCandidate,
     AgentEvent,
+    DelegationGrant,
     RootAuthorityRecord,
     RoutingDecision,
     StageArtifact,
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    WakeUpHint,
 )
 
 from orchestrator.domain.advisor import AdvisorRecommendation
 from orchestrator.domain.assessment import RoutingAssessment
 from orchestrator.domain.capability import AgentCapability
 from orchestrator.domain.task import TaskLineage
+
+
+class TaskNotClaimableError(Exception):
+    """Raised when a task is not in a claimable lifecycle status."""
+
+
+class TaskAlreadyClaimedError(Exception):
+    """Raised when a task has an active, unexpired claim by another request."""
+
+
+class ClaimNotFoundError(Exception):
+    """Raised when an expected active claim does not exist."""
+
+
+class InvalidClaimProofError(Exception):
+    """Raised when an assignment proof digest verification fails."""
+
+
+class ClaimDeliveryLeaseExpiredError(Exception):
+    """Raised when attempting an operation on an unacknowledged claim whose delivery lease has expired."""
 
 
 @runtime_checkable
@@ -32,6 +55,15 @@ class TaskDispatcher(Protocol):
     async def dispatch(
         self,
         task: TaskRequested,
+        target: str,
+    ) -> None: ...
+
+
+@runtime_checkable
+class WakeUpHintDispatcher(Protocol):
+    async def dispatch_hint(
+        self,
+        hint: WakeUpHint,
         target: str,
     ) -> None: ...
 
@@ -93,6 +125,42 @@ class AuthoritativeTaskStore(Protocol):
     async def save_root_authority(self, authority: RootAuthorityRecord) -> None: ...
 
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None: ...
+
+    async def save_authority_grant(self, grant: DelegationGrant) -> None: ...
+
+    async def get_authority_grant(
+        self, root_task_id: str, grant_id: str
+    ) -> DelegationGrant | None: ...
+
+    async def save_active_claim(self, claim: ActiveClaim) -> None: ...
+
+    async def get_active_claim(self, task_id: str) -> ActiveClaim | None: ...
+
+    async def get_fencing_epoch(self, task_id: str) -> int: ...
+
+    async def atomic_claim_task(
+        self,
+        task_id: str,
+        claim: ActiveClaim,
+        grant: DelegationGrant | None = None,
+        now: str = "",
+    ) -> tuple[ActiveClaim, bool]:
+        """Atomically claim a task.
+
+        Returns (active_claim, is_replay).
+        Raises TaskNotClaimableError, TaskAlreadyClaimedError, etc.
+        """
+        ...
+
+    async def acknowledge_claim(
+        self,
+        task_id: str,
+        assignment_id: str,
+        principal_id: str,
+        acknowledged_at: str,
+    ) -> ActiveClaim: ...
+
+    async def expire_delivery_lease(self, task_id: str, now: str) -> bool: ...
 
 
 class StateReader(Protocol):

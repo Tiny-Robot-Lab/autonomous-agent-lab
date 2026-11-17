@@ -26,6 +26,10 @@ class ConflictingRootAuthorityError(Exception):
     """Raised when attempting to overwrite an existing RootAuthorityRecord with conflicting policy data."""
 
 
+class ConflictingAuthorityGrantError(Exception):
+    """Raised when attempting to overwrite an existing DelegationGrant with conflicting grant data."""
+
+
 class ConflictingRootTaskRegistrationError(Exception):
     """Raised when attempting to register a root task with conflicting or partial state."""
 

@@ -3,13 +3,16 @@ import json
 import os
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import pytest
 import redis.asyncio as redis
 from agent_contracts import (
+    ActiveClaim,
     AgentCapabilityMetadata,
     AgentEvent,
+    DelegationGrant,
     InferenceExecutionTelemetry,
     RootAuthorityRecord,
     StageArtifact,
@@ -17,13 +20,22 @@ from agent_contracts import (
     TaskInput,
     TaskRequested,
     TaskResult,
+    WakeUpHint,
+    normalize_canonical_utc_timestamp,
 )
 from analysis_agent.application.processor import AnalysisProcessor
 from analysis_agent.infrastructure.deterministic_analyzer import (
     DeterministicMaterialAnalyzer,
 )
 from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
+from orchestrator.application.ports import (
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
+    TaskAlreadyClaimedError,
+    TaskNotClaimableError,
+)
 from orchestrator.domain.task import (
+    ConflictingAuthorityGrantError,
     ConflictingContinuationError,
     ConflictingRootAuthorityError,
     ConflictingRootTaskRegistrationError,
@@ -33,7 +45,7 @@ from orchestrator.domain.task import (
     NonContiguousVersionError,
     TaskLineage,
 )
-from orchestrator.infrastructure.redis_adapter import RedisGateway
+from orchestrator.infrastructure.redis_adapter import CLAIM_TASK_LUA, RedisGateway
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from research_agent.domain.models import ResearchResult
 from research_agent.infrastructure.redis_bus import RedisBus as ResearchRedisBus
@@ -929,4 +941,742 @@ async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clea
         assert len(successes) == 1
         assert len(failures) == 1
     finally:
+        await gateway.aclose()
+
+
+async def test_redis_authority_grant_write_once_and_conflict(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        t_id = f"root_{uuid.uuid4().hex[:8]}"
+        now = "2026-11-16T12:00:00+00:00"
+        grant_id = f"grant_{uuid.uuid4().hex[:8]}"
+        grant = DelegationGrant(
+            grant_id=grant_id,
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-001",
+            issued_to_principal_id="principal-research-1",
+            fencing_epoch=1,
+            turn_id="turn-001",
+            issued_at=now,
+        )
+
+        # 1. First save succeeds
+        await gateway.save_authority_grant(grant)
+
+        # 2. Get returns identical grant
+        retrieved = await gateway.get_authority_grant(t_id, grant_id)
+        assert retrieved == grant
+
+        # 3. Idempotent replay succeeds
+        await gateway.save_authority_grant(grant)
+
+        # 4. Conflicting save raises ConflictingAuthorityGrantError
+        conflict_grant = DelegationGrant(
+            grant_id=grant_id,
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-002",
+            issued_to_principal_id="principal-research-2",
+            fencing_epoch=1,
+            turn_id="turn-001",
+            issued_at=now,
+        )
+        with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+            await gateway.save_authority_grant(conflict_grant)
+
+        # 5. Replacement assignment gets distinct grant, both remain retrievable
+        grant_id_2 = f"grant_{uuid.uuid4().hex[:8]}"
+        grant_2 = DelegationGrant(
+            grant_id=grant_id_2,
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-002",
+            issued_to_principal_id="principal-research-2",
+            fencing_epoch=2,
+            turn_id="turn-002",
+            issued_at=now,
+        )
+        await gateway.save_authority_grant(grant_2)
+        assert await gateway.get_authority_grant(t_id, grant_id) == grant
+        assert await gateway.get_authority_grant(t_id, grant_id_2) == grant_2
+
+        # 6. Corrupt record raises CorruptAuthoritativeRecordError
+        await gateway._client.set(f"task.authority_grant:{t_id}:{grant_id}", "corrupt json string")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt DelegationGrant"):
+            await gateway.get_authority_grant(t_id, grant_id)
+    finally:
+        await gateway.aclose()
+
+
+async def test_redis_atomic_claim_acknowledgement_and_fencing_lifecycle(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    try:
+        t_id = f"task_{uuid.uuid4().hex[:8]}"
+        past = "2020-01-01T00:00:00Z"
+        now = "2020-01-01T00:00:15Z"
+        expired_now = "2020-01-01T00:00:35Z"
+        future_expire = "2020-01-01T00:00:30Z"
+
+        root = TaskRequested.create("Real Redis claim lifecycle task")
+        object.__setattr__(root, "task_id", t_id)
+        object.__setattr__(root, "root_task_id", t_id)
+        await gateway.register_root_task(root, initial_status="pending_dispatch")
+        await gateway.update_status(t_id, "pending")
+
+        grant = DelegationGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-001",
+            issued_to_principal_id="principal-research-1",
+            fencing_epoch=1,
+            turn_id="turn-001",
+            issued_at=past,
+        )
+
+        claim_1 = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-001",
+            claim_id="claim-001",
+            root_task_id=t_id,
+            turn_id="turn-001",
+            runtime_principal_id="principal-research-1",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req-001",
+            claimed_at=past,
+            delivery_expires_at=future_expire,
+            delegation_grant_id=grant.grant_id,
+        )
+
+        # 1. Atomic claim succeeds
+        active, is_replay = await gateway.atomic_claim_task(
+            task_id=t_id,
+            claim=claim_1,
+            grant=grant,
+            now=past,
+        )
+        assert is_replay is False
+        assert active.fencing_epoch == 1
+        assert active.state == "claimed_unacknowledged"
+        assert await gateway.get_status(t_id) == "working"
+        assert await gateway.get_fencing_epoch(t_id) == 1
+        assert await gateway.get_authority_grant(t_id, grant.grant_id) == grant
+
+        # 2. Idempotent claim replay
+        active_replay, is_replay_flag = await gateway.atomic_claim_task(
+            task_id=t_id,
+            claim=claim_1,
+            grant=grant,
+            now=now,
+        )
+        assert is_replay_flag is True
+        assert active_replay.fencing_epoch == 1
+        assert active_replay.assignment_id == "assign-001"
+
+        # 3. Conflicting claim by another principal fails while active
+        other_claim = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-002",
+            claim_id="claim-002",
+            root_task_id=t_id,
+            turn_id="turn-002",
+            runtime_principal_id="principal-research-2",
+            bound_agent_id="research-agent-2",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=2,
+            proof_digest="b" * 64,
+            request_id="req-002",
+            claimed_at=now,
+            delivery_expires_at=future_expire,
+        )
+        with pytest.raises(TaskAlreadyClaimedError, match="active claim by another runtime"):
+            await gateway.atomic_claim_task(
+                task_id=t_id,
+                claim=other_claim,
+                now=now,
+            )
+
+        # Non-claimable / missing task raises TaskNotClaimableError
+        with pytest.raises(TaskNotClaimableError, match="not found"):
+            await gateway.atomic_claim_task(
+                task_id="missing-task-id",
+                claim=claim_1,
+                now=now,
+            )
+
+        # Acknowledgement fails if lease expired
+        with pytest.raises(ClaimDeliveryLeaseExpiredError, match="Delivery lease"):
+            await gateway.acknowledge_claim(t_id, "assign-001", "principal-research-1", expired_now)
+
+        # 4. Delivery lease expiry restores claimability and clears claim
+        expired = await gateway.expire_delivery_lease(t_id, now=expired_now)
+        assert expired is True
+        assert await gateway.get_status(t_id) == "pending"
+        assert await gateway.get_active_claim(t_id) is None
+
+        # 5. Subsequent claim increments fencing epoch to 2
+        claim_2 = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-003",
+            claim_id="claim-003",
+            root_task_id=t_id,
+            turn_id="turn-003",
+            runtime_principal_id="principal-research-2",
+            bound_agent_id="research-agent-2",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=2,
+            proof_digest="c" * 64,
+            request_id="req-003",
+            claimed_at=expired_now,
+            delivery_expires_at="2020-01-01T00:01:00Z",
+        )
+        active_2, is_replay_2 = await gateway.atomic_claim_task(
+            task_id=t_id,
+            claim=claim_2,
+            now=expired_now,
+        )
+        assert is_replay_2 is False
+        assert active_2.fencing_epoch == 2
+        assert await gateway.get_fencing_epoch(t_id) == 2
+
+        # 6. Acknowledge claim
+        ack_time = "2020-01-01T00:00:40Z"
+        acked = await gateway.acknowledge_claim(t_id, "assign-003", "principal-research-2", ack_time)
+        assert acked.state == "acknowledged"
+        assert acked.acknowledged_at == normalize_canonical_utc_timestamp(ack_time)
+
+        # 7. Acknowledge replay is idempotent
+        acked_replay = await gateway.acknowledge_claim(t_id, "assign-003", "principal-research-2", ack_time)
+        assert acked_replay.state == "acknowledged"
+
+        # 8. Mismatched assignment ID raises ClaimNotFoundError
+        with pytest.raises(ClaimNotFoundError, match="does not match"):
+            await gateway.acknowledge_claim(t_id, "wrong-assignment", "principal-research-2", ack_time)
+
+        # 8b. Mismatched principal ID raises ClaimNotFoundError
+        with pytest.raises(ClaimNotFoundError, match="does not match"):
+            await gateway.acknowledge_claim(t_id, "assign-003", "wrong-principal", ack_time)
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.anyio
+async def test_redis_concurrent_claim_attempts_atomicity(redis_url: str) -> None:
+    gateway = RedisGateway(redis_url)
+    try:
+        now = datetime.now(UTC).isoformat()
+        future = "2099-01-01T00:00:00Z"
+
+        # Setup root task in pending status
+        root = TaskRequested.create("Concurrent claim target")
+        t_id = root.task_id
+        await gateway.register_root_task(root)
+        await gateway.update_status(t_id, "pending")
+
+        # 5 competing claims from different principals
+        competing_claims = [
+            ActiveClaim(
+                task_id=t_id,
+                assignment_id=f"assign-{i}",
+                claim_id=f"claim-{i}",
+                root_task_id=t_id,
+                turn_id=f"turn-{i}",
+                runtime_principal_id=f"principal-{i}",
+                bound_agent_id=f"agent-{i}",
+                assigned_capability="research",
+                execution_kind="initial",
+                fencing_epoch=1,
+                proof_digest=f"{i}" * 64,
+                request_id=f"req-{i}",
+                claimed_at=now,
+                delivery_expires_at=future,
+            )
+            for i in range(5)
+        ]
+
+        results = await asyncio.gather(
+            *[
+                gateway.atomic_claim_task(task_id=t_id, claim=claim, now=now)
+                for claim in competing_claims
+            ],
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, tuple)]
+        failures = [r for r in results if isinstance(r, Exception)]
+
+        # Exactly one concurrent claim succeeds; all others fail closed
+        assert len(successes) == 1
+        assert len(failures) == 4
+
+        winner_claim, is_replay = successes[0]
+        assert is_replay is False
+        assert winner_claim.fencing_epoch == 1
+        assert await gateway.get_fencing_epoch(t_id) == 1
+        assert await gateway.get_status(t_id) == "working"
+
+        for f in failures:
+            assert isinstance(f, TaskAlreadyClaimedError)
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.anyio
+async def test_redis_proof_digest_state_and_idempotent_replay(redis_url: str) -> None:
+    gateway = RedisGateway(redis_url)
+    try:
+        now = datetime.now(UTC).isoformat()
+        future = "2099-01-01T00:00:00Z"
+        digest_hex = "f" * 64
+
+        root = TaskRequested.create("Replay test")
+        t_id = root.task_id
+        await gateway.register_root_task(root)
+        await gateway.update_status(t_id, "pending")
+
+        claim = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-orig",
+            claim_id="claim-orig",
+            root_task_id=t_id,
+            turn_id="turn-orig",
+            runtime_principal_id="principal-1",
+            bound_agent_id="agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest=digest_hex,
+            request_id="req-unique-123",
+            claimed_at=now,
+            delivery_expires_at=future,
+        )
+
+        # 1. Initial claim
+        active, is_replay = await gateway.atomic_claim_task(t_id, claim, now=now)
+        assert is_replay is False
+        assert active.proof_digest == digest_hex
+
+        # Verify Redis state contains exact 64-char hex digest
+        persisted = await gateway.get_active_claim(t_id)
+        assert persisted is not None
+        assert persisted.proof_digest == digest_hex
+
+        # 2. Idempotent replay does not mutate Redis or advance fence
+        active_replay, is_replay_2 = await gateway.atomic_claim_task(t_id, claim, now=now)
+        assert is_replay_2 is True
+        assert active_replay.assignment_id == "assign-orig"
+        assert active_replay.fencing_epoch == 1
+        assert await gateway.get_fencing_epoch(t_id) == 1
+
+        # 3. Acknowledge assignment
+        await gateway.acknowledge_claim(t_id, "assign-orig", "principal-1", now)
+
+        # 4. Claim attempt after acknowledgement fails closed with TaskAlreadyClaimedError
+        with pytest.raises(TaskAlreadyClaimedError, match="already acknowledged"):
+            await gateway.atomic_claim_task(t_id, claim, now=now)
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.anyio
+async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) -> None:
+    gateway = RedisGateway(redis_url)
+    client = redis.from_url(redis_url, decode_responses=False)
+    try:
+        now = datetime.now(UTC).isoformat()
+        future = "2099-01-01T00:00:00Z"
+
+        root = TaskRequested.create("Corrupt test")
+        t_id = root.task_id
+        await gateway.register_root_task(root)
+        await gateway.update_status(t_id, "pending")
+
+        # 1. Corrupt fence record (non-integer string)
+        await client.set(f"task.fence:{t_id}", b"not-a-number")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt fencing epoch"):
+            await gateway.get_fencing_epoch(t_id)
+
+        claim = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-1",
+            claim_id="claim-1",
+            root_task_id=t_id,
+            turn_id="turn-1",
+            runtime_principal_id="p-1",
+            bound_agent_id="a-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req-1",
+            claimed_at=now,
+            delivery_expires_at=future,
+        )
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_FENCE"):
+            await gateway.atomic_claim_task(t_id, claim, now=now)
+
+        # Restore valid fence
+        await client.set(f"task.fence:{t_id}", b"0")
+
+        # 2. Corrupt claim record (invalid JSON)
+        await client.set(f"task.claim:{t_id}", b"this is {not valid json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt ActiveClaim"):
+            await gateway.get_active_claim(t_id)
+
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_CLAIM"):
+            await gateway.atomic_claim_task(t_id, claim, now=now)
+
+        with pytest.raises(CorruptAuthoritativeRecordError, match=r"Corrupt ActiveClaim"):
+            await gateway.acknowledge_claim(t_id, "assign-1", "p-1", now)
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+
+@pytest.mark.anyio
+async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
+    gateway = RedisGateway(redis_url)
+    client = redis.from_url(redis_url, decode_responses=False)
+    try:
+        now = datetime.now(UTC).isoformat()
+        future = "2099-01-01T00:00:00Z"
+
+        root = TaskRequested.create("TTL persistence test")
+        t_id = root.task_id
+        grant = DelegationGrant(
+            grant_id="grant-ttl-1",
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-ttl-1",
+            issued_to_principal_id="principal-1",
+            fencing_epoch=1,
+            turn_id="turn-ttl-1",
+            issued_at=now,
+        )
+        claim = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-ttl-1",
+            claim_id="claim-ttl-1",
+            root_task_id=t_id,
+            turn_id="turn-ttl-1",
+            runtime_principal_id="principal-1",
+            bound_agent_id="agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="d" * 64,
+            request_id="req-ttl-1",
+            claimed_at=now,
+            delivery_expires_at=future,
+            delegation_grant_id=grant.grant_id,
+        )
+
+        await gateway.register_root_task(root)
+        await gateway.update_status(t_id, "pending")
+        await gateway.atomic_claim_task(t_id, claim, grant=grant, now=now)
+
+        keys_to_check = [
+            f"task.status:{t_id}",
+            f"task.claim:{t_id}",
+            f"task.fence:{t_id}",
+            f"task.authority_grant:{t_id}:{grant.grant_id}",
+            f"task.lineage:{t_id}",
+            f"task.registration:{t_id}",
+        ]
+
+        for k in keys_to_check:
+            ttl = await client.ttl(k)
+            # ttl == -1 indicates the key exists and has no expiration (persistent)
+            assert ttl == -1, f"Expected key '{k}' to have no TTL (ttl == -1), got {ttl}"
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+
+@pytest.mark.anyio
+async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
+    # Gateway configured in authenticated_claim mode
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        secret_prompt = "TOP_SECRET_PROMPT_DO_NOT_LEAK_IN_HINT_QUEUE"
+        root = TaskRequested.create(secret_prompt)
+        await gateway.register_root_task(root)
+
+        legacy_target = "agent.tasks.research"
+        authoritative_hint_queue = "agent.hints.research"
+
+        # Dispatch via gateway under authenticated_claim mode targeting legacy queue
+        await gateway.dispatch(root, legacy_target)
+
+        # 1. Exactly one hint in the actual authoritative hint queue
+        raw_hints = await client.lrange(authoritative_hint_queue, 0, -1)
+        assert len(raw_hints) == 1
+
+        payload_str = (
+            raw_hints[0].decode("utf-8")
+            if isinstance(raw_hints[0], (bytes, bytearray))
+            else str(raw_hints[0])
+        )
+
+        # 2. Payload parses as WakeUpHint
+        hint = WakeUpHint.from_json(payload_str)
+        assert hint.capability == "research"
+        assert hint.execution_kind == "initial"
+        assert hint.task_id == root.task_id
+
+        # 3. Secret prompt absent
+        assert secret_prompt not in payload_str
+        assert "prompt" not in payload_str
+
+        # 4. No credential, token, proof, verifier digest, grant, or authority payload
+        payload_data = json.loads(payload_str)
+        disallowed_keys = {
+            "token",
+            "proof",
+            "proof_digest",
+            "verifier",
+            "grant",
+            "authority",
+            "credential",
+            "secret",
+            "input",
+            "artifact",
+        }
+        for key in payload_data:
+            assert not any(
+                disallowed in key.lower() for disallowed in disallowed_keys
+            ), f"Disallowed key in hint: {key}"
+        for val in payload_data.values():
+            val_str = str(val).lower()
+            assert not any(
+                disallowed in val_str for disallowed in disallowed_keys
+            ), f"Disallowed value in hint: {val}"
+
+        # 5. No TaskRequested duplicate in a legacy task queue
+        legacy_items = await client.lrange(legacy_target, 0, -1)
+        assert len(legacy_items) == 0
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+
+async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis)
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        t_id = f"root_{uuid.uuid4().hex[:8]}"
+        past = "2020-01-01T00:00:00Z"
+        now = "2020-01-01T00:00:15Z"
+        future = "2099-01-01T00:00:00Z"
+
+        root = TaskRequested.create("Root task for Lua two-phase tests")
+        object.__setattr__(root, "task_id", t_id)
+        object.__setattr__(root, "root_task_id", t_id)
+        await gateway.register_root_task(root)
+        await gateway.update_status(t_id, "pending")
+
+        grant_id_1 = f"grant_{uuid.uuid4().hex[:8]}"
+        grant_1 = DelegationGrant(
+            grant_id=grant_id_1,
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-001",
+            issued_to_principal_id="principal-research-1",
+            fencing_epoch=1,
+            turn_id="turn-001",
+            issued_at=past,
+        )
+        claim_1 = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-001",
+            claim_id="claim-001",
+            root_task_id=t_id,
+            turn_id="turn-001",
+            runtime_principal_id="principal-research-1",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req-001",
+            claimed_at=past,
+            delivery_expires_at=past,  # Expired lease
+            delegation_grant_id=grant_1.grant_id,
+        )
+
+        # 1. Establish initial expired claim in Redis
+        await gateway.atomic_claim_task(t_id, claim_1, grant=grant_1, now=past)
+        await gateway.update_status(t_id, "pending")
+
+        raw_claim_1_before = await client.get(f"task.claim:{t_id}")
+        raw_fence_before = await client.get(f"task.fence:{t_id}")
+        raw_status_before = await client.get(f"task.status:{t_id}")
+        raw_grant_1_before = await client.get(f"task.authority_grant:{t_id}:{grant_id_1}")
+
+        # 2. Expired claim + epoch race: leaves expired claim, fence, and status unchanged
+        claim_bad_epoch = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-002",
+            claim_id="claim-002",
+            root_task_id=t_id,
+            turn_id="turn-002",
+            runtime_principal_id="principal-research-2",
+            bound_agent_id="research-agent-2",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=99,  # Epoch race
+            proof_digest="b" * 64,
+            request_id="req-002",
+            claimed_at=now,
+            delivery_expires_at=future,
+        )
+        with pytest.raises(TaskAlreadyClaimedError, match="fencing epoch race"):
+            await gateway.atomic_claim_task(t_id, claim_bad_epoch, now=now)
+
+        assert await client.get(f"task.claim:{t_id}") == raw_claim_1_before
+        assert await client.get(f"task.fence:{t_id}") == raw_fence_before
+        assert await client.get(f"task.status:{t_id}") == raw_status_before
+
+        # 3. Expired claim + corrupt fence: leaves expired claim and status unchanged
+        await client.set(f"task.fence:{t_id}", "corrupt_non_numeric")
+        claim_candidate = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-002",
+            claim_id="claim-002",
+            root_task_id=t_id,
+            turn_id="turn-002",
+            runtime_principal_id="principal-research-2",
+            bound_agent_id="research-agent-2",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=2,
+            proof_digest="c" * 64,
+            request_id="req-002",
+            claimed_at=now,
+            delivery_expires_at=future,
+        )
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_FENCE"):
+            await gateway.atomic_claim_task(t_id, claim_candidate, now=now)
+
+        assert await client.get(f"task.claim:{t_id}") == raw_claim_1_before
+        assert await client.get(f"task.status:{t_id}") == raw_status_before
+
+        # Restore valid fence
+        await client.set(f"task.fence:{t_id}", "1")
+
+        # 4. Conflicting grant: leaves fence, status, active claim, and existing grant byte-for-byte unchanged
+        grant_conflict = DelegationGrant(
+            grant_id=grant_id_1,  # Same grant_id
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-002",  # Different assignment
+            issued_to_principal_id="principal-research-2",
+            fencing_epoch=2,
+            turn_id="turn-002",
+            issued_at=now,
+        )
+        with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+            await gateway.atomic_claim_task(t_id, claim_candidate, grant=grant_conflict, now=now)
+
+        assert await client.get(f"task.fence:{t_id}") == "1"
+        assert await client.get(f"task.status:{t_id}") == raw_status_before
+        assert await client.get(f"task.claim:{t_id}") == raw_claim_1_before
+        assert await client.get(f"task.authority_grant:{t_id}:{grant_id_1}") == raw_grant_1_before
+
+        # 5. Inconsistent grant key/payload fails without mutation
+        res_corrupt_grant = await client.eval(
+            CLAIM_TASK_LUA,
+            4,
+            f"task.status:{t_id}",
+            f"task.claim:{t_id}",
+            f"task.fence:{t_id}",
+            f"task.authority_grant:{t_id}:some_grant",  # grant key provided
+            t_id,
+            now,
+            "principal-research-2",
+            "req-002",
+            raw_status_before,
+            raw_status_before,
+            claim_candidate.to_json(),
+            "",  # grant payload empty!
+            "2",
+        )
+        assert res_corrupt_grant == ["CORRUPT_GRANT_INPUT"]
+        assert await client.get(f"task.fence:{t_id}") == "1"
+        assert await client.get(f"task.status:{t_id}") == raw_status_before
+        assert await client.get(f"task.claim:{t_id}") == raw_claim_1_before
+
+        # 6. Malformed claim JSON in expiry raises CorruptAuthoritativeRecordError
+        await client.set(f"task.claim:{t_id}", "not-valid-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="during lease expiry"):
+            await gateway.expire_delivery_lease(t_id, now=now)
+
+        # 7. Malformed delivery_expires_at type in expiry raises CorruptAuthoritativeRecordError
+        bad_claim_dict = claim_1.to_dict()
+        bad_claim_dict["delivery_expires_at"] = 12345
+        await client.set(f"task.claim:{t_id}", json.dumps(bad_claim_dict))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="during lease expiry"):
+            await gateway.expire_delivery_lease(t_id, now=now)
+
+        # 8. Unknown active-claim state in expiry raises CorruptAuthoritativeRecordError
+        bad_claim_dict["delivery_expires_at"] = past
+        bad_claim_dict["state"] = "unknown_state_xyz"
+        await client.set(f"task.claim:{t_id}", json.dumps(bad_claim_dict))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="during lease expiry"):
+            await gateway.expire_delivery_lease(t_id, now=now)
+
+        # 9. Unknown active-claim state in claim raises CorruptAuthoritativeRecordError
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_CLAIM"):
+            await gateway.atomic_claim_task(t_id, claim_candidate, now=now)
+
+        # 10. Unknown active-claim state in acknowledge raises CorruptAuthoritativeRecordError
+        with pytest.raises(CorruptAuthoritativeRecordError, match=r"Corrupt ActiveClaim"):
+            await gateway.acknowledge_claim(t_id, "assign-001", "principal-research-1", now)
+
+        # 11. Successful replacement of an expired claim advances the fence exactly once,
+        # stores the replacement claim, changes status to working, and preserves historical grant
+        await client.set(f"task.claim:{t_id}", raw_claim_1_before)  # Restore claim 1
+        grant_id_2 = f"grant_{uuid.uuid4().hex[:8]}"
+        grant_2 = DelegationGrant(
+            grant_id=grant_id_2,
+            root_task_id=t_id,
+            issued_to_assignment_id="assign-002",
+            issued_to_principal_id="principal-research-2",
+            fencing_epoch=2,
+            turn_id="turn-002",
+            issued_at=now,
+        )
+        claim_2 = ActiveClaim(
+            task_id=t_id,
+            assignment_id="assign-002",
+            claim_id="claim-002",
+            root_task_id=t_id,
+            turn_id="turn-002",
+            runtime_principal_id="principal-research-2",
+            bound_agent_id="research-agent-2",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=2,
+            proof_digest="d" * 64,
+            request_id="req-002",
+            claimed_at=now,
+            delivery_expires_at=future,
+            delegation_grant_id=grant_2.grant_id,
+        )
+        res_claim, is_replay = await gateway.atomic_claim_task(t_id, claim_2, grant=grant_2, now=now)
+        assert is_replay is False
+        assert res_claim.fencing_epoch == 2
+        assert await client.get(f"task.fence:{t_id}") == "2"
+        status_after = json.loads(await client.get(f"task.status:{t_id}"))
+        assert status_after["status"] == "working"
+        claim_after = ActiveClaim.from_json(await client.get(f"task.claim:{t_id}"))
+        assert claim_after.assignment_id == "assign-002"
+        assert claim_after.fencing_epoch == 2
+        # Historical grant preserved intact!
+        assert await client.get(f"task.authority_grant:{t_id}:{grant_id_1}") == raw_grant_1_before
+        # New grant written intact!
+        assert await client.get(f"task.authority_grant:{t_id}:{grant_id_2}") == grant_2.to_json()
+    finally:
+        await client.aclose()
         await gateway.aclose()

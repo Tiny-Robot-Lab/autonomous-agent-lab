@@ -1,10 +1,14 @@
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import redis.asyncio as redis
 from agent_contracts import (
+    ActiveClaim,
     AgentEvent,
+    DelegationGrant,
     FallbackTransition,
     InferenceExecutionTelemetry,
     RootAuthorityRecord,
@@ -13,16 +17,25 @@ from agent_contracts import (
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    WakeUpHint,
     canonical_json_dumps,
+    normalize_canonical_utc_timestamp,
 )
 
 from orchestrator.application.inference_history import (
     TaskEventObservation,
     project_task_inference_history,
 )
-from orchestrator.application.ports import TelemetryStorageError
+from orchestrator.application.ports import (
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
+    TaskAlreadyClaimedError,
+    TaskNotClaimableError,
+    TelemetryStorageError,
+)
 from orchestrator.domain.capability import AgentCapability
 from orchestrator.domain.task import (
+    ConflictingAuthorityGrantError,
     ConflictingContinuationError,
     ConflictingRootAuthorityError,
     ConflictingRootTaskRegistrationError,
@@ -223,10 +236,300 @@ else
 end
 """
 
+SAVE_AUTHORITY_GRANT_LUA = """
+local key = KEYS[1]
+local payload = ARGV[1]
+
+if redis.call('EXISTS', key) == 0 then
+    redis.call('SET', key, payload)
+    return 'OK'
+else
+    local existing = redis.call('GET', key)
+    if existing == payload then
+        return 'IDEMPOTENT'
+    else
+        return 'CONFLICT'
+    end
+end
+"""
+
+CLAIM_TASK_LUA = """
+local status_key = KEYS[1]
+local claim_key = KEYS[2]
+local fence_key = KEYS[3]
+local grant_key = KEYS[4]
+
+local task_id = ARGV[1]
+local now_iso = ARGV[2]
+local principal_id = ARGV[3]
+local request_id = ARGV[4]
+local working_status_json = ARGV[5]
+local pending_status_json = ARGV[6]
+local claim_payload = ARGV[7]
+local grant_payload = ARGV[8]
+local expected_epoch = tonumber(ARGV[9])
+
+-- =============================================================================
+-- PHASE 1: Reads and Validations (Strictly Read-Only, Zero Mutations)
+-- =============================================================================
+
+-- 1. Status key exists
+if redis.call('EXISTS', status_key) == 0 then
+    return {'NOT_FOUND'}
+end
+
+-- 2. Status JSON is valid and structurally complete
+local cur_status_raw = redis.call('GET', status_key)
+local ok_s, status_tbl = pcall(cjson.decode, cur_status_raw)
+if not ok_s or type(status_tbl) ~= 'table' then
+    return {'CORRUPT_STATUS'}
+end
+local cur_status = status_tbl['status']
+if type(cur_status) ~= 'string' or cur_status == '' then
+    return {'CORRUPT_STATUS'}
+end
+
+-- 3. Existing claim JSON is valid and structurally complete
+local effective_status = cur_status
+local has_expired_claim = false
+
+if redis.call('EXISTS', claim_key) == 1 then
+    local cur_claim_raw = redis.call('GET', claim_key)
+    local ok_c, cur_claim = pcall(cjson.decode, cur_claim_raw)
+    if not ok_c or type(cur_claim) ~= 'table' then
+        return {'CORRUPT_CLAIM'}
+    end
+
+    local c_principal_id = cur_claim['runtime_principal_id']
+    local c_request_id = cur_claim['request_id']
+    local c_assignment_id = cur_claim['assignment_id']
+    local c_state = cur_claim['state']
+    local c_expires_at = cur_claim['delivery_expires_at']
+    local c_fencing_epoch = cur_claim['fencing_epoch']
+
+    if type(c_principal_id) ~= 'string' or c_principal_id == '' then
+        return {'CORRUPT_CLAIM'}
+    end
+    if type(c_request_id) ~= 'string' or c_request_id == '' then
+        return {'CORRUPT_CLAIM'}
+    end
+    if type(c_assignment_id) ~= 'string' or c_assignment_id == '' then
+        return {'CORRUPT_CLAIM'}
+    end
+    if type(c_expires_at) ~= 'string' or c_expires_at == '' then
+        return {'CORRUPT_CLAIM'}
+    end
+    if type(c_fencing_epoch) ~= 'number' or c_fencing_epoch < 1 or math.floor(c_fencing_epoch) ~= c_fencing_epoch then
+        return {'CORRUPT_CLAIM'}
+    end
+    if type(c_state) ~= 'string' or (c_state ~= 'claimed_unacknowledged' and c_state ~= 'acknowledged') then
+        return {'CORRUPT_CLAIM'}
+    end
+
+    if c_principal_id == principal_id and c_request_id == request_id then
+        if c_state == 'acknowledged' then
+            return {'ALREADY_ACKNOWLEDGED', cur_claim_raw}
+        elseif c_state == 'claimed_unacknowledged' then
+            if c_expires_at > now_iso then
+                -- Active unacknowledged delivery lease: idempotent replay
+                return {'REPLAY', cur_claim_raw}
+            else
+                has_expired_claim = true
+                effective_status = 'pending'
+            end
+        end
+    else
+        -- Different principal or different request_id
+        if c_state == 'claimed_unacknowledged' and c_expires_at <= now_iso then
+            has_expired_claim = true
+            effective_status = 'pending'
+        else
+            return {'ALREADY_CLAIMED', cur_claim_raw}
+        end
+    end
+end
+
+-- 4. Effective status is claimable
+if effective_status ~= 'pending' and effective_status ~= 'resumable' then
+    return {'NOT_CLAIMABLE', effective_status}
+end
+
+-- 5. Fence is absent or a valid nonnegative integer
+local cur_fence = 0
+if redis.call('EXISTS', fence_key) == 1 then
+    local fence_raw = redis.call('GET', fence_key)
+    cur_fence = tonumber(fence_raw)
+    if not cur_fence or cur_fence < 0 or math.floor(cur_fence) ~= cur_fence then
+        return {'CORRUPT_FENCE'}
+    end
+end
+
+-- 6. Expected epoch equals current fence plus one
+if not expected_epoch or expected_epoch < 1 or math.floor(expected_epoch) ~= expected_epoch then
+    return {'CORRUPT_FENCE'}
+end
+
+if cur_fence + 1 ~= expected_epoch then
+    return {'EPOCH_RACE', tostring(cur_fence)}
+end
+
+-- 7. Grant key and payload pairing: both absent/empty or both present/nonempty
+local has_grant_key = (grant_key ~= nil and grant_key ~= '')
+local has_grant_payload = (grant_payload ~= nil and grant_payload ~= '')
+
+if has_grant_key ~= has_grant_payload then
+    return {'CORRUPT_GRANT_INPUT'}
+end
+local has_grant = has_grant_key and has_grant_payload
+
+-- 8. Existing grant is absent or byte-identical to candidate grant
+if has_grant then
+    if redis.call('EXISTS', grant_key) == 1 then
+        local existing_grant = redis.call('GET', grant_key)
+        if existing_grant ~= grant_payload then
+            return {'CONFLICT_GRANT'}
+        end
+    end
+end
+
+-- 9. Candidate inputs are valid enough for required invariants
+if type(claim_payload) ~= 'string' or claim_payload == '' then
+    return {'CORRUPT_CLAIM_INPUT'}
+end
+if type(working_status_json) ~= 'string' or working_status_json == '' then
+    return {'CORRUPT_STATUS_INPUT'}
+end
+
+-- =============================================================================
+-- PHASE 2: State Commit (Atomic Mutations; No Failures Permitted After First Mutation)
+-- =============================================================================
+
+-- 1. Advance fencing epoch (First mutating command in successful path)
+redis.call('SET', fence_key, tostring(expected_epoch))
+
+-- 2. Transition task status to working
+redis.call('SET', status_key, working_status_json)
+
+-- 3. Store active claim (replaces any previous claim, expired or otherwise)
+redis.call('SET', claim_key, claim_payload)
+
+-- 4. Store authority grant if present
+if has_grant then
+    redis.call('SET', grant_key, grant_payload)
+end
+
+return {'OK', tostring(expected_epoch)}
+"""
+
+ACKNOWLEDGE_CLAIM_LUA = """
+local claim_key = KEYS[1]
+local assignment_id = ARGV[1]
+local principal_id = ARGV[2]
+local now_iso = ARGV[3]
+
+if redis.call('EXISTS', claim_key) == 0 then
+    return {'CLAIM_NOT_FOUND'}
+end
+
+local cur_claim_raw = redis.call('GET', claim_key)
+local ok, cur_claim = pcall(cjson.decode, cur_claim_raw)
+if not ok or type(cur_claim) ~= 'table' then
+    return {'CORRUPT_CLAIM'}
+end
+
+local c_assignment_id = cur_claim['assignment_id']
+local c_principal_id = cur_claim['runtime_principal_id']
+local c_state = cur_claim['state']
+local c_expires_at = cur_claim['delivery_expires_at']
+local c_fencing_epoch = cur_claim['fencing_epoch']
+
+if type(c_assignment_id) ~= 'string' or c_assignment_id == '' then
+    return {'CORRUPT_CLAIM'}
+end
+if type(c_principal_id) ~= 'string' or c_principal_id == '' then
+    return {'CORRUPT_CLAIM'}
+end
+if type(c_state) ~= 'string' or (c_state ~= 'claimed_unacknowledged' and c_state ~= 'acknowledged') then
+    return {'CORRUPT_CLAIM'}
+end
+if type(c_expires_at) ~= 'string' or c_expires_at == '' then
+    return {'CORRUPT_CLAIM'}
+end
+if type(c_fencing_epoch) ~= 'number' or c_fencing_epoch < 1 or math.floor(c_fencing_epoch) ~= c_fencing_epoch then
+    return {'CORRUPT_CLAIM'}
+end
+
+if c_assignment_id ~= assignment_id or c_principal_id ~= principal_id then
+    return {'MISMATCH'}
+end
+
+if c_state == 'acknowledged' then
+    return {'IDEMPOTENT', cur_claim_raw}
+end
+
+if c_expires_at <= now_iso then
+    return {'LEASE_EXPIRED'}
+end
+
+-- State commit (Single mutating command)
+cur_claim['state'] = 'acknowledged'
+cur_claim['acknowledged_at'] = now_iso
+local updated_raw = cjson.encode(cur_claim)
+redis.call('SET', claim_key, updated_raw)
+
+return {'OK', updated_raw}
+"""
+
+EXPIRE_DELIVERY_LEASE_LUA = """
+local claim_key = KEYS[1]
+local status_key = KEYS[2]
+local now_iso = ARGV[1]
+local pending_status_json = ARGV[2]
+
+if redis.call('EXISTS', claim_key) == 0 then
+    return {'NOOP'}
+end
+
+local cur_claim_raw = redis.call('GET', claim_key)
+local ok, cur_claim = pcall(cjson.decode, cur_claim_raw)
+if not ok or type(cur_claim) ~= 'table' then
+    return {'CORRUPT_CLAIM'}
+end
+
+local c_state = cur_claim['state']
+local c_expires_at = cur_claim['delivery_expires_at']
+
+if type(c_state) ~= 'string' or (c_state ~= 'claimed_unacknowledged' and c_state ~= 'acknowledged') then
+    return {'CORRUPT_CLAIM'}
+end
+
+if type(c_expires_at) ~= 'string' or c_expires_at == '' then
+    return {'CORRUPT_CLAIM'}
+end
+
+if c_state == 'acknowledged' then
+    return {'NOOP'}
+end
+
+if c_state == 'claimed_unacknowledged' then
+    if c_expires_at > now_iso then
+        return {'NOOP'}
+    end
+
+    -- Lease has expired: atomically delete claim and restore status to pending
+    redis.call('DEL', claim_key)
+    redis.call('SET', status_key, pending_status_json)
+    return {'EXPIRED'}
+end
+
+return {'CORRUPT_CLAIM'}
+"""
+
 
 class RedisGateway:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, delivery_mode: str = "legacy_push") -> None:
         self._client = redis.from_url(url, decode_responses=True)
+        self._delivery_mode = delivery_mode
 
     async def register_root_task(
         self, task: TaskRequested, initial_status: str = "pending_dispatch"
@@ -638,6 +941,283 @@ class RedisGateway:
                 f"Corrupt RootAuthorityRecord at key '{key}': {exc}"
             ) from exc
 
+    async def save_authority_grant(self, grant: DelegationGrant) -> None:
+        target_key = f"task.authority_grant:{grant.root_task_id}:{grant.grant_id}"
+        payload = grant.to_json()
+        raw_result = await self._client.eval(
+            SAVE_AUTHORITY_GRANT_LUA,
+            1,
+            target_key,
+            payload,
+        )
+        result = (
+            raw_result.decode("utf-8")
+            if isinstance(raw_result, (bytes, bytearray))
+            else str(raw_result)
+        )
+        if result in ("OK", "IDEMPOTENT"):
+            return
+        if result == "CONFLICT":
+            raise ConflictingAuthorityGrantError(
+                f"DelegationGrant for root task '{grant.root_task_id}' and grant '{grant.grant_id}' "
+                "already exists with conflicting data"
+            )
+        raise RuntimeError(f"Unexpected Redis save_authority_grant result: {result}")
+
+    async def get_authority_grant(
+        self, root_task_id: str, grant_id: str
+    ) -> DelegationGrant | None:
+        clean_root_task_id = str(root_task_id).strip()
+        clean_grant_id = str(grant_id).strip()
+        if not clean_root_task_id or not clean_grant_id:
+            return None
+        key = f"task.authority_grant:{clean_root_task_id}:{clean_grant_id}"
+        raw = await self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError("Payload must be a JSON object")
+            return DelegationGrant.from_dict(data)
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt DelegationGrant at key '{key}': {exc}"
+            ) from exc
+
+    async def save_active_claim(self, claim: ActiveClaim) -> None:
+        key = f"task.claim:{claim.task_id}"
+        await self._client.set(key, claim.to_json())
+
+    async def get_active_claim(self, task_id: str) -> ActiveClaim | None:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return None
+        key = f"task.claim:{clean_task_id}"
+        raw = await self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError("Payload must be a JSON object")
+            return ActiveClaim.from_dict(data)
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt ActiveClaim at key '{key}': {exc}"
+            ) from exc
+
+    async def get_fencing_epoch(self, task_id: str) -> int:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return 0
+        raw = await self._client.get(f"task.fence:{clean_task_id}")
+        if raw is None:
+            return 0
+        try:
+            val = int(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            return val
+        except (TypeError, ValueError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt fencing epoch at key 'task.fence:{clean_task_id}': {exc}"
+            ) from exc
+
+    async def atomic_claim_task(
+        self,
+        task_id: str,
+        claim: ActiveClaim,
+        grant: DelegationGrant | None = None,
+        now: str = "",
+    ) -> tuple[ActiveClaim, bool]:
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            raise ValueError("task_id must be a non-empty string")
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        status_key = f"task.status:{clean_task_id}"
+        claim_key = f"task.claim:{clean_task_id}"
+        fence_key = f"task.fence:{clean_task_id}"
+        grant_key = f"task.authority_grant:{claim.root_task_id}:{grant.grant_id}" if grant else ""
+
+        claim_payload = claim.to_json()
+        grant_payload = grant.to_json() if grant else ""
+
+        working_status_json = canonical_json_dumps({
+            "status": "working",
+            "task_id": clean_task_id,
+        })
+        pending_status_json = canonical_json_dumps({
+            "status": "pending",
+            "task_id": clean_task_id,
+        })
+
+        keys = [status_key, claim_key, fence_key, grant_key or ""]
+
+        raw_res = await self._client.eval(
+            CLAIM_TASK_LUA,
+            4,
+            *keys,
+            clean_task_id,
+            now_iso,
+            claim.runtime_principal_id,
+            claim.request_id,
+            working_status_json,
+            pending_status_json,
+            claim_payload,
+            grant_payload,
+            str(claim.fencing_epoch),
+        )
+
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis claim_task response: {raw_res}")
+
+        code = raw_res[0] if isinstance(raw_res[0], str) else raw_res[0].decode("utf-8")
+
+        if code == "OK":
+            return (claim, False)
+
+        if code == "REPLAY":
+            replay_raw = raw_res[1] if isinstance(raw_res[1], str) else raw_res[1].decode("utf-8")
+            existing_claim = ActiveClaim.from_json(replay_raw)
+            return (existing_claim, True)
+
+        if code == "ALREADY_ACKNOWLEDGED":
+            raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' assignment is already acknowledged")
+
+        if code == "NOT_FOUND":
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' not found")
+
+        if code == "NOT_CLAIMABLE":
+            cur_status = raw_res[1] if len(raw_res) > 1 else "unknown"
+            if not isinstance(cur_status, str):
+                cur_status = cur_status.decode("utf-8")
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' is in non-claimable status '{cur_status}'")
+
+        if code == "ALREADY_CLAIMED":
+            raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim by another runtime")
+
+        if code == "CONFLICT_GRANT":
+            raise ConflictingAuthorityGrantError(
+                f"DelegationGrant for root task '{claim.root_task_id}' and grant '{grant.grant_id if grant else ''}' "
+                "already exists with conflicting data"
+            )
+
+        if code == "CORRUPT_GRANT_INPUT":
+            raise CorruptAuthoritativeRecordError(
+                f"Inconsistent authority grant inputs provided for task '{clean_task_id}'"
+            )
+
+        if code in ("CORRUPT_CLAIM_INPUT", "CORRUPT_STATUS_INPUT"):
+            raise CorruptAuthoritativeRecordError(
+                f"Invalid candidate payload inputs provided for task '{clean_task_id}': {code}"
+            )
+
+        if code == "EPOCH_RACE":
+            raise TaskAlreadyClaimedError(f"Concurrent claim conflict on task '{clean_task_id}' (fencing epoch race)")
+
+        if code in ("CORRUPT_CLAIM", "CORRUPT_FENCE", "CORRUPT_STATUS"):
+            raise CorruptAuthoritativeRecordError(f"Corrupt authoritative record found on task '{clean_task_id}': {code}")
+
+        raise RuntimeError(f"Unexpected claim result code: {code}")
+
+    async def acknowledge_claim(
+        self,
+        task_id: str,
+        assignment_id: str,
+        principal_id: str,
+        acknowledged_at: str,
+    ) -> ActiveClaim:
+        clean_task_id = str(task_id).strip()
+        clean_assignment_id = str(assignment_id).strip()
+        clean_principal_id = str(principal_id).strip()
+        clean_time = normalize_canonical_utc_timestamp(acknowledged_at)
+
+        claim_key = f"task.claim:{clean_task_id}"
+
+        raw_res = await self._client.eval(
+            ACKNOWLEDGE_CLAIM_LUA,
+            1,
+            claim_key,
+            clean_assignment_id,
+            clean_principal_id,
+            clean_time,
+        )
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis acknowledge_claim response: {raw_res}")
+
+        code = raw_res[0] if isinstance(raw_res[0], str) else raw_res[0].decode("utf-8")
+
+        if code in ("OK", "IDEMPOTENT"):
+            raw_json = raw_res[1] if isinstance(raw_res[1], str) else raw_res[1].decode("utf-8")
+            return ActiveClaim.from_json(raw_json)
+
+        if code == "CLAIM_NOT_FOUND":
+            raise ClaimNotFoundError(f"Active claim for task '{clean_task_id}' not found")
+
+        if code == "MISMATCH":
+            raise ClaimNotFoundError(
+                f"Active claim does not match assignment '{clean_assignment_id}' or principal '{clean_principal_id}'"
+            )
+
+        if code == "LEASE_EXPIRED":
+            raise ClaimDeliveryLeaseExpiredError(f"Delivery lease for assignment '{clean_assignment_id}' has expired")
+
+        if code == "CORRUPT_CLAIM":
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt ActiveClaim at key '{claim_key}': malformed claim record during acknowledge"
+            )
+
+        raise RuntimeError(f"Unexpected acknowledge result code: {code}")
+
+    async def expire_delivery_lease(self, task_id: str, now: str = "") -> bool:
+        clean_task_id = str(task_id).strip()
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        claim_key = f"task.claim:{clean_task_id}"
+        status_key = f"task.status:{clean_task_id}"
+        pending_status_json = canonical_json_dumps({
+            "status": "pending",
+            "task_id": clean_task_id,
+        })
+        res = await self._client.eval(
+            EXPIRE_DELIVERY_LEASE_LUA,
+            2,
+            claim_key,
+            status_key,
+            now_iso,
+            pending_status_json,
+        )
+        if not isinstance(res, (list, tuple)) or len(res) == 0:
+            if res == 1:
+                return True
+            if res == 0:
+                return False
+            raise RuntimeError(f"Unexpected Redis expire_delivery_lease response: {res}")
+
+        code = res[0] if isinstance(res[0], str) else res[0].decode("utf-8")
+        if code in ("EXPIRED", 1, "1"):
+            return True
+        if code in ("NOOP", 0, "0"):
+            return False
+        if code == "CORRUPT_CLAIM":
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt active claim on task '{clean_task_id}' during lease expiry"
+            )
+
+        raise RuntimeError(f"Unexpected expire_delivery_lease result code: {code}")
+
+    async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
+        clean_target = str(target).strip()
+        if not clean_target:
+            raise ValueError("target queue must be a non-empty string")
+        await self._client.rpush(clean_target, hint.to_json())
+
     async def dispatch(self, task: TaskRequested, target: str) -> None:
         """Atomically enqueue task payload and establish pending status.
 
@@ -651,7 +1231,23 @@ class RedisGateway:
             raise ValueError("Dispatch target must be a non-empty string")
         clean_target = target.strip()
         async with self._client.pipeline(transaction=True) as pipe:
-            pipe.rpush(clean_target, task.to_json())
+            if self._delivery_mode == "authenticated_claim":
+                capability = (
+                    clean_target.removeprefix("agent.tasks.")
+                    if clean_target.startswith("agent.tasks.")
+                    else clean_target
+                )
+                hint_target = f"agent.hints.{capability}"
+                hint = WakeUpHint(
+                    hint_id=str(uuid4()),
+                    capability=capability,
+                    created_at=datetime.now(UTC).isoformat(),
+                    execution_kind="initial",
+                    task_id=task.task_id,
+                )
+                pipe.rpush(hint_target, hint.to_json())
+            else:
+                pipe.rpush(clean_target, task.to_json())
             pipe.set(
                 f"task.status:{task.task_id}",
                 json.dumps({"task_id": task.task_id, "status": "pending"}),

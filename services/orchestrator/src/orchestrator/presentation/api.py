@@ -1,9 +1,9 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from agent_contracts import __version__
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -12,11 +12,16 @@ from orchestrator.application.ports import (
     AuthoritativeTaskStore,
     CandidateFinder,
     CapabilityRouter,
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
     EventPublisher,
+    InvalidClaimProofError,
     ResultReader,
     RoutingRecorder,
     StateReader,
+    TaskAlreadyClaimedError,
     TaskDispatcher,
+    TaskNotClaimableError,
     TaskQueue,
     TelemetryStorageError,
 )
@@ -29,13 +34,28 @@ from orchestrator.application.queries import (
     GetTaskInferenceTelemetry,
     GetTaskResult,
 )
-from orchestrator.application.use_cases import SubmitTask
+from orchestrator.application.use_cases import (
+    AcknowledgeAssignment,
+    CapabilityMismatchError,
+    ClaimTask,
+    StageArtifactUseCase,
+    SubmitTask,
+    UnauthorizedPrincipalError,
+)
 from orchestrator.config import Settings
 from orchestrator.domain.capability import (
     AgentCapability,
     CapabilityUnavailableError,
 )
+from orchestrator.domain.principal import (
+    RuntimePrincipal,
+    verify_token,
+)
 from orchestrator.domain.selection import CandidateSelectionPolicy
+from orchestrator.domain.task import (
+    ConflictingStageArtifactError,
+    NonContiguousVersionError,
+)
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 
 
@@ -147,6 +167,160 @@ async def candidates(capability: str, request: Request) -> list[dict[str, Any]]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class ClaimTaskInput(BaseModel):
+    task_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    capability: str = Field(min_length=1)
+    execution_kind: str = "initial"
+
+
+class AcknowledgeAssignmentInput(BaseModel):
+    task_id: str = Field(min_length=1)
+    assignment_proof: str = Field(min_length=1)
+
+
+class StageArtifactInput(BaseModel):
+    assignment_id: str = Field(min_length=1)
+    assignment_proof: str = Field(min_length=1)
+    artifact_id: str = Field(min_length=1)
+    artifact_type: str = Field(min_length=1)
+    content: dict[str, Any]
+    artifact_version: int = 1
+    payload_schema_version: int = 1
+
+
+def get_current_runtime_principal(request: Request) -> RuntimePrincipal:
+    auth_header = request.headers.get("Authorization", "").strip()
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    settings: Settings = request.app.state.settings
+    pepper = settings.runtime_credential_pepper
+    principals = settings.runtime_principals
+
+    for principal_id, cfg in principals.items():
+        expected_digest = cfg.get("token_digest", "")
+        if expected_digest and verify_token(token, pepper, expected_digest):
+            if not cfg.get("active", True):
+                raise HTTPException(status_code=403, detail="Principal is inactive")
+            raw_caps = cfg.get("authorized_capabilities", ())
+            caps = tuple(raw_caps) if isinstance(raw_caps, (list, tuple)) else ()
+            return RuntimePrincipal(
+                principal_id=principal_id,
+                bound_agent_id=cfg.get("bound_agent_id", principal_id),
+                authorized_capabilities=caps,
+                active=True,
+            )
+
+    raise HTTPException(status_code=401, detail="Invalid runtime credentials")
+
+
+async def claim_task_endpoint(
+    value: ClaimTaskInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    claim_task_uc: ClaimTask | None = request.app.state.claim_task
+    if claim_task_uc is None:
+        raise HTTPException(status_code=503, detail="Task claim service is not enabled")
+    try:
+        res = await claim_task_uc.execute(
+            principal=principal,
+            task_id=value.task_id,
+            request_id=value.request_id,
+            capability=value.capability,
+            execution_kind=value.execution_kind,
+        )
+        data: dict[str, Any] = {"assignment": res.assignment.to_dict()}
+        if res.assignment_proof is not None:
+            data["assignment_proof"] = res.assignment_proof
+        return data
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except TaskAlreadyClaimedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskNotClaimableError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def acknowledge_assignment_endpoint(
+    assignment_id: str,
+    value: AcknowledgeAssignmentInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    ack_uc: AcknowledgeAssignment | None = request.app.state.acknowledge_assignment
+    if ack_uc is None:
+        raise HTTPException(status_code=503, detail="Task claim service is not enabled")
+    try:
+        claim = await ack_uc.execute(
+            principal=principal,
+            task_id=value.task_id,
+            assignment_id=assignment_id,
+            assignment_proof=value.assignment_proof,
+        )
+        return {
+            "assignment_id": claim.assignment_id,
+            "status": claim.state,
+            "acknowledged_at": claim.acknowledged_at,
+        }
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ClaimNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidClaimProofError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ClaimDeliveryLeaseExpiredError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def stage_artifact_endpoint(
+    task_id: str,
+    value: StageArtifactInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    stage_uc: StageArtifactUseCase | None = request.app.state.stage_artifact
+    if stage_uc is None:
+        raise HTTPException(status_code=503, detail="Artifact staging service is not enabled")
+    try:
+        artifact = await stage_uc.execute(
+            principal=principal,
+            task_id=task_id,
+            assignment_id=value.assignment_id,
+            assignment_proof=value.assignment_proof,
+            artifact_id=value.artifact_id,
+            artifact_type=value.artifact_type,
+            content=value.content,
+            artifact_version=value.artifact_version,
+            payload_schema_version=value.payload_schema_version,
+        )
+        return {"artifact": artifact.to_dict()}
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ClaimNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidClaimProofError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except TaskNotClaimableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ConflictingStageArtifactError, NonContiguousVersionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class NoOpResultReader:
     async def get_result(self, task_id: str) -> dict[str, Any] | None:
         return None
@@ -175,7 +349,10 @@ def create_app(
     # When an explicit task_store, dispatcher, or task_queue identifies the backend,
     # do not auto-create an extra RedisGateway.
     if gateway is None and task_store is None and dispatcher is None and task_queue is None:
-        gateway = RedisGateway(resolved_settings.redis_url)
+        gateway = RedisGateway(
+            resolved_settings.redis_url,
+            delivery_mode=resolved_settings.task_delivery_mode,
+        )
 
     # 2. AuthoritativeTaskStore linear resolution
     if task_store is not None:
@@ -236,6 +413,23 @@ def create_app(
         GetTaskInferenceTelemetry(reader) if reader else None
     )
     get_task_children = GetTaskChildren(resolved_task_store)
+    claim_task: ClaimTask | None = None
+    acknowledge_assignment: AcknowledgeAssignment | None = None
+    stage_artifact: StageArtifactUseCase | None = None
+    if resolved_settings.assignment_proof_pepper.strip():
+        claim_task = ClaimTask(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            delivery_lease_seconds=resolved_settings.claim_delivery_lease_seconds,
+        )
+        acknowledge_assignment = AcknowledgeAssignment(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
+        stage_artifact = StageArtifactUseCase(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -254,6 +448,9 @@ def create_app(
     app.state.get_routing_decision = get_routing_decision
     app.state.get_task_inference_telemetry = get_task_inference_telemetry
     app.state.get_task_children = get_task_children
+    app.state.claim_task = claim_task
+    app.state.acknowledge_assignment = acknowledge_assignment
+    app.state.stage_artifact = stage_artifact
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -280,6 +477,17 @@ def create_app(
     app.add_api_route("/api/tasks/{task_id}/telemetry", task_telemetry, methods=["GET"])
     app.add_api_route("/api/tasks/{task_id}/children", task_children, methods=["GET"])
     app.add_api_route("/api/candidates", candidates, methods=["GET"])
+    app.add_api_route("/api/tasks/claim", claim_task_endpoint, methods=["POST"])
+    app.add_api_route(
+        "/api/assignments/{assignment_id}/acknowledge",
+        acknowledge_assignment_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/artifacts",
+        stage_artifact_endpoint,
+        methods=["POST"],
+    )
 
     return app
 

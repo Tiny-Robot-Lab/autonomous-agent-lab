@@ -5,21 +5,33 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agent_contracts import (
+    ActiveClaim,
     AgentAvailability,
     AgentAvailabilityState,
     AgentCandidate,
     AgentExecutionState,
+    DelegationGrant,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    WakeUpHint,
+    normalize_canonical_utc_timestamp,
 )
 from fastapi import Request
-from orchestrator.application.ports import AuthoritativeTaskStore, TaskDispatcher
+from orchestrator.application.ports import (
+    AuthoritativeTaskStore,
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
+    TaskAlreadyClaimedError,
+    TaskDispatcher,
+    TaskNotClaimableError,
+)
 from orchestrator.application.use_cases import RegisterChildTask, SubmitTask
 from orchestrator.config import Settings
 from orchestrator.domain.task import (
+    ConflictingAuthorityGrantError,
     ConflictingContinuationError,
     ConflictingRootAuthorityError,
     ConflictingRootTaskRegistrationError,
@@ -51,6 +63,9 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.continuations: dict[tuple[str, int], TaskContinuation] = {}
         self.latest_continuation: dict[str, int] = {}
         self.authorities: dict[str, RootAuthorityRecord] = {}
+        self.authority_grants: dict[tuple[str, str], DelegationGrant] = {}
+        self.claims: dict[str, ActiveClaim] = {}
+        self.fences: dict[str, int] = {}
         self.fail_next_registration: bool = False
         self.root_registrations: list[tuple[TaskRequested, str]] = []
         self.child_registrations: list[tuple[TaskRequested, str]] = []
@@ -266,6 +281,153 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
 
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
         return self.authorities.get(root_task_id.strip())
+
+    async def save_authority_grant(self, grant: DelegationGrant) -> None:
+        key = (grant.root_task_id, grant.grant_id)
+        if key in self.authority_grants:
+            if self.authority_grants[key] == grant:
+                return
+            raise ConflictingAuthorityGrantError(
+                f"DelegationGrant for root task '{grant.root_task_id}' and grant '{grant.grant_id}' "
+                "already exists with conflicting data"
+            )
+        self.authority_grants[key] = grant
+
+    async def get_authority_grant(
+        self, root_task_id: str, grant_id: str
+    ) -> DelegationGrant | None:
+        return self.authority_grants.get((root_task_id.strip(), grant_id.strip()))
+
+    async def save_active_claim(self, claim: ActiveClaim) -> None:
+        self.claims[claim.task_id] = claim
+
+    async def get_active_claim(self, task_id: str) -> ActiveClaim | None:
+        return self.claims.get(task_id.strip())
+
+    async def get_fencing_epoch(self, task_id: str) -> int:
+        return self.fences.get(task_id.strip(), 0)
+
+    async def atomic_claim_task(
+        self,
+        task_id: str,
+        claim: ActiveClaim,
+        grant: DelegationGrant | None = None,
+        now: str = "",
+    ) -> tuple[ActiveClaim, bool]:
+        clean_task_id = task_id.strip()
+        cur_status = self.statuses.get(clean_task_id)
+        if not cur_status:
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' not found")
+
+        existing_claim = self.claims.get(clean_task_id)
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        effective_status = cur_status
+
+        if existing_claim:
+            if (
+                existing_claim.runtime_principal_id == claim.runtime_principal_id
+                and existing_claim.request_id == claim.request_id
+            ):
+                if existing_claim.state == "acknowledged":
+                    raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' assignment is already acknowledged")
+                if (
+                    existing_claim.state == "claimed_unacknowledged"
+                    and existing_claim.delivery_expires_at <= now_iso
+                ):
+                    effective_status = "pending"
+                else:
+                    return (existing_claim, True)
+            else:
+                if (
+                    existing_claim.state == "claimed_unacknowledged"
+                    and existing_claim.delivery_expires_at <= now_iso
+                ):
+                    effective_status = "pending"
+                else:
+                    raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim")
+
+        if effective_status not in ("pending", "resumable"):
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' is in non-claimable status '{effective_status}'")
+
+        cur_epoch = self.fences.get(clean_task_id, 0)
+        expected_epoch = cur_epoch + 1
+        if claim.fencing_epoch != expected_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Concurrent claim conflict on task '{clean_task_id}' (fencing epoch race)"
+            )
+
+        if grant:
+            key = (grant.root_task_id, grant.grant_id)
+            if key in self.authority_grants and self.authority_grants[key] != grant:
+                raise ConflictingAuthorityGrantError(
+                    f"DelegationGrant for root task '{grant.root_task_id}' and grant '{grant.grant_id}' "
+                    "already exists with conflicting data"
+                )
+
+        # Commit phase (no failures permitted)
+        self.fences[clean_task_id] = expected_epoch
+        self.statuses[clean_task_id] = "working"
+        self.claims[clean_task_id] = claim
+
+        if grant:
+            self.authority_grants[(grant.root_task_id, grant.grant_id)] = grant
+
+        return (claim, False)
+
+    async def acknowledge_claim(
+        self,
+        task_id: str,
+        assignment_id: str,
+        principal_id: str,
+        acknowledged_at: str,
+    ) -> ActiveClaim:
+        clean_task_id = task_id.strip()
+        claim = self.claims.get(clean_task_id)
+        if not claim:
+            raise ClaimNotFoundError(f"Active claim for task '{clean_task_id}' not found")
+        if claim.assignment_id != assignment_id.strip() or claim.runtime_principal_id != principal_id.strip():
+            raise ClaimNotFoundError("Assignment ID or principal mismatch")
+        if claim.state == "acknowledged":
+            return claim
+        clean_now = normalize_canonical_utc_timestamp(acknowledged_at)
+        if claim.delivery_expires_at <= clean_now:
+            raise ClaimDeliveryLeaseExpiredError("Lease expired")
+
+        ack_dict = claim.to_dict()
+        ack_dict["state"] = "acknowledged"
+        ack_dict["acknowledged_at"] = clean_now
+        updated = ActiveClaim.from_dict(ack_dict)
+        self.claims[clean_task_id] = updated
+        return updated
+
+    async def expire_delivery_lease(self, task_id: str, now: str = "") -> bool:
+        clean_task_id = task_id.strip()
+        claim = self.claims.get(clean_task_id)
+        if not claim:
+            return False
+        if not hasattr(claim, "state") or not hasattr(claim, "delivery_expires_at"):
+            raise CorruptAuthoritativeRecordError(f"Corrupt active claim on task '{clean_task_id}' during lease expiry")
+        if claim.state not in ("claimed_unacknowledged", "acknowledged"):
+            raise CorruptAuthoritativeRecordError(f"Corrupt active claim on task '{clean_task_id}' during lease expiry")
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        if claim.state == "claimed_unacknowledged" and claim.delivery_expires_at <= now_iso:
+            del self.claims[clean_task_id]
+            self.statuses[clean_task_id] = "pending"
+            return True
+        return False
+        if claim.state == "claimed_unacknowledged" and claim.delivery_expires_at <= now_iso:
+            del self.claims[clean_task_id]
+            self.statuses[clean_task_id] = "pending"
+            return True
+        return False
 
 
 class MockAtomicDispatcher(TaskDispatcher):
@@ -1283,3 +1445,574 @@ async def test_in_memory_version_contiguity_and_concurrency() -> None:
     store.statuses[root.task_id] = "pending"
     with pytest.raises(ConflictingRootTaskRegistrationError, match="inconsistent or partial"):
         await store.register_root_task(root)
+
+
+@pytest.mark.anyio
+async def test_in_memory_authority_grant_write_once_and_conflict() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    grant = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id="root-101",
+        issued_to_assignment_id="assign-001",
+        issued_to_principal_id="principal-research-1",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=now,
+    )
+    await store.save_authority_grant(grant)
+
+    # Retrieval by (root_task_id, grant_id)
+    retrieved = await store.get_authority_grant("root-101", "grant-001")
+    assert retrieved == grant
+
+    # Non-existent grant_id returns None
+    assert await store.get_authority_grant("root-101", "nonexistent") is None
+
+    # Idempotent re-save
+    await store.save_authority_grant(grant)
+
+    # Conflicting save with same grant_id raises
+    conflicting = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id="root-101",
+        issued_to_assignment_id="assign-002",
+        issued_to_principal_id="principal-research-2",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=now,
+    )
+    with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+        await store.save_authority_grant(conflicting)
+
+    # Replacement assignment receives distinct grant bound to new assignment, epoch, turn
+    grant_b = DelegationGrant(
+        grant_id="grant-002",
+        root_task_id="root-101",
+        issued_to_assignment_id="assign-002",
+        issued_to_principal_id="principal-research-2",
+        fencing_epoch=2,
+        turn_id="turn-002",
+        issued_at=now,
+    )
+    await store.save_authority_grant(grant_b)
+
+    # Both grants remain retrievable by exact grant_id and immutable
+    assert await store.get_authority_grant("root-101", "grant-001") == grant
+    assert await store.get_authority_grant("root-101", "grant-002") == grant_b
+    assert grant.fencing_epoch != grant_b.fencing_epoch
+    assert grant.issued_to_assignment_id != grant_b.issued_to_assignment_id
+
+
+@pytest.mark.anyio
+async def test_in_memory_atomic_claim_and_acknowledgement_lifecycle() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    future = "2099-01-01T00:00:00Z"
+
+    root = TaskRequested.create("Root task")
+    await store.register_root_task(root)
+    await store.update_status(root.task_id, "pending")
+
+    grant = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id=root.task_id,
+        issued_to_assignment_id="assign-001",
+        issued_to_principal_id="principal-research-1",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=now,
+    )
+
+    claim = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-001",
+        claim_id="claim-001",
+        root_task_id=root.task_id,
+        turn_id="turn-001",
+        runtime_principal_id="principal-research-1",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="digest-001",
+        request_id="req-001",
+        claimed_at=now,
+        delivery_expires_at=future,
+        delegation_grant_id="grant-001",
+    )
+
+    # 1. Successful initial claim
+    active_claim, is_replay = await store.atomic_claim_task(
+        task_id=root.task_id,
+        claim=claim,
+        grant=grant,
+        now=now,
+    )
+    assert not is_replay
+    assert active_claim.fencing_epoch == 1
+    assert await store.get_status(root.task_id) == "working"
+    assert await store.get_authority_grant(root.task_id, grant.grant_id) == grant
+
+    # 2. Idempotent retry with same (principal_id, request_id)
+    active_claim_2, is_replay_2 = await store.atomic_claim_task(
+        task_id=root.task_id,
+        claim=claim,
+        grant=grant,
+        now=now,
+    )
+    assert is_replay_2
+    assert active_claim_2.assignment_id == "assign-001"
+
+    # 3. Another principal attempts to claim while active
+    other_claim = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-002",
+        claim_id="claim-002",
+        root_task_id=root.task_id,
+        turn_id="turn-002",
+        runtime_principal_id="principal-research-2",
+        bound_agent_id="research-agent-2",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=2,
+        proof_digest="digest-002",
+        request_id="req-002",
+        claimed_at=now,
+        delivery_expires_at=future,
+    )
+    with pytest.raises(TaskAlreadyClaimedError, match="active claim"):
+        await store.atomic_claim_task(
+            task_id=root.task_id,
+            claim=other_claim,
+            now=now,
+        )
+
+    # 4. Acknowledgement
+    acked = await store.acknowledge_claim(
+        task_id=root.task_id,
+        assignment_id="assign-001",
+        principal_id="principal-research-1",
+        acknowledged_at=now,
+    )
+    assert acked.state == "acknowledged"
+    assert acked.acknowledged_at == normalize_canonical_utc_timestamp(now)
+
+    # Idempotent acknowledgement
+    acked_again = await store.acknowledge_claim(
+        task_id=root.task_id,
+        assignment_id="assign-001",
+        principal_id="principal-research-1",
+        acknowledged_at=now,
+    )
+    assert acked_again.state == "acknowledged"
+
+    # Acknowledgement mismatch (wrong assignment)
+    with pytest.raises(ClaimNotFoundError, match="mismatch"):
+        await store.acknowledge_claim(
+            task_id=root.task_id,
+            assignment_id="wrong-assignment",
+            principal_id="principal-research-1",
+            acknowledged_at=now,
+        )
+
+    # Acknowledgement mismatch (wrong principal)
+    with pytest.raises(ClaimNotFoundError, match="mismatch"):
+        await store.acknowledge_claim(
+            task_id=root.task_id,
+            assignment_id="assign-001",
+            principal_id="wrong-principal",
+            acknowledged_at=now,
+        )
+
+
+@pytest.mark.anyio
+async def test_in_memory_delivery_lease_expiry_restores_claimability() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    past = "2020-01-01T00:00:00Z"
+    now = "2020-01-01T00:00:31Z"
+
+    root = TaskRequested.create("Root task")
+    await store.register_root_task(root)
+    await store.update_status(root.task_id, "pending")
+
+    claim = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-001",
+        claim_id="claim-001",
+        root_task_id=root.task_id,
+        turn_id="turn-001",
+        runtime_principal_id="principal-research-1",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="digest-001",
+        request_id="req-001",
+        claimed_at=past,
+        delivery_expires_at="2020-01-01T00:00:30Z",
+    )
+
+    await store.atomic_claim_task(
+        task_id=root.task_id,
+        claim=claim,
+        now=past,
+    )
+    assert await store.get_status(root.task_id) == "working"
+
+    # Acknowledgement fails if lease expired
+    with pytest.raises(ClaimDeliveryLeaseExpiredError, match="expired"):
+        await store.acknowledge_claim(
+            task_id=root.task_id,
+            assignment_id="assign-001",
+            principal_id="principal-research-1",
+            acknowledged_at=now,
+        )
+
+    # Expiry evaluation restores status: pending
+    expired = await store.expire_delivery_lease(root.task_id, now=now)
+    assert expired is True
+    assert await store.get_status(root.task_id) == "pending"
+    assert await store.get_active_claim(root.task_id) is None
+
+    # Next claim receives incremented epoch 2
+    claim_2 = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-002",
+        claim_id="claim-002",
+        root_task_id=root.task_id,
+        turn_id="turn-002",
+        runtime_principal_id="principal-research-2",
+        bound_agent_id="research-agent-2",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=2,
+        proof_digest="digest-002",
+        request_id="req-002",
+        claimed_at=now,
+        delivery_expires_at="2020-01-01T00:01:00Z",
+    )
+    new_claim, _ = await store.atomic_claim_task(
+        task_id=root.task_id,
+        claim=claim_2,
+        now=now,
+    )
+    assert new_claim.fencing_epoch == 2
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_authority_grant_roundtrip_and_conflict() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    grant = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id="root-101",
+        issued_to_assignment_id="assign-001",
+        issued_to_principal_id="principal-research-1",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=now,
+    )
+
+    # 1. Save grant (Lua returns OK)
+    gateway._client.eval = AsyncMock(return_value="OK")
+    await gateway.save_authority_grant(grant)
+    gateway._client.eval.assert_awaited_once()
+
+    # 2. Idempotent write (Lua returns IDEMPOTENT)
+    gateway._client.eval = AsyncMock(return_value="IDEMPOTENT")
+    await gateway.save_authority_grant(grant)
+
+    # 3. Conflicting write (Lua returns CONFLICT)
+    gateway._client.eval = AsyncMock(return_value="CONFLICT")
+    conflict = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id="root-101",
+        issued_to_assignment_id="assign-002",
+        issued_to_principal_id="principal-research-2",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=now,
+    )
+    with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+        await gateway.save_authority_grant(conflict)
+
+    # 4. Retrieval
+    gateway._client.get = AsyncMock(return_value=grant.to_json())
+    retrieved = await gateway.get_authority_grant("root-101", "grant-001")
+    assert retrieved == grant
+
+    # 5. Corrupt record detection
+    gateway._client.get = AsyncMock(return_value="corrupt grant data")
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt DelegationGrant"):
+        await gateway.get_authority_grant("root-101", "grant-001")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_claim_and_acknowledgement_lua_branches() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now = datetime.now(UTC).isoformat()
+    claim = ActiveClaim(
+        task_id="task-001",
+        assignment_id="assign-001",
+        claim_id="claim-001",
+        root_task_id="task-001",
+        turn_id="turn-001",
+        runtime_principal_id="principal-research-1",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="digest-001",
+        request_id="req-001",
+        claimed_at=now,
+        delivery_expires_at="2099-01-01T00:00:00Z",
+    )
+
+    # 1. NOT_CLAIMABLE
+    gateway._client.eval = AsyncMock(return_value=["NOT_CLAIMABLE", "failed"])
+    with pytest.raises(TaskNotClaimableError, match="non-claimable status 'failed'"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 2. ACTIVE_CLAIM_CONFLICT
+    gateway._client.eval = AsyncMock(return_value=["ALREADY_CLAIMED", "{}"])
+    with pytest.raises(TaskAlreadyClaimedError, match="active claim by another runtime"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 3. Success (Lua returns ["OK", "1"])
+    return_dict = claim.to_dict()
+    return_dict["fencing_epoch"] = 1
+    gateway._client.eval = AsyncMock(return_value=["OK", "1"])
+    claimed, is_replay = await gateway.atomic_claim_task("task-001", claim)
+    assert is_replay is False
+    assert claimed.fencing_epoch == 1
+
+    # 4. Replay (Lua returns ["REPLAY", json])
+    gateway._client.eval = AsyncMock(return_value=["REPLAY", json.dumps(return_dict)])
+    claimed_replayed, is_replay_flag = await gateway.atomic_claim_task("task-001", claim)
+    assert is_replay_flag is True
+    assert claimed_replayed.assignment_id == "assign-001"
+
+    # 4b. Replay after acknowledged (Lua returns ["ALREADY_ACKNOWLEDGED", json])
+    gateway._client.eval = AsyncMock(return_value=["ALREADY_ACKNOWLEDGED", json.dumps(return_dict)])
+    with pytest.raises(TaskAlreadyClaimedError, match="already acknowledged"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 4c. Fencing epoch race (Lua returns ["EPOCH_RACE", "1"])
+    gateway._client.eval = AsyncMock(return_value=["EPOCH_RACE", "1"])
+    with pytest.raises(TaskAlreadyClaimedError, match="fencing epoch race"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 4d. Conflicting authority grant (Lua returns ["CONFLICT_GRANT"])
+    gateway._client.eval = AsyncMock(return_value=["CONFLICT_GRANT"])
+    with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 4e. Corrupt or inconsistent grant inputs
+    gateway._client.eval = AsyncMock(return_value=["CORRUPT_GRANT_INPUT"])
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Inconsistent authority grant inputs"):
+        await gateway.atomic_claim_task("task-001", claim)
+
+    # 4f. Corrupt authoritative records
+    for corrupt_code in ("CORRUPT_CLAIM", "CORRUPT_FENCE", "CORRUPT_STATUS"):
+        gateway._client.eval = AsyncMock(return_value=[corrupt_code])
+        with pytest.raises(CorruptAuthoritativeRecordError, match=corrupt_code):
+            await gateway.atomic_claim_task("task-001", claim)
+
+    # 5. Acknowledge: CLAIM_NOT_FOUND
+    gateway._client.eval = AsyncMock(return_value=["CLAIM_NOT_FOUND"])
+    with pytest.raises(ClaimNotFoundError, match="not found"):
+        await gateway.acknowledge_claim("task-001", "assign-001", "principal-1", now)
+
+    # 6. Acknowledge: MISMATCH
+    gateway._client.eval = AsyncMock(return_value=["MISMATCH"])
+    with pytest.raises(ClaimNotFoundError, match="does not match"):
+        await gateway.acknowledge_claim("task-001", "wrong-assign", "principal-1", now)
+
+    # 7. Acknowledge: LEASE_EXPIRED
+    gateway._client.eval = AsyncMock(return_value=["LEASE_EXPIRED"])
+    with pytest.raises(ClaimDeliveryLeaseExpiredError, match="Delivery lease for assignment"):
+        await gateway.acknowledge_claim("task-001", "assign-001", "principal-1", now)
+
+    # 8. Acknowledge: Success
+    acked_dict = claim.to_dict()
+    acked_dict["state"] = "acknowledged"
+    acked_dict["acknowledged_at"] = normalize_canonical_utc_timestamp(now)
+    gateway._client.eval = AsyncMock(return_value=["OK", json.dumps(acked_dict)])
+    acked_claim = await gateway.acknowledge_claim("task-001", "assign-001", "principal-1", now)
+    assert acked_claim.state == "acknowledged"
+
+    # 9. Expire delivery lease: returned 1
+    gateway._client.eval = AsyncMock(return_value=1)
+    assert await gateway.expire_delivery_lease("task-001", now) is True
+
+    # 10. Expire delivery lease: returned 0
+    gateway._client.eval = AsyncMock(return_value=0)
+    assert await gateway.expire_delivery_lease("task-001", now) is False
+
+    # 10b. Expire delivery lease: returned CORRUPT_CLAIM
+    gateway._client.eval = AsyncMock(return_value=["CORRUPT_CLAIM"])
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt active claim"):
+        await gateway.expire_delivery_lease("task-001", now)
+
+    # 11. Dispatch hint
+    gateway._client.rpush = AsyncMock()
+    hint = WakeUpHint(
+        hint_id="hint-1",
+        capability="research",
+        created_at=now,
+        execution_kind="initial",
+        task_id="task-001",
+    )
+    await gateway.dispatch_hint(hint, "agent.hints.research")
+    gateway._client.rpush.assert_awaited_once_with("agent.hints.research", hint.to_json())
+
+
+@pytest.mark.anyio
+async def test_in_memory_atomic_claim_zero_mutation_invariants() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    past = "2020-01-01T00:00:00Z"
+    now = "2020-01-01T00:00:15Z"
+    future = "2099-01-01T00:00:00Z"
+
+    root = TaskRequested.create("Root task for invariant tests")
+    await store.register_root_task(root)
+    await store.update_status(root.task_id, "pending")
+
+    grant_1 = DelegationGrant(
+        grant_id="grant-001",
+        root_task_id=root.task_id,
+        issued_to_assignment_id="assign-001",
+        issued_to_principal_id="principal-research-1",
+        fencing_epoch=1,
+        turn_id="turn-001",
+        issued_at=past,
+    )
+    claim_1 = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-001",
+        claim_id="claim-001",
+        root_task_id=root.task_id,
+        turn_id="turn-001",
+        runtime_principal_id="principal-research-1",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req-001",
+        claimed_at=past,
+        delivery_expires_at=past,  # Expired lease
+        delegation_grant_id=grant_1.grant_id,
+    )
+
+    # Initial claim
+    await store.atomic_claim_task(root.task_id, claim_1, grant=grant_1, now=past)
+    assert store.fences[root.task_id] == 1
+    assert store.statuses[root.task_id] == "working"
+    assert store.claims[root.task_id] == claim_1
+    assert store.authority_grants[(root.task_id, grant_1.grant_id)] == grant_1
+
+    # Status back to pending for re-claim
+    await store.update_status(root.task_id, "pending")
+
+    # Invariant 1: Expired claim + epoch race leaves expired claim and status unchanged
+    claim_bad_epoch = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-002",
+        claim_id="claim-002",
+        root_task_id=root.task_id,
+        turn_id="turn-002",
+        runtime_principal_id="principal-research-2",
+        bound_agent_id="research-agent-2",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=99,  # Epoch race
+        proof_digest="b" * 64,
+        request_id="req-002",
+        claimed_at=now,
+        delivery_expires_at=future,
+    )
+    with pytest.raises(TaskAlreadyClaimedError, match="fencing epoch race"):
+        await store.atomic_claim_task(root.task_id, claim_bad_epoch, now=now)
+
+    assert store.fences[root.task_id] == 1
+    assert store.statuses[root.task_id] == "pending"
+    assert store.claims[root.task_id] == claim_1  # Claim 1 preserved, NOT deleted!
+
+    # Invariant 2: Conflicting grant leaves fence, status, active claim, and existing grant unchanged
+    grant_conflict = DelegationGrant(
+        grant_id="grant-001",  # Same grant_id
+        root_task_id=root.task_id,
+        issued_to_assignment_id="assign-002",  # Different assignment
+        issued_to_principal_id="principal-research-2",  # Different principal
+        fencing_epoch=2,
+        turn_id="turn-002",
+        issued_at=now,
+    )
+    claim_2_candidate = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-002",
+        claim_id="claim-002",
+        root_task_id=root.task_id,
+        turn_id="turn-002",
+        runtime_principal_id="principal-research-2",
+        bound_agent_id="research-agent-2",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=2,
+        proof_digest="c" * 64,
+        request_id="req-002",
+        claimed_at=now,
+        delivery_expires_at=future,
+        delegation_grant_id=grant_conflict.grant_id,
+    )
+    with pytest.raises(ConflictingAuthorityGrantError, match="already exists with conflicting data"):
+        await store.atomic_claim_task(root.task_id, claim_2_candidate, grant=grant_conflict, now=now)
+
+    assert store.fences[root.task_id] == 1  # Fence NOT incremented!
+    assert store.statuses[root.task_id] == "pending"  # Status NOT working!
+    assert store.claims[root.task_id] == claim_1  # Claim 1 preserved!
+    assert store.authority_grants[(root.task_id, grant_1.grant_id)] == grant_1  # Grant 1 untouched!
+
+    # Invariant 3: Successful replacement of an expired claim advances fence exactly once,
+    # stores replacement claim, changes status to working, and preserves historical grant
+    grant_2_valid = DelegationGrant(
+        grant_id="grant-002",
+        root_task_id=root.task_id,
+        issued_to_assignment_id="assign-002",
+        issued_to_principal_id="principal-research-2",
+        fencing_epoch=2,
+        turn_id="turn-002",
+        issued_at=now,
+    )
+    claim_2_valid = ActiveClaim(
+        task_id=root.task_id,
+        assignment_id="assign-002",
+        claim_id="claim-002",
+        root_task_id=root.task_id,
+        turn_id="turn-002",
+        runtime_principal_id="principal-research-2",
+        bound_agent_id="research-agent-2",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=2,
+        proof_digest="c" * 64,
+        request_id="req-002",
+        claimed_at=now,
+        delivery_expires_at=future,
+        delegation_grant_id=grant_2_valid.grant_id,
+    )
+    res_claim, is_replay = await store.atomic_claim_task(root.task_id, claim_2_valid, grant=grant_2_valid, now=now)
+    assert not is_replay
+    assert res_claim.fencing_epoch == 2
+    assert store.fences[root.task_id] == 2
+    assert store.statuses[root.task_id] == "working"
+    assert store.claims[root.task_id] == claim_2_valid
+    assert store.authority_grants[(root.task_id, grant_1.grant_id)] == grant_1  # Historical grant preserved!
+    assert store.authority_grants[(root.task_id, grant_2_valid.grant_id)] == grant_2_valid  # New grant stored!
+
+    # Invariant 4: Malformed claim in expiry fails closed
+    store.claims[root.task_id] = "corrupt_non_dict"  # type: ignore[assignment]
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt active claim"):
+        await store.expire_delivery_lease(root.task_id, now=now)

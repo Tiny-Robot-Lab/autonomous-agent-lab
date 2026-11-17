@@ -18,12 +18,23 @@ from .queries import (
     GetTaskResult,
     QueryAgentsByCapability,
 )
-from .use_cases import RegisterChildTask, SubmitTask
+from .use_cases import (
+    AcknowledgeAssignment,
+    CapabilityMismatchError,
+    ClaimTask,
+    RegisterChildTask,
+    StageArtifactUseCase,
+    SubmitTask,
+    UnauthorizedPrincipalError,
+)
 
 __all__ = [
+    "AcknowledgeAssignment",
     "AuthoritativeTaskStore",
     "CandidateFinder",
+    "CapabilityMismatchError",
     "CapabilityRouter",
+    "ClaimTask",
     "EventPublisher",
     "FindCandidatesByCapability",
     "GetAgentStates",
@@ -35,9 +46,11 @@ __all__ = [
     "RegisterChildTask",
     "ResultReader",
     "RoutingRecorder",
+    "StageArtifactUseCase",
     "StateReader",
     "SubmitTask",
     "TaskDispatcher",
     "TaskQueue",
+    "UnauthorizedPrincipalError",
 ]
 

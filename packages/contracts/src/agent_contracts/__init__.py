@@ -1,3 +1,7 @@
+from .active_claim import (
+    ACTIVE_CLAIM_CONTRACT_VERSION,
+    ActiveClaim,
+)
 from .artifact_reference import ArtifactReference
 from .availability import (
     AgentAvailability,
@@ -11,6 +15,10 @@ from .availability import (
 )
 from .candidates import AgentCandidate
 from .capabilities import AgentCapabilityMetadata
+from .delegation_grant import (
+    DELEGATION_GRANT_CONTRACT_VERSION,
+    DelegationGrant,
+)
 from .errors import (
     AllInferenceProvidersFailedError,
     FallbackEligibleInferenceError,
@@ -49,6 +57,7 @@ from .serialization import (
     check_no_credential_bearing_keys,
     freeze_value,
     is_credential_bearing_key,
+    normalize_canonical_utc_timestamp,
     to_plain_json_structure,
 )
 from .stage_artifact import (
@@ -56,13 +65,18 @@ from .stage_artifact import (
     MAX_STAGE_ARTIFACT_BYTES,
     StageArtifact,
 )
+from .task_assignment import (
+    TASK_ASSIGNMENT_CONTRACT_VERSION,
+    ClaimTaskResponse,
+    TaskAssignment,
+)
 from .task_continuation import (
     ALLOWED_CONTINUATION_STAGES,
     MAX_CONTINUATION_BYTES,
     STAGE_CONTROL_FIELDS_ALLOWLIST,
     TaskContinuation,
 )
-from .task_input import TaskInput
+from .task_input import TaskInput, TaskInputReference
 from .tool_authorization import (
     ToolAuditDeliveryOutcome,
     ToolAuthorizationContext,
@@ -97,19 +111,28 @@ from .tools import (
     ToolRiskLevel,
 )
 from .version import __version__
+from .wake_up_hint import (
+    WAKE_UP_HINT_CONTRACT_VERSION,
+    WakeUpHint,
+)
 
 __all__ = [
+    "ACTIVE_CLAIM_CONTRACT_VERSION",
     "ALLOWED_ARTIFACT_TYPES",
     "ALLOWED_CONTINUATION_STAGES",
     "ALL_TASK_LIFECYCLE_STATUSES",
     "CHILD_LIFECYCLE_STATUSES",
     "DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS",
+    "DELEGATION_GRANT_CONTRACT_VERSION",
     "MAX_CONTINUATION_BYTES",
     "MAX_STAGE_ARTIFACT_BYTES",
     "NONTERMINAL_TASK_LIFECYCLE_STATUSES",
     "PARENT_LIFECYCLE_STATUSES",
     "STAGE_CONTROL_FIELDS_ALLOWLIST",
+    "TASK_ASSIGNMENT_CONTRACT_VERSION",
     "TERMINAL_TASK_LIFECYCLE_STATUSES",
+    "WAKE_UP_HINT_CONTRACT_VERSION",
+    "ActiveClaim",
     "AgentAvailability",
     "AgentAvailabilityState",
     "AgentCandidate",
@@ -119,6 +142,8 @@ __all__ = [
     "AgentHeartbeat",
     "AllInferenceProvidersFailedError",
     "ArtifactReference",
+    "ClaimTaskResponse",
+    "DelegationGrant",
     "FallbackEligibleInferenceError",
     "FallbackTransition",
     "HeartbeatRunner",
@@ -135,8 +160,10 @@ __all__ = [
     "RoutingDecision",
     "RoutingProvenance",
     "StageArtifact",
+    "TaskAssignment",
     "TaskContinuation",
     "TaskInput",
+    "TaskInputReference",
     "TaskLifecycleStatus",
     "TaskRequested",
     "TaskResult",
@@ -167,6 +194,7 @@ __all__ = [
     "ToolSelectionDecision",
     "ToolSelectionKind",
     "ToolSelector",
+    "WakeUpHint",
     "__version__",
     "canonical_json_dumps",
     "check_no_credential_bearing_keys",
@@ -174,6 +202,7 @@ __all__ = [
     "evaluate_availability",
     "freeze_value",
     "is_credential_bearing_key",
+    "normalize_canonical_utc_timestamp",
     "parse_health_probe_timeout",
     "parse_heartbeat_interval",
     "parse_timestamp",
