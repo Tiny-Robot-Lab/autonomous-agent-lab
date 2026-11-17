@@ -1,24 +1,71 @@
 # ADR 0007: Durable Task Continuations and Platform-Governed Asynchronous Resumption
 
-Status: Proposed
-Date accepted:
+Status: Accepted
+Date accepted: 2026-11-16
 Related issue: https://github.com/Tiny-Robot-Lab/autonomous-agent-lab/issues/33, https://github.com/Tiny-Robot-Lab/autonomous-agent-lab/issues/34, https://github.com/Tiny-Robot-Lab/autonomous-agent-lab/issues/35, https://github.com/Tiny-Robot-Lab/autonomous-agent-lab/issues/36
 Supersedes: N/A
 
 ## Review status
 
-This revision incorporates human architecture review and remains
-**Proposed**; it must not be implemented as accepted architecture. ADR 0006
-remains accepted and governing. This ADR fills in the continuation,
-completion, and resumption details that ADR 0006 deliberately deferred; it
-does not reopen or replace its lineage, delegation-authority, turn-boundary,
-depth, wave, or specialist-registration decisions.
+Accepted by explicit human decision on 2026-11-16 after repository-grounded
+prospective drafting, human architecture review, independent Gemini 4 Argon
+High review, validation of Argon's findings against live main at `7e8bfc7`,
+revision of the architecture, and final full-document consistency review.
+ADR 0006 remains accepted and governing. ADR 0007 fills in ADR 0006's
+deferred continuation, completion, and resumption details; it does not reopen
+or replace ADR 0006's lineage, delegation-authority, turn-boundary, depth,
+wave, or specialist-registration decisions.
 
-An independent Gemini 4 Argon review is required. Its findings must be
-validated against live `main` after review, and explicit human acceptance is
-required before implementation. The repository evidence below was inspected
-at `7e8bfc7`, which is also the local `main` baseline for this proposal. No
-review, acceptance, issue update, or implementation is implied.
+### Independent review record
+
+Gemini 4 Argon High independently reviewed the prospective ADR and
+recommended revision before acceptance, identifying seven blocking findings.
+Those findings were validated against live main at `7e8bfc7`; confirmed
+findings were incorporated, and overstated findings were narrowed or rejected:
+
+1. **B-1, proposer identity:** Partially confirmed. The authenticated API
+   boundary is selected here; its deployed credential mechanism remains a
+   mandatory pre-enablement gate.
+2. **B-2, initial root assignment:** Confirmed as a design gap. This revision
+   requires initial Research turns to use authenticated pull-claim and bind
+   any delegation grant to that assignment.
+3. **B-3, result writes and fencing:** Partially confirmed. The previous
+   decision prohibited direct writes only for delegated children. This
+   revision applies trusted fenced completion to all assignment-backed turns.
+4. **B-4, API plus completion stream:** The redundancy concern is valid; the
+   claim that the two boundaries are contradictory is not. This revision
+   removes the stream and projector in favor of direct idempotent projection.
+5. **B-5, pre-bound push recovery:** Partially confirmed. Pull-claim removes
+   pre-bound delivery; acknowledged expired execution claims still require
+   explicit recovery and are not automatically retried.
+6. **B-6, child input and artifact validation:** Confirmed as a design gap.
+   This revision adds immutable input/artifact verification to atomic
+   acceptance.
+7. **B-7, missing workers:** The absence of Orchestrator work processors was
+   confirmed, but a requirement for four distinct workers was not. This
+   revision assigns claim-deadline evaluation to Orchestrator claim and
+   recovery/status operations.
+
+The high-priority validation found that candidate availability before
+acceptance is unnecessary under pull-claim. An accepted pending child with no
+eligible claim before its deadline reaches `claim_timed_out`. Immutable,
+versioned TaskInput wording was already sound.
+Explicit continuation transitions, initial root authority issuance, and
+issue-#33 authoritative sources for issue-#36 identifiers needed
+clarification. The 2–4 KiB recommendation was unsupported by measurements;
+16 KiB UTF-8 remains a provisional, test-enforced default. TaskInput and
+artifact retention, plus turn identity for fallback history, are now
+specified.
+
+The final architecture selects authenticated pull-claim, non-secret wake-up
+hints, and direct idempotent atomic platform projection. Argon informed the
+revision but did not make the acceptance decision. Acceptance does not mean
+the implementation already exists. Executable delegation remains blocked
+until the accepted pre-enablement requirements are implemented and
+validated, including unique runtime authentication, protected assignment
+delivery, least-privilege Redis permissions, fenced canonical completion,
+exact schemas, lease/deadline parameters, and deployment persistence/recovery
+configuration.
 
 ## Context
 
@@ -32,18 +79,20 @@ delegation until proposer binding and authority composition are resolved.
 The current implementation provides useful foundations but not that
 lifecycle:
 
-- `TaskRequested` is a versioned task-dispatch contract; `TaskResult` is a
-  result envelope. Neither represents a resumable execution continuation or
-  canonical failed terminal outcome. The authoritative store does not retain
-  the original prompt/task input independently of the queue.
+- `TaskRequested` is a versioned task-request identity/input envelope;
+  `TaskResult` is a successful-output envelope. Neither is an authenticated
+  assignment, continuation, claim, or authority proof; neither represents a
+  resumable execution continuation or canonical failed terminal outcome.
+  The authoritative store does not retain the original prompt/task input
+  independently of the queue.
 - `AuthoritativeTaskStore` and `RedisGateway` persist task status, lineage, and
   parent membership. `RegisterChildTask` validates parent/depth and delegates
   child existence to one Redis transaction, but does not atomically update a
   parent continuation, dependency, wait state, or delegation-wave allowance.
 - Orchestrator dispatch records routing and writes the advertised dispatch
   target. Redis list dispatch uses `RPUSH`; agents consume with destructive
-  `BLPOP`. There is no consumer group, completion projector, or resumable-task
-  dispatcher.
+  `BLPOP`. There is no authenticated claim API for initial, child, or resumed
+  work.
 - Research Agent and Analysis Agent Redis adapters save successful results
   directly to `task.result:{task_id}`. Their processors publish lifecycle
   events, including an error event on ordinary execution failure, but no
@@ -91,19 +140,27 @@ does not determine ownership or completion routing.
 
 Introduce a provider-neutral, versioned, JSON-compatible `TaskContinuation`
 record in authoritative task state. It is distinct from `TaskRequested` and
-`TaskResult`; those contracts keep their current dispatch and result
-semantics. The record contains:
+`TaskResult`. `TaskRequested` retains its task-request identity/input
+envelope purpose, and `TaskResult` retains its successful-output envelope
+purpose. Neither is an authenticated assignment, continuation, claim, or
+authority proof. `TaskAssignment` controls execution; the trusted fenced
+platform completion boundary canonically accepts `TaskResult`. Agents no
+longer canonically establish results through direct Redis writes. The
+continuation record contains:
 
 - `parent_task_id`;
 - a reference to the immutable task input and its version;
 - `continuation_capability` (initially `research`);
-- a bounded, schema-defined `stage` (initially waiting for and then
-  incorporating the required child outcome);
+- a bounded, schema-defined `stage` identifying the application resumption
+  entry point (initially `incorporate_analysis_child`);
 - optional small schema-defined control context and references to
   stage-required artifacts;
 - required child task IDs (exactly one for issue #33);
 - a monotonically increasing `continuation_version`; and
 - platform creation/update timestamps.
+
+Task lifecycle status separately represents `waiting_for_children`,
+`resumable`, and `working`; these are not continuation stages.
 
 The record is a small checkpoint, not a transcript or serialized runtime.
 Persist only the application fields needed to resume the named stage. Do not
@@ -124,7 +181,8 @@ Every resumable task retains durable access to an immutable, versioned
 processes. It includes the original task input needed for execution, such as
 the submitted prompt, and may reference other immutable task-scoped artifacts.
 The record is keyed by task ID and input version; updates create a new version
-rather than mutating an existing input.
+rather than mutating an existing input. A distinct version can be selected
+only through an explicit authoritative operation; versions are write-once.
 
 The queue message is a delivery mechanism only; consuming it does not consume
 the task's authoritative input.
@@ -144,220 +202,171 @@ execution state. The minimum lifecycle for this increment is:
 
 | Parent task state | Meaning |
 | --- | --- |
-| `pending` | Accepted for initial execution, not yet claimed. |
-| `working` | An executor holds the current fenced task-turn claim. |
+| `pending` | Accepted for initial execution and claimable. |
+| `working` | An authenticated executor holds the current fenced task-turn claim. |
 | `waiting_for_children` | Delegation was accepted; the continuation and dependency are durable. No executor is held. |
 | `resumable` | Every required child has a canonical terminal outcome; an eligible executor may claim the continuation. |
-| `recovery_required` | A continuation claim expired or was abandoned; the continuation remains durable, but a new execution claim requires an explicit recovery decision. |
+| `recovery_required` | An acknowledged execution claim expired or was abandoned. Its fence is invalidated; a new execution claim requires an explicit recovery decision. |
 | `completed` | The parent goal completed. |
 | `failed` | The parent goal failed with a canonical safe terminal outcome. |
 
 | Child task state | Meaning |
 | --- | --- |
-| `pending_dispatch` | Child exists authoritatively and awaits platform dispatch. |
-| `pending` | Dispatched and available for execution. |
-| `working` | A specialist holds the current fenced task claim. |
+| `pending` | Child exists authoritatively and is claimable; it need not have a reserved executor. |
+| `working` | An authenticated specialist holds the current fenced task claim. |
+| `recovery_required` | An acknowledged child execution claim expired or was abandoned; its fence is invalidated. |
 | `completed` | Canonical successful terminal outcome and normal result are durable. |
 | `failed` | Canonical safe execution-failure outcome is durable. |
-| `dispatch_failed` | The platform could not dispatch the existing child; this is terminal for the single-child dependency and is distinct from execution failure. |
+| `claim_timed_out` | No eligible Analysis runtime claimed the pending child before its bounded claim deadline; this is terminal for the single-child dependency and distinct from execution failure, assignment-delivery failure, or temporary executor unavailability before the deadline. |
 
-The platform transitions parent state; agent lifecycle events do not. A
+The platform transitions task state; agent lifecycle events do not. A
 child's canonical terminal completion or failure satisfies its parent
 dependency. Under the issue-#33 one-child policy, that makes the parent
-`resumable`, including when the child failed or dispatch failed. The resumed
-agent loads the bounded continuation and T101's canonical outcome/result,
-incorporates it, and may complete or fail the parent according to the task
-contract. No synchronous wait or process-local callback is used.
+`resumable`, including when the child failed or its claim timed out. Root and
+resumed work remains claimable when no eligible executor is currently
+available. No synchronous wait or process-local callback is used.
 
-### 4. Canonical child terminal outcomes
+### 4. Continuation stages and versions
+
+The issue-#33 continuation has one stage, `incorporate_analysis_child`.
+Continuation versions identify immutable checkpoints; ordinary scheduling
+state transitions do not create a new checkpoint.
+
+| Operation | Task transition | Continuation effect |
+| --- | --- | --- |
+| Delegation acceptance | Parent becomes `waiting_for_children`. | Write checkpoint version 1 with stage `incorporate_analysis_child` and the required child ID. |
+| Child terminal projection | Parent becomes `resumable`. | Keep version 1; do not increment it. |
+| Parent claim | Parent becomes `working` only if the expected version is 1. | Keep version 1. |
+| Parent completion | Parent becomes `completed` or `failed`. | Retain version 1 as immutable historical state; task terminal state closes its use. Do not increment it. |
+
+A future change that writes a distinct checkpoint creates a new immutable
+version through an explicit authoritative operation. It must not mutate
+version 1 in place. The claim and each state transition use the expected
+continuation version and fencing epoch where applicable.
+
+### 5. Canonical child terminal outcomes
 
 Successful completion is authoritative task state plus the normal
 `TaskResult` (or an authoritative reference to it). Failure is an equally
 durable terminal record containing the child task ID, a stable non-sensitive
 failure code, and terminal timestamp. The initial failure codes distinguish
-at least execution failure and dispatch failure. A fixed safe summary may be
-included where needed; raw exceptions, provider/network responses, prompts,
-credentials, and arbitrary agent text are excluded.
+at least execution failure and `claim_timed_out`. `claim_timed_out` means
+that an accepted pending child received no eligible Analysis claim before its
+deadline. It is not an execution failure, an assignment-delivery failure,
+or an ordinary temporarily unavailable executor before that deadline. A
+fixed safe summary may be included where needed; raw exceptions,
+provider/network responses, prompts, credentials, and arbitrary agent text
+are excluded.
 
 Neither a missing result nor a bounded `agent.events` entry proves success,
 failure, or completion. The parent dependency is satisfied only by the
 platform's canonical terminal projection. A parent loads the child's
 authoritative terminal outcome and, on success, its normal result.
 
-### 5. Atomic delegation acceptance and dispatch
+### 6. Non-secret wake-up hints
 
-Before accepting a bounded proposal, the platform verifies the assignment
-proof, applies the explicit policy in Decision 8, and confirms that at least
-one eligible `analysis` candidate currently exists. If none exists, it
-rejects the proposal without creating a child, consuming the delegation wave,
-or suspending the parent. A proposal contains the requested capability,
-bounded child intent, and proposal ID; it does not contain a child ID, target
-agent ID, queue name, or dispatch target. Acceptance uses one atomic or
-equivalently safe compare-and-set boundary to:
+A claimable initial root, delegated child, or resumable parent may cause a
+lightweight hint to be written to the matching capability queue. A hint
+contains only identifiers such as task ID, capability, execution kind, and
+expected continuation version where applicable. It contains no assignment
+proof, credential, prompt, TaskInput, artifact payload, or authority grant.
 
-1. verify the expected parent execution/continuation version and unconsumed
-   one-wave allowance;
-2. validate and consume the one-turn delegation proof and proposal
-   idempotency key;
-3. mint one child ID and persist child status, forward lineage, and parent
-   membership;
-4. persist the versioned parent continuation and its required-child
-   dependency;
-5. set the parent to `waiting_for_children` and consume the root's one
-   delegation wave; and
-6. record a durable pending-dispatch work item for that child.
+A hint grants no authority and is not evidence that a runtime owns a task. It
+may be duplicated, lost, or stale without changing authoritative task state.
+An agent acts on a hint only by calling the authenticated Orchestrator claim
+operation; it may instead poll that operation without a hint. A stale or
+failed hint does not move a task to `recovery_required`.
 
-Child existence and the parent wait state therefore become visible together.
-The dispatch work item makes the post-commit interval recoverable; routing
-does not become child existence or authorization. After acceptance, the
-platform applies selection to the eligible candidate set and dispatches
-through the selected candidate's advertised target. If eligibility or
-delivery is lost after acceptance, a terminal dispatch failure is recorded
-as a canonical child outcome and resumes the parent with that failure. This
-post-acceptance failure is distinct from a pre-acceptance unavailable
-capability rejection. Assignment-delivery recovery may retry the same child
-ID and dispatch identity; it does not authorize task re-execution.
+### 7. Authenticated pull-claim and TaskAssignment
 
-### 6. Platform-controlled completion command path
+All assignment-backed execution kinds use one platform claim model:
+initial root, delegated child, and resumed continuation. A live agent
+authenticates to the Orchestrator as a unique runtime principal and requests
+claimable work for an authorized capability. Agent registration, advertised
+capability, `agent_id`, and a wake-up hint aid discovery only; they do not
+authenticate the caller.
 
-Use a Redis task-completion command stream, separate from `agent.events`,
-consumed by a trusted Orchestrator completion projector. This is a new
-authoritative command boundary, not a conversion of operational events into
-commands. For delegated children, agent-side adapters must not establish
-canonical completion by directly writing `task.result:{task_id}`. A command
-may carry the normal result or an immutable staged-result reference; the
-projector validates and owns canonical acceptance.
+The claim operation atomically validates that:
 
-The agent-side result adapter submits a completion command through the
-authenticated Orchestrator channel for its assigned task. The trusted
-platform accepts that command onto the Redis stream with a stable
-command/assignment identity; it carries either the normal task result, an
-immutable staged-result reference, or a safe failure code. The adapter does
-not directly write canonical `task.result`, parent state, lineage,
-dependencies, or resumability. The projector validates the authenticated
-assignment and command against authoritative task state. In one atomic or
-equivalently safe projection it establishes:
+- the task is `pending` or `resumable`;
+- the authenticated principal is authorized and capability-compatible;
+- the expected continuation version matches when the task has a continuation;
+  and
+- no valid active claim exists.
 
-- the canonical `TaskResult` on success;
-- the canonical safe terminal outcome;
-- the child terminal status;
-- parent dependency satisfaction;
-- parent `resumable` state when all required outcomes are terminal; and
-- exactly one resumable-work record when the parent becomes resumable.
+Each claim request carries a stable request ID scoped to the authenticated
+principal. Retrying an unacknowledged request with the same ID returns the
+same assignment rather than claiming another task.
 
-The projector acknowledges the stream entry only after this projection
-commits. Redelivery after a crash is expected and idempotent. Entries remain
-pending until projection commits; acknowledgement happens afterward. This
-command path's durability is bounded by the configured Redis persistence and
-recovery semantics. It is not an unconditional guarantee against Redis data
-loss. The canonical terminal outcome remains authoritative after command
-acknowledgement. A projector outage delays completion visibility but does not
-cause the child runtime to wait for a particular parent process.
-Consumer-group recovery, monitoring, and bounded post-ack retention are
-implementation obligations; the existing `agent.events` stream is not
-reused for them.
+The platform creates an assignment ID, claim ID, fencing epoch, validity
+window, and applicable delegation grant; transitions the task to `working`;
+records the assignment/claim and routing decision IDs with the authenticated
+runtime identity, including the registered executor `agent_id` mapped from
+that principal rather than asserted by the caller; and returns a private,
+versioned `TaskAssignment` over the authenticated response. The assignment
+semantically binds:
 
-This choice keeps platform authority centralized and lets the platform
-enforce atomic completion-to-parent projection without requiring every
-specialist to call an Orchestrator HTTP service successfully at the moment of
-completion. It adds a trusted worker and Redis stream-consumer-group
-operations that do not exist today.
+- assignment ID, task ID, and authenticated runtime principal;
+- claim ID and execution kind (`initial`, `delegated_child`, or
+  `resumed_continuation`);
+- continuation version, when applicable, and fencing epoch;
+- assigned capability and bounded delegation grant, when authorized;
+- validity; and
+- immutable TaskInput, continuation, and required-artifact references and
+  versions.
 
-### 7. Parent continuation claim and delivery
+Proof or credential material is detached secret authorization data, not an
+ordinary JSON field likely to be logged. The platform-minted assignment proof
+is delivered separately and bound to the assignment, principal, task,
+continuation version, fencing epoch, capability, and grant.
+Every proposal, artifact access, and completion validates the assignment,
+principal, fence, task, version, and command identity. The assignment is
+returned only over the authenticated channel, never through a shared Redis
+queue, `TaskRequested`, public metadata, events, routing decisions, or logs.
 
-The platform selects an eligible Research candidate using current
-registration, liveness, and its advertised dispatch target. It then performs
-one atomic claim against the expected `continuation_version` and task state:
-only a `resumable` parent with the expected version can transition to
-`working`; the claim records a new claim ID, fencing epoch, and assignment ID.
-The platform delivers a private, versioned `TaskAssignment` envelope
-(initial envelope version 1), distinct from `TaskRequested` and public
-metadata. It semantically binds:
+The runtime acknowledges an assignment before starting execution. If
+delivery is unacknowledged, the same principal may retrieve the same
+assignment; on delivery-lease expiry the platform invalidates its fence and
+returns the task to its prior claimable state. This is assignment-delivery
+recovery, not task re-execution. After acknowledgement, claim expiration
+follows Decision 11.
 
-- assignment ID and task ID;
-- authenticated assigned-runtime principal;
-- claim ID;
-- execution kind (`initial`, `delegated_child`, or `resumed_continuation`);
-- continuation version (null only when the execution has no continuation);
-- fencing epoch and assigned capability;
-- the bounded delegation grant, if any;
-- expiration/validity;
-- references and versions for task input, continuation, and required
-  artifacts; and
-- the platform-minted assignment proof.
+### 8. Trust boundary and initial root authority
 
-The envelope contains references, not copies of full task input or artifacts.
-The proof is secret, scoped to this task turn and assignment, replay-protected,
-and invalidated on completion, expiration, or fencing. It is absent from
-logs, telemetry, events, routing decisions, and public metadata. Only the
-trusted assignment boundary may deliver it to the authenticated assigned
-runtime.
+The selected authoritative claim, proposal, artifact-access, and completion
+boundary is an authenticated Orchestrator API/channel. Every runtime has a
+unique principal and credential; a credential shared by every instance of a
+service is insufficient for runtime identity. Credentials are provisioned
+outside ordinary task payloads, protected in transit, revocable and
+rotatable, and excluded from logs, telemetry, and events. Their exact
+cryptographic format is implementation-specific, but the deployed mechanism
+must be selected, threat-reviewed, and validated before executable
+delegation is enabled.
 
-An assignment delivery that is not yet acknowledged may be retried only as
-the same assignment ID, proof, and fencing epoch to the same authenticated
-runtime; the runtime must deduplicate by assignment ID. A stale version,
-claim, or fencing epoch cannot write task state, submit another delegation,
-or complete the task. There is at most one active valid claimant; the system
-does not promise exactly-once execution across process crashes or exactly-once
-external provider effects.
+The current shared Redis connection/topology, registration records,
+self-asserted `agent_id`, and queue access do not authenticate a runtime.
+Agent Redis permissions must not allow bypass writes to authoritative task,
+result, continuation, artifact, assignment, claim, or terminal-outcome state.
+Telemetry and non-authoritative registration access do not grant those
+permissions.
 
-If no eligible Research candidate is available, the parent stays
-`resumable`; it is not failed or silently discarded. When an eligible agent
-becomes available, the platform may dispatch it. If an acknowledged execution
-claim expires or is abandoned, that state is observable and the continuation
-remains durable in `recovery_required`; the old proof and fence are
-invalidated, so stale executors can never commit. Issue #33 does not
-automatically re-execute the parent or redispatch a new execution assignment
-after an ambiguous claim. Any new execution claim after an expired/abandoned
-claim requires an explicit recovery decision outside the automatic issue-#33
-path. This is not a general task retry policy; only unacknowledged
-assignment-delivery recovery may redeliver the same assignment as described
-above.
+The assigned runtime stages and seals Research artifacts through this
+authenticated API. The platform validates the assignment and stamps
+task/turn, schema, version, and provenance metadata; service-local Redis
+writes cannot create an authoritative artifact.
 
-### 8. Trustworthy proposer binding and narrow authority
-
-Resolve ADR 0006 item 18 with a platform-minted, one-turn task-assignment
-proof. It is high-entropy and unforgeable, bound to the authoritative parent
-task, authenticated runtime identity, assignment ID and fencing epoch, the
-`research -> analysis` edge, a one-child limit, and bounded validity. The
-platform validates and consumes its delegation authority atomically;
-proposal ID plus assignment epoch prevents replay. A consumed, expired,
-superseded, or mismatched proof cannot authorize a new proposal. An exact
-authenticated replay of an already accepted proposal returns its recorded
-acceptance without creating state or consuming new authority. The proof
-grants only the ability to submit the bounded proposal; it does not mint a
-child ID, select an agent, name a queue, or grant the child permissions.
-
-**The current shared Redis topology does not prove the identity of a queue
-consumer.** A self-asserted `agent_id`, advertised capability, Redis
-registration record, or possession of a shared Redis credential is not
-runtime authentication.
-
-For executable issue #33, the minimum selected trust boundary is an
-authenticated platform assignment/delegation channel that authenticates a
-runtime instance, binds that principal to the platform-issued `TaskAssignment`,
-and validates the proof for proposal and completion commands. The initial
-choice is an authenticated Orchestrator API/channel with per-runtime
-credentials and a protected assignment delivery path. The `TaskAssignment`
-envelope and proof must not be delivered through the current shared Redis
-task queue. Redis ACLs may add defense in depth but do not replace this
-binding when credentials are shared by service instances.
-
-Service-specific Redis ACL credentials can restrict a service to its
-capability queue and command stream, but credentials shared by all instances
-of a service do not distinguish which instance consumed a queue item. Unique
-per-runtime Redis credentials plus queue ACLs could establish that identity,
-but would require per-instance provisioning, queue isolation, rotation, and
-validation. An authenticated platform API/channel centralizes principal
-binding and proof checks, at the cost of a new runtime dependency and
-availability boundary. This ADR selects the latter as the minimum semantic
-boundary; its concrete authentication and delivery mechanism must be selected
-and tested before delegation is enabled. Until that is done, executable
-delegation is blocked. Shared Redis delivery alone is insufficient.
-
-Capability advertisement is not a parent authority grant: the platform must
-supply an explicit narrow grant for the parent execution, and must reject
-delegation if that grant cannot be established.
+At root ingestion the platform persists a default root-authority record
+bound to the root task. It records the baseline authority and delegation
+policy context but contains no secret proof. The default does not itself
+authorize delegation. Before an initial Research turn can propose, policy
+may issue the narrow one-turn `research -> analysis`, one-child,
+one-wave grant only when the root and selected Research execution are
+eligible. The grant is bound to that claimed assignment and derived from
+the root authority, explicit platform policy, and specialist configuration.
+The authority record tracks issuance and consumption; secret proof material
+is returned only through the authenticated assignment response. If the
+grant cannot be established, the assignment has no delegation authority and
+the proposal is rejected. `TaskRequested` never carries the grant or proof.
 
 Resolve ADR 0006 item 19 narrowly for issue #33:
 
@@ -374,60 +383,186 @@ discovery evidence, not authorization. The child receives no retrieval,
 provider credentials, tool access, or external network authority through
 delegation.
 
-### 9. Duplicate, retry, and consistency semantics
+### 9. Atomic delegation acceptance and child claimability
+
+Acceptance does not require reserving or selecting an eligible Analysis
+runtime. A proposal contains bounded child intent, proposal ID, and
+references to the sealed Research artifact and required input; it contains
+no child ID, runtime principal, queue name, or dispatch target.
+
+The platform verifies the authenticated parent assignment, principal,
+fencing epoch, expected continuation version, proposal ID, one-turn grant,
+single-child/depth-one policy, and unconsumed wave. It verifies that the
+referenced Research artifact exists, is sealed and immutable, has the
+expected schema, version, and provenance, and is authorized for the child.
+The artifact must remain pinned while the child or parent continuation can
+reference it. The platform creates an immutable child `TaskInput` referencing
+that artifact or verifies the exact immutable input within the same
+consistency boundary.
+
+One atomic or equivalently safe compare-and-set boundary then:
+
+1. verifies the parent assignment/fence and the expected continuation
+   version;
+2. validates and consumes the one-turn delegation grant and proposal
+   idempotency key, then records the proposal and delegation decision IDs;
+3. validates and pins the immutable artifact and child `TaskInput`
+   references;
+4. mints one child ID and persists child state, forward lineage, and parent
+   membership;
+5. writes parent continuation version 1 at stage
+   `incorporate_analysis_child` and its required-child dependency;
+6. consumes the root's one delegation wave and moves the parent to
+   `waiting_for_children`; and
+7. makes the child `pending` and claimable and writes a non-secret Analysis
+   wake-up hint or equivalent marker.
+
+Child existence and the parent wait state become visible together. An exact
+retry of the same proposal under the same valid assignment returns the same
+accepted child; it cannot consume a second grant or create another child.
+The hint is not authoritative. If it is lost, the child remains claimable.
+
+### 10. Candidate availability and claim deadline
+
+Candidate availability is not a prerequisite for delegation acceptance.
+The accepted child remains `pending` until an eligible authenticated
+Analysis runtime claims it. Root and resumed-parent work may likewise remain
+claimable when no eligible executor is currently available.
+
+Acceptance records a bounded child claim deadline. The Orchestrator's
+authenticated capability-claim operation evaluates due deadlines for that
+capability before returning work. A task-status/recovery operation may invoke
+the same bounded recovery use case. No separate dispatcher, resumable-work,
+or lease-expiry worker is required. If no eligible child runtime claims
+before the deadline, the trusted platform atomically records canonical
+`claim_timed_out`, satisfies the parent dependency, makes the parent
+`resumable`, and writes one non-secret parent hint. An expired deadline is
+materialized on the next claim or recovery/status operation; it does not
+authorize task execution. A child claimed before the deadline is governed by
+its execution claim and Decision 11.
+
+`claim_timed_out` is distinct from execution failure because no runtime
+executed the child; distinct from assignment-delivery failure because no
+assignment was claimed; and distinct from temporary executor unavailability
+before the deadline, during which the child remains pending and claimable.
+
+### 11. Universal fenced completion and canonical projection
+
+Every assignment-backed execution turn uses trusted platform completion:
+initial root, general worker, Research root, delegated Analysis child, and
+resumed parent. Agent adapters may not establish canonical completion by
+directly writing `task.result:{task_id}`. Existing direct-result behavior
+must be migrated incrementally and cannot remain a permanent bypass.
+
+The runtime submits completion or safe failure through the authenticated
+Orchestrator API with a stable command ID and assignment/fence proof. For
+issue #33, the request carries one bounded canonical `TaskResult` on success,
+or a stable safe failure code on failure. The Analysis and parent results
+are inline; issue #33 does not support a second staged-result-reference
+completion mode. The request size and result bounds are configured and
+test-enforced.
+
+Before replying, the API validates the authenticated principal, assignment,
+fence, task, continuation version, and command ID and directly performs one
+idempotent atomic Redis projection. As applicable, the projection establishes:
+
+- canonical `TaskResult` on success;
+- canonical safe terminal outcome and task terminal status;
+- child dependency satisfaction;
+- the parent transition to `resumable`; and
+- a canonical outcome ID associated with the stable completion command ID;
+- exactly one non-secret parent wake-up hint or equivalent claimable-work
+  marker.
+
+A retry after a lost response uses the same command ID and returns the
+recorded canonical outcome. A conflicting terminal command fails closed and
+cannot overwrite the first outcome. The API replies only after projection
+commits. This ADR does not use a task-completion stream, consumer group, or
+projector worker.
+
+Completion-command durability is bounded by configured Redis persistence
+and recovery semantics; it is not an unconditional guarantee against Redis
+data loss. In-memory queues, agent events, and uncommitted API requests are
+not canonical completion. `agent.events` remains bounded, best-effort
+observability under ADR 0005.
+
+### 12. Claim expiration and recovery
+
+An unacknowledged assignment delivery may be safely released to its prior
+claimable state after its delivery lease expires; the old fence is
+invalidated. This is assignment-delivery recovery, not task re-execution.
+Loss or staleness of a non-secret wake-up hint does not create
+`recovery_required`.
+
+An acknowledged execution claim that expires or is abandoned becomes
+observable as `recovery_required`; its proof and fence are invalidated, so a
+stale executor cannot commit. The Orchestrator claim/status/recovery
+operations detect and record the expired state. A separate explicit trusted
+`ResolveExpiredClaim` operation verifies the task, claim, and expired epoch
+and records a recovery-decision ID. It may clear `recovery_required` only
+under an explicit recovery disposition; any subsequent assignment uses a
+new fence. Issue #33 does not define that disposition, automatically
+re-execute a task, retry a provider, or redispatch an acknowledged execution
+claim. Retry policy remains outside this issue.
+
+### 13. Duplicate semantics and Redis topology
 
 - **Delegation proposal:** A unique proposal ID is scoped to the parent
   assignment/turn. Replaying the same accepted proposal returns its original
   child and acceptance; it never mints another child. A different proposal
   after the wave is consumed is rejected.
-- **Child dispatch:** The child ID and dispatch generation are the
-  idempotency key. Retrying platform delivery cannot create another child or
-  authorize a second execution claim. A terminal dispatch failure is
-  explicit; this ADR does not add general task retry or replanning.
-- **Child completion:** A stable completion command ID and child assignment
-  identify a completion. Identical redelivery is acknowledged as a no-op
-  after projection. A conflicting second terminal outcome cannot overwrite
-  the first canonical outcome or result.
-- **Parent unblock:** Dependency satisfaction and the transition to
-  `resumable` are a single conditional projection. Repeated commands or
-  projector delivery do not create a second continuation version or duplicate
-  resumable work.
-- **Continuation claim/delivery:** An expected continuation version and
-  claim idempotency key are checked atomically. Duplicate delivery of the
-  same active assignment to the same runtime is safe; a stale claim cannot
-  acquire or use the active fence. A new task execution claim after expiration
-  requires explicit recovery and a higher fence, not automatic retry.
+- **Child claim:** A task can have at most one valid active claim. Repeated
+  claim requests by the same principal can retrieve the same unacknowledged
+  assignment; a stale hint cannot claim or execute a task.
+- **Completion:** A stable completion command ID and assignment identify a
+  completion. Identical retries return the recorded outcome. A conflicting
+  terminal outcome cannot overwrite it.
+- **Parent unblock:** Child terminal projection, dependency satisfaction,
+  parent `resumable` state, and the single claimable-work marker are one
+  conditional atomic projection. Retries do not create duplicate work or
+  continuation versions.
+- **Fencing:** A stale assignment, continuation version, claim, or epoch
+  cannot propose, access artifacts, or commit completion.
 
-Redis transactions already establish child-registration and dispatch
-boundaries, but a transaction alone does not express every conditional
-version/claim check. Implementation must use a Redis atomic script or an
-equivalently safe compare-and-set mechanism for multi-key state transitions.
-No key layout is mandated here.
+Issue #33 atomic scripts/CAS are scoped to the bundled single-node Redis
+deployment. Do not introduce Redis Cluster hash-tag design without a
+deployment requirement. Any alternative Redis topology requires separate
+validation of multi-key atomicity. AOF and a named volume do not provide an
+unconditional no-loss guarantee; the accepted deployment must state its
+persistence and recovery configuration.
 
-### 10. Issue boundaries and exclusions
+### 14. Issue boundaries and exclusions
 
 **Issue #33** is limited to one Research parent, one Analysis child, one
-delegation wave, non-blocking suspend/yield, durable continuation, canonical
-child completion or failure, parent resumability, one active atomic
-continuation claim, and parent resumption with child outcome incorporation.
-The parent remains owner of the overall goal.
+delegation wave, depth one, non-blocking suspend/yield, durable input and
+continuation, atomic delegation acceptance, canonical completion/failure,
+parent resumability, authenticated pull-claim, and parent resumption with
+child outcome incorporation. The parent remains owner of the overall goal.
 
-**Issue #34** owns multiple children, concurrent dispatch/execution,
-wait-all/partial/timeout/cancellation policies, and their synchronization.
-It uses this task-owned continuation and completion architecture; it does not
-create a second continuation model.
+**Issue #34** owns multiple children, concurrent execution, wait-all/partial/
+timeout/cancellation policies, and their synchronization. It uses this
+task-owned continuation and completion architecture; it does not create a
+second continuation model.
 
 **Issue #35** owns structured aggregation of authoritative child outcomes,
 task/contributor attribution, evidence/source preservation, and
 partial-failure representation. It must not reconstruct results from
 best-effort operational events.
 
-**Issue #36** owns observational tracing through authoritative identifiers
-and execution turns: root task ID; parent/child task IDs; delegation
-proposal/decision ID; routing decision; assignment/claim ID; continuation
-version; canonical terminal outcome; and executor agent ID per turn. Tracing
-may correlate and display these values but can never become authoritative
-lineage, task state, completion, dependency, continuation, or claim state.
+**Issue #36** owns observational tracing through identifiers produced by
+authoritative issue-#33 records and safe operational emitters: root task ID;
+parent/child task IDs; proposal ID; delegation decision ID; routing decision
+ID; assignment ID; claim ID; fencing epoch; continuation version;
+completion command/outcome ID; and executor agent ID plus authenticated
+runtime principal per turn. Secret proof and credential data must never be
+traced. Tracing may correlate and display these values but can never become
+authoritative lineage, task state, completion, dependency, continuation, or
+claim state.
+
+Inference fallback history remains task-scoped and is additionally grouped
+by assignment/turn ID and continuation version where applicable. Attempt
+indices may restart within a turn and must not be deduplicated across turns.
+The task-level projection may aggregate the per-turn histories.
 
 This ADR does not introduce grandchildren, multiple delegation waves,
 arbitrary execution DAGs, sequential plan steps, conditional planning,
@@ -439,46 +574,55 @@ v0.8 memory semantics, general v0.7 planning abstractions, automatic public
 user routing to Analysis, or parallel execution/aggregation inside issue
 #33.
 
-Implementation remains within functional issue #33 but should be delivered
-through bounded increments, without assigning issue numbers here:
+Implementation remains within functional issue #33 but must be delivered
+through bounded sub-issues and PR gates, without assigning issue numbers
+here:
 
-1. Task-input, continuation, and artifact contracts and authoritative
-   storage.
-2. The `TaskAssignment` envelope, authenticated proposer binding, and narrow
-   authorization.
-3. Atomic delegation acceptance and child dispatch.
-4. Completion commands, the trusted projector, and canonical outcomes.
-5. Resumable-parent claim and Research continuation.
+1. TaskInput, continuation, artifact, and root-authority records/storage.
+2. Authenticated runtime principal, pull-claim, TaskAssignment, fencing, and
+   narrow root grant.
+3. Atomic Research -> Analysis delegation acceptance and child claimability.
+4. Universal fenced completion API/projection and canonical outcomes.
+5. Resumed-parent claim, Research continuation, expiry/recovery handling,
+   and turn-aware telemetry.
 6. End-to-end Research -> Analysis -> Research validation.
 
 ### Required invariants
 
 - A waiting parent occupies no agent execution slot.
-- A resumable task can recover its original immutable task input and all
+- A resumable task recovers its original immutable TaskInput and all
   stage-required artifacts without relying on consumed messages or process
   memory.
-- Parent continuation, dependency, and terminal child outcome survive agent
-  and process restart, subject to configured Redis persistence and recovery
-  semantics.
+- TaskInput versions and sealed artifacts are immutable; updates create new
+  versions through explicit authoritative operations.
+- Referenced TaskInput and artifacts cannot expire while any nonterminal
+  task, continuation, dependency, assignment, canonical outcome, or required
+  result can reference them. Post-terminal deletion is configurable and
+  reference-safe.
 - Intermediate Research material is immutable, versioned, task-scoped, and
   provenance-bearing; continuation and child input reference it rather than
   copying it into lineage or control state.
-- Continuation targets a capability, not an agent ID.
-- Child completion, execution failure, and dispatch failure are canonical and
-  durable; operational events are not authoritative.
-- At most one valid executor holds a continuation's active claim/fence.
+- Continuation control state is schema-defined and bounded; larger material
+  uses artifact references. The 16 KiB UTF-8 limit is a provisional initial
+  default, not an interoperability guarantee.
+- Non-secret hints grant no authority and do not change authoritative task
+  state.
+- Every assignment is bound to a unique authenticated runtime principal and
+  current fencing epoch.
+- No agent can directly write canonical task result, continuation, claim,
+  artifact, or terminal-outcome state.
+- At most one valid executor holds an active task-turn claim.
 - A stale executor whose assignment proof or fencing epoch is invalidated
   can never commit task state or completion.
-- Duplicate commands do not duplicate child existence, terminal projection,
-  parent unblocking, or active parent resumption.
-- A delegated child's canonical `TaskResult` is accepted only by trusted
-  platform projection, never by direct agent writes to `task.result`.
-- A terminal outcome for the single child eventually makes the parent
-  resumable, including child failure and dispatch failure.
-- `research -> analysis` is the only initially authorized delegation edge.
-- Delegation does not increase effective authority.
-- The parent task remains owner of the overall goal.
+- Canonical completion and parent unblocking are idempotent and atomic.
+- A terminal child outcome, including `claim_timed_out`, makes the parent
+  resumable with that outcome.
 - Issue #33 permits one child and one delegation wave per root.
+- Operational events and issue-#36 traces are observational, not
+  authoritative.
+- Task-scoped inference history carries assignment/turn identity and
+  continuation version where applicable, so attempt indices from separate
+  turns do not collide.
 
 ## Deferred questions
 
@@ -486,30 +630,33 @@ These are implementation details, not permission to weaken the decisions
 above. They must be resolved and validated before executable delegation is
 enabled:
 
-- Which concrete per-runtime credential and delivery mechanism implements
-  the authenticated Orchestrator assignment/delegation channel, binds queue
-  consumption to that runtime, and protects proof issuance and rotation?
-- What bounded assignment/claim lease duration and heartbeat policy provide
-  useful recovery without allowing stale executors to commit?
-- Which Redis persistence and recovery configuration is required for the
-  completion-command durability needed by the deployment, and what post-ack
-  retention policy reclaims entries without deleting unprojected or pending
-  commands?
-- What exact per-stage continuation field schemas and stable safe failure
-  code set does the issue-#33 contract require?
+- Which unique per-runtime credential and protected API/channel mechanism
+  will be deployed, and how will it be threat-reviewed, rotated, and revoked?
+- What delivery-acknowledgement lease, acknowledged execution-claim lease,
+  and bounded child claim deadline are appropriate?
+- What exact per-stage continuation field schemas, safe failure-code set, and
+  bounded inline TaskResult size does issue #33 require?
+- What Redis persistence and recovery configuration is required for the
+  selected deployment?
+- What post-terminal retention period is appropriate, subject to the
+  reference-safety invariant?
+- Which precise inference telemetry contract changes carry assignment/turn
+  identity without exposing secrets or sensitive event detail?
 
 ## Consequences and tradeoffs
 
 Benefits:
 
-- Durable task state, rather than a live process, owns the work across
+- Durable task state, rather than a live process, owns work across
   suspension, completion, and resumption.
-- A separate completion command path preserves the distinction between
-  authoritative lifecycle commands and bounded, best-effort observability.
-- Canonical failed outcomes allow a parent to resume even when a child fails
-  before producing a normal result.
-- Versioned compare-and-set claims and idempotent projections make duplicate
-  delivery and process restart explicit rather than relying on event timing.
+- Authenticated pull-claim unifies initial, child, and resumed turns while
+  keeping assignment authority out of shared queues.
+- Non-secret hints reduce polling but are safe to lose, duplicate, or replay.
+- Direct idempotent projection centralizes canonical results, outcomes,
+  dependency satisfaction, and parent resumption without a completion
+  consumer group or projector worker.
+- Versioned compare-and-set claims and fencing make stale execution explicit;
+  external effects are not exactly-once.
 - The initial Research-to-Analysis authority edge is narrow, deterministic,
   and compatible with the platform-owned routing and authorization boundary
   in ADR 0006.
@@ -518,22 +665,23 @@ Benefits:
 
 Costs and limitations:
 
+- The Orchestrator becomes the authenticated claim, proposal, artifact, and
+  completion boundary and must be available to runtimes at those points.
+- Unique runtime credentials, claim acknowledgement, API idempotency, and
+  least-privilege Redis permissions require implementation and operational
+  validation.
 - The platform gains authoritative continuation, dependency, terminal
-  outcome, claim/lease, and resumable-work state plus new conditional atomic
+  outcome, claim/lease, and root-authority state plus conditional atomic
   operations.
-- A durable completion stream and trusted projector introduce a worker,
-  consumer-group recovery, monitoring, retention, and operational failure
-  modes absent from the current architecture.
-- Redis queue consumption currently uses destructive `BLPOP`; reliable
-  delegated-task and continuation delivery must be addressed at the
-  assignment boundary without claiming that the current task queues already
-  provide at-least-once processing.
-- Assignment-proof protection requires a private authenticated runtime
-  boundary. The current self-asserted identity and shared Redis behavior are
-  insufficient evidence of such a boundary.
+- Pull-claim removes push-delivery workers but does not eliminate claim
+  deadline evaluation or explicit recovery for acknowledged expired claims.
+- Direct API completion depends on the caller retrying the same command ID
+  after a lost response; Redis persistence remains deployment-bounded.
+- Redis queue consumption currently uses destructive `BLPOP`; hints are
+  non-authoritative and do not make current queues reliable task delivery.
 - A lease and fencing token prevent concurrent authoritative owners but
-  cannot guarantee exactly-once external effects if an executor crashes after
-  performing them. This ADR adds no general execution retry policy.
+  cannot guarantee exactly-once external effects if an executor crashes
+  after performing them. This ADR adds no general execution retry policy.
 - Continuation schemas and their size bounds must be explicit, versioned, and
   reviewed as they evolve; arbitrary model context is not a safe default.
 - Candidate availability and Redis behavior at collaboration scale remain
@@ -543,8 +691,8 @@ Costs and limitations:
 
 ### 1. Blocking in-process wait by the original parent agent
 
-The original Research Agent waits for T101 and then continues T100 in the same
-call stack.
+The original Research Agent waits for the child and then continues the parent
+in the same call stack.
 
 - **Availability/correctness:** Loses progress on process restart and can
   deadlock a serial agent that must execute the child itself. It contradicts
@@ -575,21 +723,22 @@ it.
   complicates #34/#35, and preserves process-local orchestration.
 - **Disposition:** Rejected.
 
-### 3. Durable task-owned suspension and resumption (selected)
+### 3. Durable task-owned suspension and resumption
 
 The parent stores a versioned continuation and dependency, yields, and later
-is atomically claimed and delivered to an eligible capability-matched
-executor.
+is atomically claimed by an authenticated capability-matched executor. This
+is the selected workflow model; assignment delivery and completion use the
+claim and direct-projection decisions above.
 
 - **Availability/correctness:** Survives process replacement; conditional
   writes, fencing, canonical outcomes, and idempotency protect authoritative
   state. External effects are not exactly-once.
 - **Authority/duplicates:** Platform owns acceptance, task identity, routing,
-  claim, and completion projection; requires a protected assignment proof and
-  explicit duplicate semantics.
+  claim, and completion projection; requires a unique authenticated runtime
+  principal, fencing, and explicit duplicate semantics.
 - **Crash recovery/complexity/Redis:** Best fit with Redis authoritative
   status/lineage and transaction precedent, but adds state transitions,
-  durable outbox/command handling, claims, leases, and stream consumers.
+  pull-claims, leases, and atomic projection.
 - **Issues and v0.7:** Supports #34/#35 without a process-specific callback
   or general planning graph; remains a bounded v0.6 barrier.
 - **Disposition:** Selected.
@@ -613,38 +762,35 @@ status/dependencies.
   silently introducing graph policy outside the platform.
 - **Disposition:** Rejected.
 
-### 5. Synchronous Orchestrator completion API
+### 5. Authenticated Orchestrator API with direct atomic projection (selected)
 
 Each agent sends a completion request to a trusted platform API, which
-validates and atomically projects the child outcome and parent transition
-before replying.
+validates the assignment and atomically projects the task outcome and any
+parent transition before replying. The same API provides pull-claim,
+proposal, and authorized artifact access.
 
-- **Availability/correctness:** Centralizes authority and can make one
-  synchronous request idempotent, but completion visibility depends on the
-  API being available at the time the agent reports completion.
+- **Availability/correctness:** Centralizes authority and makes completion
+  visibility depend on the API being available when the agent reports
+  completion. Callers retry with the same stable command ID after a lost
+  response.
 - **Authority/duplicates:** Strong platform control if the API authenticates
   the assignment; clients still need stable command IDs and safe response
   retry behavior.
-- **Crash recovery/complexity/Redis:** Fewer components than a projector, but
-  couples specialist completion latency and availability to the Orchestrator
-  API. A lost response leaves the client uncertain whether the transaction
-  committed.
-- **Issues and v0.7:** The API can project multiple children later, but does
-  not itself provide durable buffering while the platform is unavailable.
-  It is compatible with the task-owned model but less decoupled for #34.
-- **Disposition:** Not selected for the primary completion path. A narrow
-  authenticated API may be used as transport only if it durably accepts a
-  command before acknowledging it; authority and projection remain in the
-  trusted projector.
+- **Crash recovery/complexity/Redis:** Avoids a separate completion stream,
+  consumer group, and projector worker. A lost response is resolved by
+  replaying the same command ID and reading the canonical outcome.
+- **Issues and v0.7:** Supports later bounded multi-child projection without
+  changing the task-owned model; Redis durability remains deployment-bounded.
+- **Disposition:** Selected.
 
-### 6. Durable completion command queue and trusted projector (selected)
+### 6. Durable completion command stream and trusted projector
 
-Agents submit durable task-completion commands; a platform-owned consumer
-validates and projects them idempotently.
+Agents submit task-completion commands to a Redis stream; a platform-owned
+consumer validates and projects them idempotently.
 
-- **Availability/correctness:** Durable buffering decouples agent completion
-  from immediate projector availability. The projector is the one authority
-  that commits terminal outcome and parent unblocking.
+- **Availability/correctness:** Durable buffering can decouple agent
+  completion from immediate projector availability, subject to configured
+  Redis persistence and recovery semantics.
 - **Authority/duplicates:** The command is untrusted input until assignment
   validation; command identity, terminal-state checks, and idempotent
   projection handle redelivery and conflicting commands.
@@ -654,6 +800,6 @@ validates and projects them idempotently.
 - **Issues and v0.7:** Supports independent #34 children and gives #35
   authoritative inputs without prescribing aggregation. It adds no general
   planner or retry policy.
-- **Disposition:** Selected over direct Redis writes and synchronous-only
-  completion because the repository currently has no durable completion
-  projection and agents must not own parent lifecycle authority.
+- **Disposition:** Rejected for issue #33 in favor of the authenticated API
+  with direct idempotent atomic projection. The additional stream/projector
+  boundary is not required for the selected bounded workflow.
