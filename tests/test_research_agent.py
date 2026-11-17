@@ -1280,7 +1280,7 @@ async def test_cloudflare_provider_successful_synthesis() -> None:
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1305,7 +1305,7 @@ async def test_cloudflare_provider_successful_synthesis() -> None:
     mock_client.post.assert_called_once()
     url, kwargs = mock_client.post.call_args[0][0], mock_client.post.call_args[1]
     assert (
-        "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct"
+        "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct"
         in url
     )
     assert kwargs["headers"]["Authorization"] == "Bearer test-tok"
@@ -1340,7 +1340,7 @@ async def test_cloudflare_provider_empty_evidence_formatting() -> None:
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1373,7 +1373,7 @@ async def test_cloudflare_provider_api_failure_error_status() -> None:
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1422,7 +1422,7 @@ async def test_cloudflare_provider_malformed_json_response() -> None:
         headers={"Content-Type": "text/html"},
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1445,7 +1445,7 @@ async def test_cloudflare_provider_malformed_response_missing_result() -> None:
         json={"success": True, "result": None},
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1468,7 +1468,7 @@ async def test_cloudflare_provider_malformed_response_missing_response_string() 
         json={"success": True, "result": {"other_field": 123}},
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -1973,7 +1973,7 @@ async def test_cloudflare_provider_normal_completion(caplog: pytest.LogCaptureFi
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -2024,7 +2024,7 @@ async def test_cloudflare_provider_token_limit_completion(caplog: pytest.LogCapt
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -2073,7 +2073,7 @@ async def test_cloudflare_provider_response_ending_mid_sentence(caplog: pytest.L
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -2113,7 +2113,7 @@ async def test_cloudflare_provider_payload_enforces_requested_number_of_findings
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -2165,7 +2165,7 @@ async def test_cloudflare_provider_payload_forbids_unrequested_additionally_sect
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -2223,7 +2223,7 @@ async def test_research_processor_with_tavily_and_cloudflare_inference() -> None
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/acc-1/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/acc-1/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_cf_client.post.return_value = mock_cf_response
@@ -2894,7 +2894,7 @@ async def test_research_processor_preserves_sources_through_synthesis_and_saves_
         content="Key Findings:\n1. Raft uses leader election and replicated logs.\n\nSources:\n- https://raft.github.io",
         evidence="Grounded evidence snippet",
         provider="cloudflare",
-        model="@cf/meta/llama-3.1-8b-instruct",
+        model="@cf/mistralai/mistral-small-3.1-24b-instruct",
         truncated=False,
     )
 

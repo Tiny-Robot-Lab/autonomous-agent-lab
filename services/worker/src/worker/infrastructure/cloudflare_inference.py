@@ -13,7 +13,7 @@ from agent_infrastructure import CloudflareHealthProbe
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CLOUDFLARE_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+DEFAULT_CLOUDFLARE_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 DEFAULT_CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts"
 DEFAULT_CLOUDFLARE_AI_MAX_TOKENS = 1024
 

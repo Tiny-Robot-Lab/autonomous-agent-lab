@@ -78,6 +78,27 @@ def test_configured_priority_breaks_ties_within_healthy_class() -> None:
     assert dec2.ranked_candidates[1].provider_name == "gemini"
 
 
+def test_provider_selection_cloudflare_primary_gemini_secondary_healthy() -> None:
+    selector = DeterministicProviderSelector()
+    preferences = ["cloudflare", "gemini"]
+    snapshots = [
+        _make_health("cloudflare", InferenceHealthStatus.HEALTHY),
+        _make_health("gemini", InferenceHealthStatus.HEALTHY),
+    ]
+
+    decision = selector.select(preferences, snapshots)
+
+    assert decision.selected_provider == "cloudflare"
+    assert decision.status == InferenceHealthStatus.HEALTHY
+    assert len(decision.ranked_candidates) == 2
+    assert decision.ranked_candidates[0].provider_name == "cloudflare"
+    assert decision.ranked_candidates[0].priority_index == 0
+    assert decision.ranked_candidates[0].health_status == InferenceHealthStatus.HEALTHY
+    assert decision.ranked_candidates[1].provider_name == "gemini"
+    assert decision.ranked_candidates[1].priority_index == 1
+    assert decision.ranked_candidates[1].health_status == InferenceHealthStatus.HEALTHY
+
+
 def test_degraded_remains_eligible_and_breaks_ties_by_priority() -> None:
     selector = DeterministicProviderSelector()
     snapshots = [

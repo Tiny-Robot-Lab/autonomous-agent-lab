@@ -98,3 +98,39 @@ def test_mcp_dependency_isolation_in_service_requirements() -> None:
     assert "mcp>=2.3.0,<3.0.0" in research_reqs
     assert "mcp" not in orchestrator_reqs
     assert "mcp>=2.3.0,<3.0.0" in worker_reqs
+
+
+def test_cloudflare_model_default_consistency() -> None:
+    expected_model = "@cf/mistralai/mistral-small-3.1-24b-instruct"
+    deprecated_model = "@cf/meta/llama-3.1-8b-instruct"
+
+    # 1. .env.example uses the Mistral model
+    env_example = (REPO_ROOT / ".env.example").read_text()
+    assert f"CLOUDFLARE_AI_MODEL={expected_model}" in env_example
+    assert deprecated_model not in env_example
+
+    # 2. compose.yaml reconciles both Worker and Research Agent to the same fallback default
+    compose_yaml = (REPO_ROOT / "compose.yaml").read_text()
+    expected_compose_entry = f"CLOUDFLARE_AI_MODEL: ${{CLOUDFLARE_AI_MODEL:-{expected_model}}}"
+    assert compose_yaml.count(expected_compose_entry) >= 2
+    assert deprecated_model not in compose_yaml
+
+    # 3. Python runtime defaults use the Mistral model
+    from agent_infrastructure.cloudflare_probe import (
+        DEFAULT_CLOUDFLARE_AI_MODEL as PROBE_DEFAULT,
+    )
+    from research_agent.infrastructure.cloudflare_inference import (
+        DEFAULT_CLOUDFLARE_AI_MODEL as RESEARCH_DEFAULT,
+    )
+    from worker.infrastructure.cloudflare_inference import (
+        DEFAULT_CLOUDFLARE_AI_MODEL as WORKER_DEFAULT,
+    )
+
+    assert PROBE_DEFAULT == expected_model
+    assert WORKER_DEFAULT == expected_model
+    assert RESEARCH_DEFAULT == expected_model
+
+    # 4. No committed runtime default remains the deprecated model
+    assert PROBE_DEFAULT != deprecated_model
+    assert WORKER_DEFAULT != deprecated_model
+    assert RESEARCH_DEFAULT != deprecated_model

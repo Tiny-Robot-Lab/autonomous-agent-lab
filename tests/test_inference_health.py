@@ -481,6 +481,44 @@ async def test_cloudflare_health_check_exact_catalog_match_with_uuid_id() -> Non
 
 
 @pytest.mark.anyio
+async def test_cloudflare_health_check_exact_catalog_mistral_model_healthy() -> None:
+    calls = []
+
+    def mock_handler(method, url, headers, params=None, json_data=None):
+        calls.append({"method": method, "url": url, "headers": headers, "params": params})
+        if "/ai/models/search" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "result": [
+                        {
+                            "id": "c007137a-4ec6-4f4c-81ec-4c9194ec710f",
+                            "name": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+                        }
+                    ],
+                },
+            )
+        raise ValueError(f"Unexpected url: {url}")
+
+    client = DummyAsyncClient(mock_handler)
+    probe = CloudflareHealthProbe(
+        account_id="acc123",
+        api_token="secret-token-xyz",
+        model="@cf/mistralai/mistral-small-3.1-24b-instruct",
+        client=client,
+    )
+
+    health = await probe.check_health()
+    assert health.status == InferenceHealthStatus.HEALTHY
+    assert health.model == "@cf/mistralai/mistral-small-3.1-24b-instruct"
+    assert "catalog probe verified model '@cf/mistralai/mistral-small-3.1-24b-instruct' is accessible" in health.reason
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://api.cloudflare.com/client/v4/accounts/acc123/ai/models/search"
+    assert calls[0]["params"] == {"search": "@cf/mistralai/mistral-small-3.1-24b-instruct"}
+
+
+@pytest.mark.anyio
 async def test_cloudflare_health_check_exact_schema_metadata_confirmation_healthy() -> None:
     calls = []
 
@@ -1089,7 +1127,7 @@ async def test_service_adapters_cloudflare_health_delegation() -> None:
     def mock_handler(method, url, headers, params=None, json_data=None):
         return httpx.Response(
             200,
-            json={"success": True, "result": [{"id": "@cf/meta/llama-3.1-8b-instruct"}]},
+            json={"success": True, "result": [{"id": "@cf/mistralai/mistral-small-3.1-24b-instruct"}]},
         )
 
     client = DummyAsyncClient(mock_handler)

@@ -602,7 +602,7 @@ async def test_cloudflare_provider_successful_generate() -> None:
         },
         request=httpx.Request(
             "POST",
-            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct",
         ),
     )
     mock_client.post.return_value = mock_response
@@ -622,7 +622,7 @@ async def test_cloudflare_provider_successful_generate() -> None:
     mock_client.post.assert_called_once()
     url, kwargs = mock_client.post.call_args[0][0], mock_client.post.call_args[1]
     assert (
-        "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/meta/llama-3.1-8b-instruct"
+        "https://api.cloudflare.com/client/v4/accounts/test-acc/ai/run/@cf/mistralai/mistral-small-3.1-24b-instruct"
         in url
     )
     assert kwargs["headers"]["Authorization"] == "Bearer test-tok"
