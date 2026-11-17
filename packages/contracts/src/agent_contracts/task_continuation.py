@@ -39,7 +39,7 @@ class TaskContinuation:
     - Bounded to fixed 16 KiB canonical UTF-8;
     - Stage-specific allowlist of control fields;
     - Strictly references TaskInput and stage artifacts rather than duplicating payloads;
-    - Enforces cross-task authorization on referenced artifacts;
+    - ArtifactReference validates structure only; contextual authorization belongs to later acceptance policy;
     - Forbids process memory, credentials, raw prompts, child outputs, and credential-bearing keys;
     - Versioned and write-once per continuation_version.
     """
@@ -118,12 +118,6 @@ class TaskContinuation:
                 else:
                     raise TypeError(
                         f"artifact_references elements must be ArtifactReference or dict, got {type(ref).__name__}"
-                    )
-                # Cross-task scoping validation: must belong to the parent task
-                if parsed_ref.producing_task_id != clean_parent:
-                    raise ValueError(
-                        f"Cross-task artifact reference rejected: artifact producing task "
-                        f"'{parsed_ref.producing_task_id}' does not match parent task '{clean_parent}'"
                     )
                 clean_refs.append(parsed_ref)
             object.__setattr__(self, "artifact_references", tuple(clean_refs))

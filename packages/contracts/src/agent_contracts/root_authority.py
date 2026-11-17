@@ -14,25 +14,22 @@ BASELINE_DELEGATION_EDGES: tuple[tuple[str, str], ...] = (("research", "analysis
 
 @dataclass(frozen=True)
 class RootAuthorityRecord:
-    """Non-secret root-authority record persisted at root task ingestion.
+    """Non-secret immutable root-authority policy baseline persisted at root task ingestion.
 
     Governed by ADR-0007:
     - Persisted at root ingestion bound to root_task_id;
     - Strictly constrained to the accepted baseline: depth 1, 1 wave, 1 child, research->analysis;
-    - Tracks baseline authority with no credentials, API keys, or secret proofs;
-    - Fixed baseline in #219; no authority escalation permitted.
+    - Tracks immutable baseline authority with no credentials, API keys, or secret proofs;
+    - Fixed baseline in #219; mutable grant/wave state belongs to #220/#221.
     """
 
     root_task_id: str
     created_at: str
-    updated_at: str
     policy_context: str = BASELINE_POLICY_CONTEXT
     max_delegation_depth: int = BASELINE_MAX_DEPTH
     max_delegation_waves: int = BASELINE_MAX_WAVES
     max_children_per_wave: int = BASELINE_MAX_CHILDREN_PER_WAVE
     allowed_delegation_edges: tuple[tuple[str, str], ...] = BASELINE_DELEGATION_EDGES
-    grants_issued: int = 0
-    waves_consumed: int = 0
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -48,10 +45,6 @@ class RootAuthorityRecord:
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ValueError("created_at must be a non-empty string")
         object.__setattr__(self, "created_at", self.created_at.strip())
-
-        if not isinstance(self.updated_at, str) or not self.updated_at.strip():
-            raise ValueError("updated_at must be a non-empty string")
-        object.__setattr__(self, "updated_at", self.updated_at.strip())
 
         if self.policy_context != BASELINE_POLICY_CONTEXT:
             raise ValueError(
@@ -72,16 +65,6 @@ class RootAuthorityRecord:
             raise ValueError(
                 f"RootAuthorityRecord max_children_per_wave must be {BASELINE_MAX_CHILDREN_PER_WAVE}, "
                 f"got {self.max_children_per_wave}"
-            )
-
-        if self.grants_issued != 0:
-            raise ValueError(
-                f"RootAuthorityRecord baseline grants_issued must be 0 at ingestion, got {self.grants_issued}"
-            )
-
-        if self.waves_consumed != 0:
-            raise ValueError(
-                f"RootAuthorityRecord baseline waves_consumed must be 0 at ingestion, got {self.waves_consumed}"
             )
 
         if not isinstance(self.allowed_delegation_edges, (list, tuple)):
@@ -115,10 +98,7 @@ class RootAuthorityRecord:
             max_delegation_waves=BASELINE_MAX_WAVES,
             max_children_per_wave=BASELINE_MAX_CHILDREN_PER_WAVE,
             allowed_delegation_edges=BASELINE_DELEGATION_EDGES,
-            grants_issued=0,
-            waves_consumed=0,
             created_at=now,
-            updated_at=now,
             version=1,
         )
 
@@ -126,15 +106,12 @@ class RootAuthorityRecord:
         return {
             "allowed_delegation_edges": [list(edge) for edge in self.allowed_delegation_edges],
             "created_at": self.created_at,
-            "grants_issued": self.grants_issued,
             "max_children_per_wave": self.max_children_per_wave,
             "max_delegation_depth": self.max_delegation_depth,
             "max_delegation_waves": self.max_delegation_waves,
             "policy_context": self.policy_context,
             "root_task_id": self.root_task_id,
-            "updated_at": self.updated_at,
             "version": self.version,
-            "waves_consumed": self.waves_consumed,
         }
 
     def to_json(self) -> str:
@@ -148,15 +125,12 @@ class RootAuthorityRecord:
         allowed_fields = {
             "allowed_delegation_edges",
             "created_at",
-            "grants_issued",
             "max_children_per_wave",
             "max_delegation_depth",
             "max_delegation_waves",
             "policy_context",
             "root_task_id",
-            "updated_at",
             "version",
-            "waves_consumed",
         }
         unexpected_fields = data.keys() - allowed_fields
         if unexpected_fields:
@@ -171,7 +145,7 @@ class RootAuthorityRecord:
         else:
             version = 1
 
-        required = ("root_task_id", "created_at", "updated_at")
+        required = ("root_task_id", "created_at")
         for field_name in required:
             if field_name not in data:
                 raise ValueError(f"{field_name} is required")
@@ -189,10 +163,7 @@ class RootAuthorityRecord:
             max_delegation_waves=data.get("max_delegation_waves", BASELINE_MAX_WAVES),
             max_children_per_wave=data.get("max_children_per_wave", BASELINE_MAX_CHILDREN_PER_WAVE),
             allowed_delegation_edges=edges,
-            grants_issued=data.get("grants_issued", 0),
-            waves_consumed=data.get("waves_consumed", 0),
             created_at=data["created_at"],
-            updated_at=data["updated_at"],
             version=version,
         )
 

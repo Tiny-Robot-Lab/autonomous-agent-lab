@@ -44,6 +44,7 @@ def canonical_json_dumps(obj: Any) -> str:
     - Sorted dictionary keys (sort_keys=True)
     - Compact standard separators (",", ":") with no extra whitespace
     - Direct UTF-8 representation without escaping non-ASCII (ensure_ascii=False)
+    - Rejection of out-of-range floats (NaN, +inf, -inf) per JSON specification (allow_nan=False)
     """
     plain = to_plain_json_structure(obj)
     return json.dumps(
@@ -51,6 +52,7 @@ def canonical_json_dumps(obj: Any) -> str:
         sort_keys=True,
         separators=CANONICAL_JSON_SEPARATORS,
         ensure_ascii=False,
+        allow_nan=False,
     )
 
 

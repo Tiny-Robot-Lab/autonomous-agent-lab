@@ -50,26 +50,43 @@ CAPABILITY_QUEUE_MAP: dict[AgentCapability, str] = {
 }
 
 REGISTER_ROOT_TASK_LUA = """
-local exists_status = redis.call('EXISTS', KEYS[1])
-local exists_lineage = redis.call('EXISTS', KEYS[2])
-local exists_input = redis.call('EXISTS', KEYS[3])
-local exists_authority = redis.call('EXISTS', KEYS[4])
+local marker_key = KEYS[1]
+local status_key = KEYS[2]
+local lineage_key = KEYS[3]
+local input_key = KEYS[4]
+local authority_key = KEYS[5]
 
-if exists_status == 0 and exists_lineage == 0 and exists_input == 0 and exists_authority == 0 then
-    redis.call('SET', KEYS[1], ARGV[1])
-    redis.call('SET', KEYS[2], ARGV[2])
-    redis.call('SET', KEYS[3], ARGV[3])
-    redis.call('SET', KEYS[4], ARGV[4])
+local marker_payload = ARGV[1]
+local initial_status_json = ARGV[2]
+local lineage_json = ARGV[3]
+local input_json = ARGV[4]
+local authority_json = ARGV[5]
+local expected_task_id = ARGV[6]
+
+local exists_marker = redis.call('EXISTS', marker_key)
+local exists_status = redis.call('EXISTS', status_key)
+local exists_lineage = redis.call('EXISTS', lineage_key)
+local exists_input = redis.call('EXISTS', input_key)
+local exists_authority = redis.call('EXISTS', authority_key)
+
+if exists_marker == 0 and exists_status == 0 and exists_lineage == 0 and exists_input == 0 and exists_authority == 0 then
+    redis.call('SET', marker_key, marker_payload)
+    redis.call('SET', status_key, initial_status_json)
+    redis.call('SET', lineage_key, lineage_json)
+    redis.call('SET', input_key, input_json)
+    redis.call('SET', authority_key, authority_json)
     return 'OK'
 end
 
-if exists_status == 1 and exists_lineage == 1 and exists_input == 1 and exists_authority == 1 then
-    local cur_status = redis.call('GET', KEYS[1])
-    local cur_lineage = redis.call('GET', KEYS[2])
-    local cur_input = redis.call('GET', KEYS[3])
-    local cur_authority = redis.call('GET', KEYS[4])
-    if cur_lineage == ARGV[2] and cur_input == ARGV[3] and cur_authority == ARGV[4] then
-        if cur_status == ARGV[1] or string.find(cur_status, ARGV[5], 1, true) then
+if exists_marker == 1 and exists_status == 1 and exists_lineage == 1 and exists_input == 1 and exists_authority == 1 then
+    local cur_marker = redis.call('GET', marker_key)
+    local cur_lineage = redis.call('GET', lineage_key)
+    local cur_input = redis.call('GET', input_key)
+    local cur_authority = redis.call('GET', authority_key)
+    if cur_marker == marker_payload and cur_lineage == lineage_json and cur_input == input_json and cur_authority == authority_json then
+        local cur_status = redis.call('GET', status_key)
+        local ok, status_tbl = pcall(cjson.decode, cur_status)
+        if ok and type(status_tbl) == 'table' and status_tbl['task_id'] == expected_task_id and type(status_tbl['status']) == 'string' then
             return 'IDEMPOTENT'
         end
     end
@@ -139,26 +156,48 @@ local latest_key = KEYS[2]
 local version = tonumber(ARGV[1])
 local payload = ARGV[2]
 
-if version > 1 then
-    local prior_key = KEYS[3]
-    if (not prior_key) or redis.call('EXISTS', prior_key) == 0 then
-        return 'NON_CONTIGUOUS'
-    end
-end
-
 if redis.call('EXISTS', target_key) == 0 then
-    redis.call('SET', target_key, payload)
-    local cur_latest = redis.call('GET', latest_key)
-    if (not cur_latest) or (tonumber(cur_latest) < version) then
-        redis.call('SET', latest_key, tostring(version))
+    if version == 1 then
+        if redis.call('EXISTS', latest_key) == 1 then
+            return 'CORRUPT_POINTER'
+        end
+    else
+        if redis.call('EXISTS', latest_key) == 0 then
+            return 'CORRUPT_POINTER'
+        end
+        local cur_latest_raw = redis.call('GET', latest_key)
+        if (not cur_latest_raw) or (not string.match(cur_latest_raw, '^%d+$')) then
+            return 'CORRUPT_POINTER'
+        end
+        local cur_latest = tonumber(cur_latest_raw)
+        if cur_latest >= version then
+            return 'CORRUPT_POINTER'
+        end
+        if cur_latest < version - 1 then
+            return 'NON_CONTIGUOUS'
+        end
+        local prior_key = KEYS[3]
+        if (not prior_key) or redis.call('EXISTS', prior_key) == 0 then
+            return 'NON_CONTIGUOUS'
+        end
     end
+
+    redis.call('SET', target_key, payload)
+    redis.call('SET', latest_key, tostring(version))
     return 'OK'
 else
     local existing = redis.call('GET', target_key)
     if existing == payload then
-        local cur_latest = redis.call('GET', latest_key)
-        if (not cur_latest) or (tonumber(cur_latest) < version) then
-            redis.call('SET', latest_key, tostring(version))
+        if redis.call('EXISTS', latest_key) == 0 then
+            return 'CORRUPT_POINTER'
+        end
+        local cur_latest_raw = redis.call('GET', latest_key)
+        if (not cur_latest_raw) or (not string.match(cur_latest_raw, '^%d+$')) then
+            return 'CORRUPT_POINTER'
+        end
+        local cur_latest = tonumber(cur_latest_raw)
+        if cur_latest < version then
+            return 'CORRUPT_POINTER'
         end
         return 'IDEMPOTENT'
     else
@@ -209,11 +248,16 @@ class RedisGateway:
             created_at=task.created_at,
         )
 
+        marker_key = f"task.registration:{task.task_id}"
         status_key = f"task.status:{task.task_id}"
         lineage_key = f"task.lineage:{task.task_id}"
         input_key = f"task.input:{task.task_id}:1"
         authority_key = f"task.authority:{task.task_id}"
 
+        marker_json = canonical_json_dumps({
+            "registered_at": task.created_at,
+            "task_id": task.task_id,
+        })
         status_json = canonical_json_dumps({
             "status": initial_status,
             "task_id": task.task_id,
@@ -225,20 +269,21 @@ class RedisGateway:
         })
         input_json = task_input.to_json()
         authority_json = root_authority.to_json()
-        task_id_needle = f'"task_id":"{task.task_id}"'
 
         raw_result = await self._client.eval(
             REGISTER_ROOT_TASK_LUA,
-            4,
+            5,
+            marker_key,
             status_key,
             lineage_key,
             input_key,
             authority_key,
+            marker_json,
             status_json,
             lineage_json,
             input_json,
             authority_json,
-            task_id_needle,
+            task.task_id,
         )
         result = (
             raw_result.decode("utf-8")
@@ -519,6 +564,11 @@ class RedisGateway:
                 f"Cannot save TaskContinuation version {continuation.continuation_version} "
                 f"for parent task '{continuation.parent_task_id}' because prior version "
                 f"{continuation.continuation_version - 1} does not exist"
+            )
+        if result == "CORRUPT_POINTER":
+            raise CorruptAuthoritativeRecordError(
+                f"Continuation latest pointer for parent task '{continuation.parent_task_id}' "
+                f"is corrupt or inconsistent with version {continuation.continuation_version}"
             )
         if result == "CONFLICT":
             raise ConflictingContinuationError(

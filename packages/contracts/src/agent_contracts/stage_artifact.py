@@ -40,6 +40,7 @@ class StageArtifact:
     created_at: str
     producing_turn_id: str | None = None
     artifact_version: int = 1
+    payload_schema_version: int = 1
     sealed: bool = True
     metadata: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
@@ -49,6 +50,11 @@ class StageArtifact:
             raise TypeError(f"version must be an int, got {type(self.version).__name__}")
         if self.version != 1:
             raise ValueError(f"Unsupported contract version: {self.version}")
+
+        if type(self.payload_schema_version) is bool or not isinstance(self.payload_schema_version, int):
+            raise TypeError(f"payload_schema_version must be an int, got {type(self.payload_schema_version).__name__}")
+        if self.payload_schema_version != 1:
+            raise ValueError(f"Unsupported payload_schema_version: {self.payload_schema_version}")
 
         if type(self.artifact_version) is bool or not isinstance(self.artifact_version, int):
             raise TypeError(f"artifact_version must be an int, got {type(self.artifact_version).__name__}")
@@ -88,6 +94,22 @@ class StageArtifact:
             raise TypeError(f"content must be a dict or Mapping, got {type(self.content).__name__}")
         if not self.content:
             raise ValueError("content must not be empty")
+
+        if clean_type == "research_material":
+            if set(self.content.keys()) != {"material"}:
+                raise ValueError(
+                    f"research_material content must contain only 'material' field, got: {sorted(self.content.keys())}"
+                )
+            if not isinstance(self.content["material"], str) or not self.content["material"].strip():
+                raise ValueError("research_material content 'material' must be a non-empty string")
+        elif clean_type == "analysis_summary":
+            if set(self.content.keys()) != {"summary"}:
+                raise ValueError(
+                    f"analysis_summary content must contain only 'summary' field, got: {sorted(self.content.keys())}"
+                )
+            if not isinstance(self.content["summary"], str) or not self.content["summary"].strip():
+                raise ValueError("analysis_summary content 'summary' must be a non-empty string")
+
         check_no_credential_bearing_keys(self.content, "StageArtifact content")
         object.__setattr__(self, "content", freeze_value(self.content))
 
@@ -117,6 +139,7 @@ class StageArtifact:
         content: Mapping[str, Any],
         producing_turn_id: str | None = None,
         artifact_version: int = 1,
+        payload_schema_version: int = 1,
         metadata: Mapping[str, Any] | None = None,
     ) -> "StageArtifact":
         return cls(
@@ -127,6 +150,7 @@ class StageArtifact:
             content=content,
             created_at=datetime.now(UTC).isoformat(),
             artifact_version=artifact_version,
+            payload_schema_version=payload_schema_version,
             sealed=True,
             metadata=metadata or {},
             version=1,
@@ -140,6 +164,7 @@ class StageArtifact:
             "content": to_plain_json_structure(self.content),
             "created_at": self.created_at,
             "metadata": to_plain_json_structure(self.metadata),
+            "payload_schema_version": self.payload_schema_version,
             "producing_task_id": self.producing_task_id,
             "producing_turn_id": self.producing_turn_id,
             "sealed": self.sealed,
@@ -161,6 +186,7 @@ class StageArtifact:
             "content",
             "created_at",
             "metadata",
+            "payload_schema_version",
             "producing_task_id",
             "producing_turn_id",
             "sealed",
@@ -178,6 +204,15 @@ class StageArtifact:
                 raise ValueError(f"Unsupported contract version: {version}")
         else:
             version = 1
+
+        if "payload_schema_version" in data:
+            payload_schema_version = data["payload_schema_version"]
+            if type(payload_schema_version) is bool or not isinstance(payload_schema_version, int):
+                raise TypeError(f"payload_schema_version must be an int, got {type(payload_schema_version).__name__}")
+            if payload_schema_version != 1:
+                raise ValueError(f"Unsupported payload_schema_version: {payload_schema_version}")
+        else:
+            payload_schema_version = 1
 
         required = ("artifact_id", "producing_task_id", "artifact_type", "content", "created_at")
         for field_name in required:
@@ -200,6 +235,7 @@ class StageArtifact:
             content=content,
             created_at=data["created_at"],
             artifact_version=data.get("artifact_version", 1),
+            payload_schema_version=payload_schema_version,
             sealed=data.get("sealed", True),
             metadata=metadata,
             version=version,

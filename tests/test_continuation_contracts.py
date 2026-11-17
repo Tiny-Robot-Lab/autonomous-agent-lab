@@ -100,6 +100,20 @@ def test_canonical_json_dumps_deterministic_and_compact() -> None:
     assert serialized == '{"a":2,"m":{"a":4,"b":3},"z":1}'
 
 
+def test_canonical_json_dumps_rejects_nan_and_inf() -> None:
+    # NaN rejected
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_json_dumps({"nan_val": float("nan")})
+
+    # +Infinity rejected
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_json_dumps({"inf_val": float("inf")})
+
+    # -Infinity rejected in nested structure
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_json_dumps({"nested": [1, 2, {"neg_inf": float("-inf")}]})
+
+
 def test_credential_bearing_key_detection() -> None:
     # Forbidden tokens and compound keys
     assert is_credential_bearing_key("api_key") is True
@@ -181,6 +195,10 @@ def test_artifact_reference_validation_errors() -> None:
 
     with pytest.raises(TypeError, match="artifact_version must be an int"):
         ArtifactReference("p-1", "art-1", True)  # type: ignore[arg-type]
+
+    # Required pinned integer version >= 1: implicit latest resolution prohibited
+    with pytest.raises(ValueError, match="artifact_version is required"):
+        ArtifactReference.from_dict({"producing_task_id": "p-1", "artifact_id": "art-1"})
 
 
 # ==============================================================================
@@ -321,9 +339,10 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
         producing_turn_id="turn-claim-1",
         artifact_type="research_material",
         artifact_version=1,
+        payload_schema_version=1,
         created_at=now,
         sealed=True,
-        content={"findings": ["finding-1", "finding-2"], "count": 2},
+        content={"material": "verified research material content"},
         metadata={"schema_version": "v1.0"},
         version=1,
     )
@@ -333,7 +352,8 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
     assert artifact.producing_turn_id == "turn-claim-1"
     assert artifact.sealed is True
     assert artifact.artifact_type == "research_material"
-    assert artifact.content == {"findings": ("finding-1", "finding-2"), "count": 2}
+    assert artifact.payload_schema_version == 1
+    assert artifact.content == {"material": "verified research material content"}
 
     # Deep immutability
     with pytest.raises(TypeError):
@@ -343,6 +363,7 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
     assert d["artifact_id"] == "art-999"
     assert d["sealed"] is True
     assert d["artifact_type"] == "research_material"
+    assert d["payload_schema_version"] == 1
 
     from_dict_artifact = StageArtifact.from_dict(d)
     assert from_dict_artifact == artifact
@@ -351,24 +372,101 @@ def test_stage_artifact_valid_creation_and_roundtrip() -> None:
     assert from_json_artifact == artifact
 
 
-def test_stage_artifact_allowlisted_types() -> None:
+def test_stage_artifact_payload_schema_version_enforced() -> None:
     now = datetime.now(UTC).isoformat()
-    for valid_type in ALLOWED_ARTIFACT_TYPES:
-        art = StageArtifact(
+
+    # payload_schema_version != 1 rejected
+    with pytest.raises(ValueError, match="Unsupported payload_schema_version: 2"):
+        StageArtifact(
             artifact_id="art-1",
             producing_task_id="task-1",
-            artifact_type=valid_type,
-            content={"sample": "data"},
+            artifact_type="research_material",
+            content={"material": "data"},
+            payload_schema_version=2,
             created_at=now,
         )
-        assert art.artifact_type == valid_type
 
+    # non-int payload_schema_version rejected
+    with pytest.raises(TypeError, match="payload_schema_version must be an int"):
+        StageArtifact(
+            artifact_id="art-1",
+            producing_task_id="task-1",
+            artifact_type="research_material",
+            content={"material": "data"},
+            payload_schema_version=True,  # type: ignore[arg-type]
+            created_at=now,
+        )
+
+
+def test_stage_artifact_content_schemas_and_allowlisted_types() -> None:
+    now = datetime.now(UTC).isoformat()
+
+    assert "research_material" in ALLOWED_ARTIFACT_TYPES
+    assert "analysis_summary" in ALLOWED_ARTIFACT_TYPES
+
+    # research_material requires non-empty material string and rejects any other keys
+    res_art = StageArtifact(
+        artifact_id="art-res",
+        producing_task_id="task-1",
+        artifact_type="research_material",
+        content={"material": "valid research material"},
+        created_at=now,
+    )
+    assert res_art.content["material"] == "valid research material"
+
+    with pytest.raises(ValueError, match="research_material content must contain only 'material' field"):
+        StageArtifact(
+            artifact_id="art-res-bad",
+            producing_task_id="task-1",
+            artifact_type="research_material",
+            content={"material": "text", "extra_field": "disallowed"},
+            created_at=now,
+        )
+
+    with pytest.raises(ValueError, match="research_material content 'material' must be a non-empty string"):
+        StageArtifact(
+            artifact_id="art-res-empty",
+            producing_task_id="task-1",
+            artifact_type="research_material",
+            content={"material": "   "},
+            created_at=now,
+        )
+
+    # analysis_summary requires non-empty summary string and rejects any other keys
+    ana_art = StageArtifact(
+        artifact_id="art-ana",
+        producing_task_id="task-1",
+        artifact_type="analysis_summary",
+        content={"summary": "valid analysis summary"},
+        created_at=now,
+    )
+    assert ana_art.content["summary"] == "valid analysis summary"
+
+    with pytest.raises(ValueError, match="analysis_summary content must contain only 'summary' field"):
+        StageArtifact(
+            artifact_id="art-ana-bad",
+            producing_task_id="task-1",
+            artifact_type="analysis_summary",
+            content={"summary": "text", "extra_field": "disallowed"},
+            created_at=now,
+        )
+
+    with pytest.raises(ValueError, match="analysis_summary content 'summary' must be a non-empty string"):
+        StageArtifact(
+            artifact_id="art-ana-empty",
+            producing_task_id="task-1",
+            artifact_type="analysis_summary",
+            content={"summary": ""},
+            created_at=now,
+        )
+
+    # Unallowlisted artifact type
     with pytest.raises(ValueError, match="Unknown artifact_type"):
         StageArtifact(
             artifact_id="art-1",
             producing_task_id="task-1",
             artifact_type="arbitrary_unallowlisted_type",
-            content={"sample": "data"},
+            content={"material": "data"},
             created_at=now,
         )
 
@@ -406,7 +504,7 @@ def test_stage_artifact_size_bound_64kib() -> None:
         artifact_id="art-1",
         producing_task_id="task-1",
         artifact_type="research_material",
-        content={"data": "a" * 1000},
+        content={"material": "a" * 1000},
         created_at=now,
     )
     assert valid.byte_size() <= MAX_STAGE_ARTIFACT_BYTES
@@ -417,22 +515,13 @@ def test_stage_artifact_size_bound_64kib() -> None:
             artifact_id="art-1",
             producing_task_id="task-1",
             artifact_type="research_material",
-            content={"data": "a" * 66000},
+            content={"material": "a" * 66000},
             created_at=now,
         )
 
 
 def test_stage_artifact_credential_detection() -> None:
     now = datetime.now(UTC).isoformat()
-    # Content with credential key
-    with pytest.raises(ValueError, match="Credential-bearing key 'client_secret'"):
-        StageArtifact(
-            artifact_id="art-1",
-            producing_task_id="task-1",
-            artifact_type="research_material",
-            content={"client_secret": "leak"},
-            created_at=now,
-        )
 
     # Metadata with credential key
     with pytest.raises(ValueError, match="Credential-bearing key 'access_token'"):
@@ -440,7 +529,7 @@ def test_stage_artifact_credential_detection() -> None:
             artifact_id="art-1",
             producing_task_id="task-1",
             artifact_type="research_material",
-            content={"valid": "content"},
+            content={"material": "content"},
             metadata={"access_token": "leak"},
             created_at=now,
         )
@@ -495,19 +584,19 @@ def test_task_continuation_valid_creation_and_roundtrip() -> None:
     assert from_json_cont == continuation
 
 
-def test_task_continuation_cross_task_scoping_enforcement() -> None:
+def test_task_continuation_structural_artifact_references_accepted() -> None:
     now = datetime.now(UTC).isoformat()
-    # Artifact produced by foreign task must be rejected
-    foreign_ref = ArtifactReference("foreign-task-999", "art-1", 1)
-    with pytest.raises(ValueError, match="Cross-task artifact reference rejected"):
-        TaskContinuation(
-            parent_task_id="parent-123",
-            child_task_id="child-456",
-            control_fields={"analysis_focus": "test"},
-            artifact_references=(foreign_ref,),
-            created_at=now,
-            updated_at=now,
-        )
+    # ArtifactReference validates structure only; contextual cross-task authorization belongs to #221
+    foreign_ref = ArtifactReference("other-task-999", "art-1", 1)
+    continuation = TaskContinuation(
+        parent_task_id="parent-123",
+        child_task_id="child-456",
+        control_fields={"analysis_focus": "test"},
+        artifact_references=(foreign_ref,),
+        created_at=now,
+        updated_at=now,
+    )
+    assert continuation.artifact_references == (foreign_ref,)
 
 
 def test_task_continuation_stage_and_control_fields_allowlist() -> None:
@@ -587,10 +676,7 @@ def test_root_authority_record_valid_creation_and_roundtrip() -> None:
         max_delegation_waves=1,
         max_children_per_wave=1,
         allowed_delegation_edges=(("research", "analysis"),),
-        grants_issued=0,
-        waves_consumed=0,
         created_at=now,
-        updated_at=now,
         version=1,
     )
 
@@ -599,8 +685,6 @@ def test_root_authority_record_valid_creation_and_roundtrip() -> None:
     assert auth.max_delegation_waves == 1
     assert auth.max_children_per_wave == 1
     assert auth.allowed_delegation_edges == (("research", "analysis"),)
-    assert auth.grants_issued == 0
-    assert auth.waves_consumed == 0
 
     d = auth.to_dict()
     assert d["root_task_id"] == "root-100"
@@ -621,8 +705,6 @@ def test_root_authority_create_default() -> None:
     assert auth.max_delegation_waves == 1
     assert auth.max_children_per_wave == 1
     assert auth.allowed_delegation_edges == (("research", "analysis"),)
-    assert auth.grants_issued == 0
-    assert auth.waves_consumed == 0
     assert auth.version == 1
 
 
@@ -635,7 +717,6 @@ def test_root_authority_baseline_invariants_enforced() -> None:
             root_task_id="root-1",
             policy_context="escalated_context",
             created_at=now,
-            updated_at=now,
         )
 
     # max_delegation_depth != 1
@@ -644,7 +725,6 @@ def test_root_authority_baseline_invariants_enforced() -> None:
             root_task_id="root-1",
             max_delegation_depth=2,
             created_at=now,
-            updated_at=now,
         )
 
     # max_delegation_waves != 1
@@ -653,7 +733,6 @@ def test_root_authority_baseline_invariants_enforced() -> None:
             root_task_id="root-1",
             max_delegation_waves=2,
             created_at=now,
-            updated_at=now,
         )
 
     # max_children_per_wave != 1
@@ -662,25 +741,6 @@ def test_root_authority_baseline_invariants_enforced() -> None:
             root_task_id="root-1",
             max_children_per_wave=2,
             created_at=now,
-            updated_at=now,
-        )
-
-    # grants_issued != 0
-    with pytest.raises(ValueError, match="grants_issued must be 0 at ingestion"):
-        RootAuthorityRecord(
-            root_task_id="root-1",
-            grants_issued=1,
-            created_at=now,
-            updated_at=now,
-        )
-
-    # waves_consumed != 0
-    with pytest.raises(ValueError, match="waves_consumed must be 0 at ingestion"):
-        RootAuthorityRecord(
-            root_task_id="root-1",
-            waves_consumed=1,
-            created_at=now,
-            updated_at=now,
         )
 
     # allowed_delegation_edges != (("research", "analysis"),)
@@ -689,5 +749,4 @@ def test_root_authority_baseline_invariants_enforced() -> None:
             root_task_id="root-1",
             allowed_delegation_edges=(("general", "analysis"),),
             created_at=now,
-            updated_at=now,
         )

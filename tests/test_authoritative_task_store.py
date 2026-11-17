@@ -43,6 +43,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
 
     def __init__(self) -> None:
         self.statuses: dict[str, str] = {}
+        self.registrations: dict[str, dict[str, Any]] = {}
         self.lineages: dict[str, TaskLineage] = {}
         self.children: dict[str, set[str]] = {}
         self.inputs: dict[tuple[str, int], TaskInput] = {}
@@ -63,12 +64,17 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             self.fail_next_registration = False
             raise RuntimeError("Simulated pipeline failure during root registration")
 
+        exists_marker = task.task_id in self.registrations
         exists_status = task.task_id in self.statuses
         exists_lineage = task.task_id in self.lineages
         exists_input = (task.task_id, 1) in self.inputs
         exists_authority = task.task_id in self.authorities
 
-        if not (exists_status or exists_lineage or exists_input or exists_authority):
+        if not (exists_marker or exists_status or exists_lineage or exists_input or exists_authority):
+            self.registrations[task.task_id] = {
+                "registered_at": task.created_at,
+                "task_id": task.task_id,
+            }
             self.statuses[task.task_id] = initial_status
             self.lineages[task.task_id] = TaskLineage(
                 task_id=task.task_id,
@@ -91,14 +97,18 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             self.root_registrations.append((task, initial_status))
             return
 
-        if exists_status and exists_lineage and exists_input and exists_authority:
+        if exists_marker and exists_status and exists_lineage and exists_input and exists_authority:
+            existing_marker = self.registrations[task.task_id]
             existing_lineage = self.lineages[task.task_id]
             existing_input = self.inputs[(task.task_id, 1)]
             existing_authority = self.authorities[task.task_id]
+            existing_status = self.statuses[task.task_id]
             if (
-                existing_lineage.root_task_id == task.root_task_id
+                existing_marker.get("task_id") == task.task_id
+                and existing_lineage.root_task_id == task.root_task_id
                 and existing_input.prompt == task.prompt
                 and existing_authority.root_task_id == task.task_id
+                and isinstance(existing_status, str)
             ):
                 return
             raise ConflictingRootTaskRegistrationError(
@@ -188,26 +198,55 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         return self.artifacts.get((producing_task_id.strip(), artifact_id.strip(), artifact_version))
 
     async def save_continuation(self, continuation: TaskContinuation) -> None:
-        if continuation.continuation_version > 1:
-            prior_key = (continuation.parent_task_id, continuation.continuation_version - 1)
-            if prior_key not in self.continuations:
-                raise NonContiguousVersionError(
-                    f"Cannot save TaskContinuation version {continuation.continuation_version} "
-                    f"for parent task '{continuation.parent_task_id}' because prior version "
-                    f"{continuation.continuation_version - 1} does not exist"
-                )
         key = (continuation.parent_task_id, continuation.continuation_version)
-        if key in self.continuations:
-            if self.continuations[key] == continuation:
-                return
-            raise ConflictingContinuationError(
-                f"TaskContinuation for parent task '{continuation.parent_task_id}' "
-                f"version {continuation.continuation_version} already exists with conflicting data"
-            )
-        self.continuations[key] = continuation
-        cur_latest = self.latest_continuation.get(continuation.parent_task_id, 0)
-        if continuation.continuation_version > cur_latest:
+        if key not in self.continuations:
+            if continuation.continuation_version == 1:
+                if continuation.parent_task_id in self.latest_continuation:
+                    raise CorruptAuthoritativeRecordError(
+                        "Continuation latest pointer already exists for version 1 creation"
+                    )
+            else:
+                if continuation.parent_task_id not in self.latest_continuation:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Continuation latest pointer is missing for version {continuation.continuation_version}"
+                    )
+                cur_latest = self.latest_continuation[continuation.parent_task_id]
+                if cur_latest >= continuation.continuation_version:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Continuation latest pointer is corrupt: {cur_latest}"
+                    )
+                if cur_latest < continuation.continuation_version - 1:
+                    raise NonContiguousVersionError(
+                        f"Cannot save TaskContinuation version {continuation.continuation_version} "
+                        f"for parent task '{continuation.parent_task_id}' because prior version "
+                        f"{continuation.continuation_version - 1} does not exist"
+                    )
+                prior_key = (continuation.parent_task_id, continuation.continuation_version - 1)
+                if prior_key not in self.continuations:
+                    raise NonContiguousVersionError(
+                        f"Cannot save TaskContinuation version {continuation.continuation_version} "
+                        f"for parent task '{continuation.parent_task_id}' because prior version "
+                        f"{continuation.continuation_version - 1} does not exist"
+                    )
+            self.continuations[key] = continuation
             self.latest_continuation[continuation.parent_task_id] = continuation.continuation_version
+            return
+
+        if self.continuations[key] == continuation:
+            if continuation.parent_task_id not in self.latest_continuation:
+                raise CorruptAuthoritativeRecordError(
+                    "Continuation latest pointer is missing during replay"
+                )
+            cur_latest = self.latest_continuation[continuation.parent_task_id]
+            if cur_latest < continuation.continuation_version:
+                raise CorruptAuthoritativeRecordError(
+                    f"Continuation latest pointer is corrupt during replay: {cur_latest}"
+                )
+            return
+        raise ConflictingContinuationError(
+            f"TaskContinuation for parent task '{continuation.parent_task_id}' "
+            f"version {continuation.continuation_version} already exists with conflicting data"
+        )
 
     async def get_continuation(
         self, parent_task_id: str, continuation_version: int = 1
@@ -846,7 +885,7 @@ async def test_in_memory_stage_artifact_write_once_semantics() -> None:
         artifact_id="art-1",
         producing_task_id="t-parent",
         artifact_type="research_material",
-        content={"key": "val1"},
+        content={"material": "val1"},
         created_at=now,
         artifact_version=1,
     )
@@ -863,7 +902,7 @@ async def test_in_memory_stage_artifact_write_once_semantics() -> None:
         artifact_id="art-1",
         producing_task_id="t-parent",
         artifact_type="research_material",
-        content={"key": "val-conflict"},
+        content={"material": "val-conflict"},
         created_at=now,
         artifact_version=1,
     )
@@ -916,7 +955,6 @@ async def test_in_memory_root_authority_write_once_semantics() -> None:
         root_task_id="r-1",
         policy_context="default",
         created_at=now,
-        updated_at=now,
     )
 
     await store.save_root_authority(auth)
@@ -964,8 +1002,6 @@ async def test_submit_task_root_ingestion_persists_durable_input_and_authority()
     assert authority.root_task_id == task_id
     assert authority.max_delegation_depth == 1
     assert authority.max_delegation_waves == 1
-    assert authority.grants_issued == 0
-    assert authority.waves_consumed == 0
 
 
 @pytest.mark.anyio
@@ -1029,7 +1065,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
         artifact_id="art-1",
         producing_task_id="t-1",
         artifact_type="research_material",
-        content={"data": "sample"},
+        content={"material": "sample"},
         created_at=now,
         artifact_version=1,
     )
@@ -1049,7 +1085,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
         artifact_id="art-1",
         producing_task_id="t-1",
         artifact_type="research_material",
-        content={"data": "conflicting_sample"},
+        content={"material": "conflicting_sample"},
         created_at=now,
         artifact_version=1,
     )
@@ -1062,7 +1098,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
         artifact_id="art-1",
         producing_task_id="t-1",
         artifact_type="research_material",
-        content={"data": "v3"},
+        content={"material": "v3"},
         created_at=now,
         artifact_version=3,
     )
@@ -1131,6 +1167,11 @@ async def test_redis_gateway_continuation_roundtrip_and_conflict() -> None:
     with pytest.raises(NonContiguousVersionError, match="prior version 2 does not exist"):
         await gateway.save_continuation(cont_v3)
 
+    # 4b. Corrupt latest pointer write (Lua returns CORRUPT_POINTER)
+    gateway._client.eval = AsyncMock(return_value="CORRUPT_POINTER")
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Continuation latest pointer"):
+        await gateway.save_continuation(cont)
+
     # 5. Retrieval
     gateway._client.get = AsyncMock(return_value=cont.to_json())
     retrieved = await gateway.get_continuation("p-1", 1)
@@ -1192,25 +1233,49 @@ async def test_in_memory_version_contiguity_and_concurrency() -> None:
         artifact_id="a-c",
         producing_task_id="t-c",
         artifact_type="research_material",
-        content={"data": "v2"},
+        content={"material": "v2"},
         created_at=now,
         artifact_version=2,
     )
     with pytest.raises(NonContiguousVersionError, match="prior version 1 does not exist"):
         await store.save_stage_artifact(v2_art)
 
-    # TaskContinuation contiguity: cannot save v2 without v1
-    v2_cont = TaskContinuation(
-        parent_task_id="t-c",
-        child_task_id="child-c",
+    # TaskContinuation latest pointer and contiguity:
+    # Saving v2 without v1 (latest pointer missing) raises CorruptAuthoritativeRecordError
+    v2_missing_cont = TaskContinuation(
+        parent_task_id="t-missing",
+        child_task_id="child-missing",
         stage="incorporate_analysis_child",
         control_fields={"analysis_focus": "v2"},
         continuation_version=2,
         created_at=now,
         updated_at=now,
     )
-    with pytest.raises(NonContiguousVersionError, match="prior version 1 does not exist"):
-        await store.save_continuation(v2_cont)
+    with pytest.raises(CorruptAuthoritativeRecordError):
+        await store.save_continuation(v2_missing_cont)
+
+    # Save v1, then attempt saving v3 (latest=1 < 3-1) raises NonContiguousVersionError
+    v1_cont = TaskContinuation(
+        parent_task_id="t-c",
+        child_task_id="child-c",
+        stage="incorporate_analysis_child",
+        control_fields={"analysis_focus": "v1"},
+        continuation_version=1,
+        created_at=now,
+        updated_at=now,
+    )
+    await store.save_continuation(v1_cont)
+    v3_cont = TaskContinuation(
+        parent_task_id="t-c",
+        child_task_id="child-c",
+        stage="incorporate_analysis_child",
+        control_fields={"analysis_focus": "v3"},
+        continuation_version=3,
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(NonContiguousVersionError, match="prior version 2 does not exist"):
+        await store.save_continuation(v3_cont)
 
     # Partial state conflict on root registration
     root = TaskRequested.create("Root task")

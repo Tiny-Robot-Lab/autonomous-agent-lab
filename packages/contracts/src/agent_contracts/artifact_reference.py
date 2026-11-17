@@ -9,14 +9,15 @@ class ArtifactReference:
     """Explicit, versioned, task-scoped reference to a StageArtifact.
 
     Governed by ADR-0007:
-    - Identifies a stage artifact by producing task, artifact ID, and version;
+    - Identifies a stage artifact by producing task, artifact ID, and explicitly pinned version;
+    - Implicit 'latest' resolution is strictly prohibited in storage records;
     - Immutable and canonical;
     - References stage-required evidence rather than duplicating payloads into lineage or continuations.
     """
 
     producing_task_id: str
     artifact_id: str
-    artifact_version: int = 1
+    artifact_version: int
 
     def __post_init__(self) -> None:
         if type(self.artifact_version) is bool or not isinstance(self.artifact_version, int):
@@ -54,10 +55,12 @@ class ArtifactReference:
             raise ValueError("producing_task_id is required")
         if "artifact_id" not in data:
             raise ValueError("artifact_id is required")
+        if "artifact_version" not in data:
+            raise ValueError("artifact_version is required")
         return cls(
             producing_task_id=data["producing_task_id"],
             artifact_id=data["artifact_id"],
-            artifact_version=data.get("artifact_version", 1),
+            artifact_version=data["artifact_version"],
         )
 
     @classmethod

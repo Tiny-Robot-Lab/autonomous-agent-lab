@@ -116,24 +116,36 @@ class InMemoryRedis:
         args = list(keys_and_args[numkeys:])
 
         # Register root task
-        if len(keys) >= 4 and "task.status" in keys[0]:
-            status_key, lineage_key, input_key, authority_key = keys[:4]
-            status_json, lineage_json, input_json, authority_json = args[:4]
-            all_keys = [status_key, lineage_key, input_key, authority_key]
+        if len(keys) >= 5 and "task.registration" in keys[0]:
+            marker_key, status_key, lineage_key, input_key, authority_key = keys[:5]
+            marker_json, status_json, lineage_json, input_json, authority_json = args[:5]
+            expected_task_id = args[5] if len(args) > 5 else ""
+            all_keys = [marker_key, status_key, lineage_key, input_key, authority_key]
             exists_count = sum(1 for k in all_keys if k in self._strings)
             if exists_count == 0:
+                self._strings[marker_key] = marker_json
                 self._strings[status_key] = status_json
                 self._strings[lineage_key] = lineage_json
                 self._strings[input_key] = input_json
                 self._strings[authority_key] = authority_json
                 return "OK"
-            if exists_count == 4:
+            if exists_count == 5:
                 if (
-                    self._strings[lineage_key] == lineage_json
+                    self._strings[marker_key] == marker_json
+                    and self._strings[lineage_key] == lineage_json
                     and self._strings[input_key] == input_json
                     and self._strings[authority_key] == authority_json
                 ):
-                    return "IDEMPOTENT"
+                    try:
+                        cur_status_data = json.loads(self._strings[status_key])
+                        if (
+                            isinstance(cur_status_data, dict)
+                            and cur_status_data.get("task_id") == expected_task_id
+                            and isinstance(cur_status_data.get("status"), str)
+                        ):
+                            return "IDEMPOTENT"
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                        return "CONFLICT"
                 return "CONFLICT"
             return "PARTIAL_CONFLICT"
 
@@ -177,22 +189,37 @@ class InMemoryRedis:
             latest_key = keys[1]
             version = int(args[0])
             payload = args[1]
-            if version > 1:
-                prior_key = keys[2]
-                if prior_key not in self._strings:
-                    return "NON_CONTIGUOUS"
             if target_key not in self._strings:
+                if version == 1:
+                    if latest_key in self._strings:
+                        return "CORRUPT_POINTER"
+                else:
+                    if latest_key not in self._strings:
+                        return "CORRUPT_POINTER"
+                    raw_latest = self._strings[latest_key]
+                    if not raw_latest.isdigit():
+                        return "CORRUPT_POINTER"
+                    cur_latest = int(raw_latest)
+                    if cur_latest >= version:
+                        return "CORRUPT_POINTER"
+                    if cur_latest < version - 1:
+                        return "NON_CONTIGUOUS"
+                    prior_key = keys[2] if len(keys) > 2 else None
+                    if not prior_key or prior_key not in self._strings:
+                        return "NON_CONTIGUOUS"
                 self._strings[target_key] = payload
-                cur_latest = int(self._strings.get(latest_key, 0))
-                if version > cur_latest:
-                    self._strings[latest_key] = str(version)
+                self._strings[latest_key] = str(version)
                 return "OK"
-            if self._strings[target_key] == payload:
-                cur_latest = int(self._strings.get(latest_key, 0))
-                if version > cur_latest:
-                    self._strings[latest_key] = str(version)
-                return "IDEMPOTENT"
-            return "CONFLICT"
+            else:
+                existing = self._strings[target_key]
+                if existing == payload:
+                    if latest_key not in self._strings:
+                        return "CORRUPT_POINTER"
+                    raw_latest = self._strings[latest_key]
+                    if not raw_latest.isdigit() or int(raw_latest) < version:
+                        return "CORRUPT_POINTER"
+                    return "IDEMPOTENT"
+                return "CONFLICT"
 
         # Root authority
         if keys and "task.authority" in keys[0]:
