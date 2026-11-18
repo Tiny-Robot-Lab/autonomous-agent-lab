@@ -1,6 +1,7 @@
 import json
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
@@ -115,3 +116,30 @@ def check_no_credential_bearing_keys(
     elif isinstance(data, (list, tuple)):
         for item in data:
             check_no_credential_bearing_keys(item, context, max_depth, current_depth + 1)
+
+
+def normalize_canonical_utc_timestamp(val: str | datetime) -> str:
+    """Normalize any ISO timestamp or datetime to canonical ISO UTC representation with microsecond precision.
+
+    Produces strictly fixed-length (27 chars) format: YYYY-MM-DDTHH:MM:SS.ffffffZ
+    This guarantees that lexicographical string comparisons (such as in Redis Lua)
+    strictly match chronological ordering.
+    """
+    if isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, str):
+        cleaned = val.strip()
+        if not cleaned:
+            raise ValueError("Timestamp string cannot be empty")
+        try:
+            dt = datetime.fromisoformat(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"Invalid ISO timestamp: {cleaned}") from exc
+    else:
+        raise TypeError(f"Expected str or datetime, got {type(val).__name__}")
+
+    if dt.tzinfo is None:
+        raise ValueError("Naive timestamps without timezone are not permitted")
+
+    dt_utc = dt.astimezone(UTC)
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ")

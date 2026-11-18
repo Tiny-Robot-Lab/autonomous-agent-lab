@@ -14,6 +14,57 @@ from .serialization import (
 
 
 @dataclass(frozen=True)
+class TaskInputReference:
+    """Explicit, versioned reference to an immutable TaskInput record.
+
+    Governed by ADR-0007 and Issue #220:
+    - References durable TaskInput by task_id and input_version;
+    - Immutable and canonical.
+    """
+
+    task_id: str
+    input_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.input_version) is bool or not isinstance(self.input_version, int):
+            raise TypeError(f"input_version must be an int, got {type(self.input_version).__name__}")
+        if self.input_version < 1:
+            raise ValueError(f"input_version must be >= 1, got {self.input_version}")
+
+        if not isinstance(self.task_id, str) or not self.task_id.strip():
+            raise ValueError("task_id must be a non-empty string")
+        object.__setattr__(self, "task_id", self.task_id.strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "input_version": self.input_version,
+            "task_id": self.task_id,
+        }
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskInputReference":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        allowed = {"task_id", "input_version"}
+        unexpected = data.keys() - allowed
+        if unexpected:
+            raise TypeError(f"unexpected TaskInputReference fields: {sorted(unexpected)}")
+        if "task_id" not in data:
+            raise ValueError("task_id is required")
+        return cls(
+            task_id=data["task_id"],
+            input_version=data.get("input_version", 1),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "TaskInputReference":
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
 class TaskInput:
     """Immutable, versioned record of task input.
 

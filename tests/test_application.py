@@ -1,14 +1,27 @@
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from agent_contracts import (
+    ActiveClaim,
+    DelegationGrant,
+    RequiredCapabilityRecord,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    WakeUpHint,
+    normalize_canonical_utc_timestamp,
 )
-from orchestrator.application.ports import AuthoritativeTaskStore
+from orchestrator.application.ports import (
+    AuthoritativeTaskStore,
+    ClaimDeliveryLeaseExpiredError,
+    ClaimNotFoundError,
+    FencingEpochRaceError,
+    TaskAlreadyClaimedError,
+    TaskNotClaimableError,
+)
 from orchestrator.application.queries import (
     GetAgentStates,
     GetRecentEvents,
@@ -16,11 +29,12 @@ from orchestrator.application.queries import (
 )
 from orchestrator.application.use_cases import SubmitTask
 from orchestrator.domain.capability import AgentCapability
-from orchestrator.domain.task import TaskLineage
+from orchestrator.domain.task import ConflictingAuthorityGrantError, TaskLineage
 
 
 class FakeTaskQueue(AuthoritativeTaskStore):
-    def __init__(self) -> None:
+    def __init__(self, delivery_mode: str = "legacy_push") -> None:
+        self._delivery_mode = delivery_mode
         self.enqueued: list[tuple[TaskRequested, AgentCapability]] = []
         self.dispatches: list[tuple[TaskRequested, str]] = []
         self.statuses: dict[str, str] = {}
@@ -30,12 +44,26 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         self.artifacts: dict[tuple[str, str, int], StageArtifact] = {}
         self.continuations: dict[tuple[str, int], TaskContinuation] = {}
         self.authorities: dict[str, RootAuthorityRecord] = {}
+        self.authority_grants: dict[tuple[str, str], DelegationGrant] = {}
+        self.required_capabilities: dict[str, RequiredCapabilityRecord] = {}
+        self.claims: dict[str, ActiveClaim] = {}
+        self.fences: dict[str, int] = {}
+        self.hints: list[tuple[WakeUpHint, str]] = []
         self.fail_get_lineage: bool = False
         self.fail_get_children: bool = False
 
     async def register_root_task(
-        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+        required_capability: str = "general",
     ) -> None:
+        required_cap_record = RequiredCapabilityRecord(
+            task_id=task.task_id,
+            required_capability=required_capability,
+            created_at=task.created_at,
+            version=1,
+        )
         self.statuses[task.task_id] = initial_status
         self.lineages[task.task_id] = TaskLineage(
             task_id=task.task_id,
@@ -55,18 +83,43 @@ class FakeTaskQueue(AuthoritativeTaskStore):
             root_task_id=task.task_id,
             created_at=task.created_at,
         )
+        self.required_capabilities[task.task_id] = required_cap_record
 
     async def register_child_task(
-        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+        required_capability: str = "analysis",
     ) -> None:
+        cap_rec = RequiredCapabilityRecord(
+            task_id=task.task_id,
+            required_capability=required_capability,
+            created_at=task.created_at,
+            version=1,
+        )
         self.statuses[task.task_id] = initial_status
         self.lineages[task.task_id] = TaskLineage(
             task_id=task.task_id,
             root_task_id=task.root_task_id,
             parent_task_id=task.parent_task_id,
         )
+        self.required_capabilities[task.task_id] = cap_rec
+        self.inputs[(task.task_id, 1)] = TaskInput(
+            task_id=task.task_id,
+            prompt=task.prompt,
+            created_at=task.created_at,
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        )
         if task.parent_task_id:
             self.children.setdefault(task.parent_task_id, set()).add(task.task_id)
+
+    async def get_required_capability(
+        self, task_id: str
+    ) -> RequiredCapabilityRecord | None:
+        return self.required_capabilities.get(task_id.strip())
 
     async def get_lineage(self, task_id: str) -> TaskLineage | None:
         if self.fail_get_lineage:
@@ -92,7 +145,13 @@ class FakeTaskQueue(AuthoritativeTaskStore):
     ) -> TaskInput | None:
         return self.inputs.get((task_id.strip(), input_version))
 
-    async def save_stage_artifact(self, artifact: StageArtifact) -> None:
+    async def save_stage_artifact(
+        self,
+        artifact: StageArtifact,
+        expected_assignment_id: str,
+        expected_principal_id: str,
+        expected_fencing_epoch: int,
+    ) -> None:
         self.artifacts[(artifact.producing_task_id, artifact.artifact_id, artifact.artifact_version)] = artifact
 
     async def get_stage_artifact(
@@ -114,6 +173,141 @@ class FakeTaskQueue(AuthoritativeTaskStore):
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
         return self.authorities.get(root_task_id.strip())
 
+    async def save_authority_grant(self, grant: DelegationGrant) -> None:
+        self.authority_grants[(grant.root_task_id, grant.grant_id)] = grant
+
+    async def get_authority_grant(
+        self, root_task_id: str, grant_id: str
+    ) -> DelegationGrant | None:
+        return self.authority_grants.get((root_task_id.strip(), grant_id.strip()))
+
+    async def save_active_claim(self, claim: ActiveClaim) -> None:
+        self.claims[claim.task_id] = claim
+
+    async def get_active_claim(self, task_id: str) -> ActiveClaim | None:
+        return self.claims.get(task_id.strip())
+
+    async def get_fencing_epoch(self, task_id: str) -> int:
+        return self.fences.get(task_id.strip(), 0)
+
+    async def atomic_claim_task(
+        self,
+        task_id: str,
+        claim: ActiveClaim,
+        grant: DelegationGrant | None = None,
+        now: str = "",
+        expected_continuation_version: int | None = None,
+        is_root: bool = True,
+    ) -> tuple[ActiveClaim, bool]:
+        clean_task_id = task_id.strip()
+        cur_status = self.statuses.get(clean_task_id)
+        if not cur_status:
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' not found")
+
+        existing_claim = self.claims.get(clean_task_id)
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        effective_status = cur_status
+
+        if existing_claim:
+            if (
+                existing_claim.runtime_principal_id == claim.runtime_principal_id
+                and existing_claim.request_id == claim.request_id
+            ):
+                if existing_claim.state == "acknowledged":
+                    raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' assignment is already acknowledged")
+                if (
+                    existing_claim.state == "claimed_unacknowledged"
+                    and existing_claim.delivery_expires_at <= now_iso
+                ):
+                    effective_status = existing_claim.prior_claimable_status
+                else:
+                    return (existing_claim, True)
+            else:
+                if (
+                    existing_claim.state == "claimed_unacknowledged"
+                    and existing_claim.delivery_expires_at <= now_iso
+                ):
+                    effective_status = existing_claim.prior_claimable_status
+                else:
+                    raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim")
+
+        if effective_status not in ("pending", "resumable"):
+            raise TaskNotClaimableError(f"Task '{clean_task_id}' is in non-claimable status '{effective_status}'")
+
+        cur_epoch = self.fences.get(clean_task_id, 0)
+        expected_epoch = cur_epoch + 1
+        if claim.fencing_epoch != expected_epoch:
+            raise FencingEpochRaceError(
+                f"Concurrent claim conflict on task '{clean_task_id}' (fencing epoch race)"
+            )
+
+        if grant:
+            key = (grant.root_task_id, grant.grant_id)
+            if key in self.authority_grants and self.authority_grants[key] != grant:
+                raise ConflictingAuthorityGrantError(
+                    f"DelegationGrant for root task '{grant.root_task_id}' and grant '{grant.grant_id}' "
+                    "already exists with conflicting data"
+                )
+
+        # Commit phase (no failures permitted)
+        self.fences[clean_task_id] = expected_epoch
+        self.statuses[clean_task_id] = "working"
+        self.claims[clean_task_id] = claim
+
+        if grant:
+            self.authority_grants[(grant.root_task_id, grant.grant_id)] = grant
+
+        return (claim, False)
+
+    async def acknowledge_claim(
+        self,
+        task_id: str,
+        assignment_id: str,
+        principal_id: str,
+        acknowledged_at: str,
+    ) -> ActiveClaim:
+        clean_task_id = task_id.strip()
+        claim = self.claims.get(clean_task_id)
+        if not claim:
+            raise ClaimNotFoundError(f"Active claim for task '{clean_task_id}' not found")
+        if claim.assignment_id != assignment_id.strip() or claim.runtime_principal_id != principal_id.strip():
+            raise ClaimNotFoundError("Assignment ID or principal mismatch")
+        if claim.state == "acknowledged":
+            return claim
+        clean_time = normalize_canonical_utc_timestamp(acknowledged_at)
+        if claim.delivery_expires_at <= clean_time:
+            raise ClaimDeliveryLeaseExpiredError("Lease expired")
+
+        ack_dict = claim.to_dict()
+        ack_dict["state"] = "acknowledged"
+        ack_dict["acknowledged_at"] = clean_time
+        updated = ActiveClaim.from_dict(ack_dict)
+        self.claims[clean_task_id] = updated
+        return updated
+
+    async def expire_delivery_lease(self, task_id: str, now: str = "") -> bool:
+        clean_task_id = task_id.strip()
+        claim = self.claims.get(clean_task_id)
+        if not claim:
+            return False
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        if claim.state == "claimed_unacknowledged" and claim.delivery_expires_at <= now_iso:
+            del self.claims[clean_task_id]
+            self.statuses[clean_task_id] = "pending"
+            return True
+        return False
+
+    async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
+        self.hints.append((hint, target))
+
     async def enqueue(
         self,
         task: TaskRequested,
@@ -124,19 +318,51 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         if target:
             self.dispatches.append((task, target))
 
-    async def dispatch(self, task: TaskRequested, target: str) -> None:
-        self.dispatches.append((task, target))
-        capability = (
-            AgentCapability.RESEARCH if "research" in target else AgentCapability.GENERAL
-        )
-        self.enqueued.append((task, capability))
+    async def dispatch(
+        self, task: TaskRequested, target: str, capability: str | None = None
+    ) -> None:
+        if self._delivery_mode == "authenticated_claim":
+            recognized = frozenset({"general", "research", "analysis"})
+            if capability is not None and str(capability).strip():
+                cand = str(capability).strip()
+                if cand in recognized:
+                    resolved_cap = cand
+                else:
+                    raise ValueError(f"Unrecognized canonical capability: '{cand}'")
+            else:
+                inv_map = {
+                    "agent.tasks.general": "general",
+                    "agent.tasks.research": "research",
+                }
+                mapped = inv_map.get(target)
+                if mapped in recognized:
+                    resolved_cap = mapped
+                else:
+                    raise ValueError(
+                        f"Cannot derive recognized canonical capability from target '{target}'"
+                    )
+            hint_target = f"agent.hints.{resolved_cap}"
+            hint = WakeUpHint(
+                hint_id=f"hint-{task.task_id}",
+                capability=resolved_cap,
+                created_at=datetime.now(UTC).isoformat(),
+                execution_kind="initial",
+                task_id=task.task_id,
+            )
+            self.hints.append((hint, hint_target))
+        else:
+            self.dispatches.append((task, target))
+            capability = (
+                AgentCapability.RESEARCH if "research" in target else AgentCapability.GENERAL
+            )
+            self.enqueued.append((task, capability))
         self.statuses[task.task_id] = "pending"
 
 
 class FakeStateReader:
     def __init__(
         self,
-        agents_data: list[dict[str, str]] | None = None,
+        agents_data: list[dict[str, Any]] | None = None,
         events_data: list[dict[str, str]] | None = None,
         routing_decisions: dict[str, dict[str, Any]] | None = None,
         task_results: dict[str, Any] | None = None,
