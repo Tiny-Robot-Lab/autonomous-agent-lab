@@ -253,7 +253,7 @@ class ClaimTaskResponse:
 
     Governed by ADR-0007 (Decision 7) and Issue #220:
     - Returns private TaskAssignment and detached secret assignment proof;
-    - Proof is returned only once on initial claim, omitted on idempotent replays;
+    - Proof is deterministically re-derived and returned on valid unacknowledged idempotent replays while delivery lease remains valid;
     - Under no circumstances is assignment_proof persisted in public logs or task contracts.
     """
 

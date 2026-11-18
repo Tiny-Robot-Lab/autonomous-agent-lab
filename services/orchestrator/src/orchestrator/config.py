@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from .domain.principal import parse_master_secret
+from .domain.principal import parse_master_secret, validate_principal_config_registry
 
 logger = logging.getLogger(__name__)
 
@@ -46,30 +46,23 @@ class Settings:
                 )
             parse_master_secret(self.assignment_proof_pepper)
 
-            if not isinstance(self.runtime_principals, (dict, MappingProxyType)) or not self.runtime_principals:
-                raise ValueError(
-                    "runtime_principals must contain at least one principal when task_delivery_mode is 'authenticated_claim'"
-                )
-            has_active = any(
-                isinstance(p, dict) and p.get("active", True) is True
-                for p in self.runtime_principals.values()
+            validated = validate_principal_config_registry(self.runtime_principals)
+            object.__setattr__(
+                self,
+                "runtime_principals",
+                MappingProxyType(validated),
             )
-            if not has_active:
-                raise ValueError(
-                    "runtime_principals must contain at least one active principal when task_delivery_mode is 'authenticated_claim'"
-                )
         else:
             if isinstance(self.runtime_credential_pepper, str) and self.runtime_credential_pepper.strip():
                 parse_master_secret(self.runtime_credential_pepper)
             if isinstance(self.assignment_proof_pepper, str) and self.assignment_proof_pepper.strip():
                 parse_master_secret(self.assignment_proof_pepper)
-
-        if isinstance(self.runtime_principals, dict):
-            object.__setattr__(
-                self,
-                "runtime_principals",
-                MappingProxyType(dict(self.runtime_principals)),
-            )
+            if isinstance(self.runtime_principals, dict):
+                object.__setattr__(
+                    self,
+                    "runtime_principals",
+                    MappingProxyType(dict(self.runtime_principals)),
+                )
 
     @classmethod
     def from_env(cls) -> "Settings":

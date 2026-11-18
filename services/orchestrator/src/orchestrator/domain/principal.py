@@ -1,8 +1,8 @@
 import base64
-import binascii
 import hashlib
 import hmac
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +11,7 @@ from agent_contracts import canonical_json_dumps
 TOKEN_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.token-key.v1"
 VERIFIER_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.verifier-key.v1"
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+RECOGNIZED_CAPABILITIES: frozenset[str] = frozenset({"general", "research", "analysis"})
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ def parse_master_secret(raw: str | bytes) -> bytes:
             decoded = base64.b64decode(cleaned.encode("ascii"), validate=True)
             if len(decoded) >= 32:
                 return decoded
-        except (ValueError, binascii.Error):
+        except ValueError:
             pass
         utf8_bytes = cleaned.encode("utf-8")
         if len(utf8_bytes) >= 32:
@@ -115,6 +116,7 @@ def encode_canonical_proof_identity(
     request_id: str,
     delivery_expires_at: str,
     delegation_grant_id: str | None,
+    prior_claimable_status: str = "pending",
     proof_contract_version: int = 1,
 ) -> bytes:
     """Encode complete canonical proof identity dictionary into canonical UTF-8 JSON bytes."""
@@ -134,6 +136,7 @@ def encode_canonical_proof_identity(
         "request_id": request_id.strip(),
         "delivery_expires_at": delivery_expires_at.strip(),
         "delegation_grant_id": delegation_grant_id.strip() if delegation_grant_id is not None else None,
+        "prior_claimable_status": prior_claimable_status.strip(),
     }
     return canonical_json_dumps(payload).encode("utf-8")
 
@@ -169,3 +172,96 @@ def verify_assignment_proof(
         return False
     computed_digest = compute_assignment_verifier_digest(verifier_key, clean_proof)
     return hmac.compare_digest(computed_digest, clean_expected)
+
+
+def validate_principal_config_registry(
+    principals: Any,
+) -> dict[str, dict[str, Any]]:
+    """Validate every principal entry in the configuration registry.
+
+    Governed by ADR-0007 (Decision 7, 8) and Issue #220:
+    - outer key is a nonempty principal ID;
+    - embedded principal_id, if present, equals outer key;
+    - bound_agent_id is a nonempty string;
+    - token_digest is a valid canonical 64-character lowercase hexadecimal digest;
+    - no two principals share a token_digest;
+    - no two active principals share a bound_agent_id unless explicitly permitted;
+    - authorized_capabilities is a nonempty collection of recognized nonempty capability strings;
+    - active is a Boolean;
+    - each entry can construct a valid RuntimePrincipal;
+    - malformed or ambiguous configuration fails startup without leaking raw secrets or JSON.
+    """
+    if not isinstance(principals, (dict, Mapping)) or not principals:
+        raise ValueError("runtime_principals must contain at least one principal when task_delivery_mode is 'authenticated_claim'")
+
+    seen_digests: set[str] = set()
+    seen_active_agents: set[str] = set()
+    validated: dict[str, dict[str, Any]] = {}
+    has_active = False
+
+    for outer_key, cfg in principals.items():
+        if not isinstance(outer_key, str) or not outer_key.strip():
+            raise ValueError("Invalid principal configuration: principal_id must be a non-empty string")
+        clean_outer = outer_key.strip()
+
+        if not isinstance(cfg, dict):
+            raise ValueError("Invalid principal configuration: principal entry must be an object")  # noqa: TRY004
+
+        embedded_id = cfg.get("principal_id")
+        if embedded_id is not None and (
+            not isinstance(embedded_id, str) or embedded_id.strip() != clean_outer
+        ):
+            raise ValueError("Invalid principal configuration: embedded principal_id must match outer key")
+
+        bound_agent = cfg.get("bound_agent_id")
+        if not isinstance(bound_agent, str) or not bound_agent.strip():
+            raise ValueError("Invalid principal configuration: bound_agent_id must be a non-empty string")
+        clean_bound_agent = bound_agent.strip()
+
+        digest = cfg.get("token_digest")
+        if not isinstance(digest, str) or not HEX_64_PATTERN.match(digest):
+            raise ValueError("Invalid principal configuration: token_digest must be a 64-character lowercase hexadecimal string")
+        if digest in seen_digests:
+            raise ValueError("Invalid principal configuration: duplicate token_digest")
+        seen_digests.add(digest)
+
+        active = cfg.get("active", True)
+        if type(active) is not bool:
+            raise ValueError("Invalid principal configuration: active must be a boolean")
+        if active:
+            has_active = True
+            if clean_bound_agent in seen_active_agents:
+                raise ValueError("Invalid principal configuration: duplicate bound_agent_id for active principal")
+            seen_active_agents.add(clean_bound_agent)
+
+        caps = cfg.get("authorized_capabilities")
+        if not isinstance(caps, (list, tuple, set, frozenset)) or not caps:
+            raise ValueError("Invalid principal configuration: authorized_capabilities must be a non-empty collection")
+        clean_caps: list[str] = []
+        for c in caps:
+            if not isinstance(c, str) or not c.strip() or c.strip() not in RECOGNIZED_CAPABILITIES:
+                raise ValueError("Invalid principal configuration: unrecognized or empty capability in authorized_capabilities")
+            clean_caps.append(c.strip())
+
+        try:
+            RuntimePrincipal(
+                principal_id=clean_outer,
+                bound_agent_id=clean_bound_agent,
+                authorized_capabilities=tuple(clean_caps),
+                active=active,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(f"Invalid principal configuration: {exc}") from None
+
+        validated[clean_outer] = {
+            "principal_id": clean_outer,
+            "bound_agent_id": clean_bound_agent,
+            "token_digest": digest,
+            "authorized_capabilities": tuple(clean_caps),
+            "active": active,
+        }
+
+    if not has_active:
+        raise ValueError("runtime_principals must contain at least one active principal when task_delivery_mode is 'authenticated_claim'")
+
+    return validated

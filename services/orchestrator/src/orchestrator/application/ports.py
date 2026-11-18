@@ -5,6 +5,7 @@ from agent_contracts import (
     AgentCandidate,
     AgentEvent,
     DelegationGrant,
+    RequiredCapabilityRecord,
     RootAuthorityRecord,
     RoutingDecision,
     StageArtifact,
@@ -40,6 +41,14 @@ class ClaimDeliveryLeaseExpiredError(Exception):
     """Raised when attempting an operation on an unacknowledged claim whose delivery lease has expired."""
 
 
+class CapabilityMismatchError(Exception):
+    """Raised when an authenticated principal attempts an operation for an unauthorized or mismatched capability."""
+
+
+class FencingEpochRaceError(TaskAlreadyClaimedError):
+    """Raised when a concurrent claim conflict or epoch race is detected."""
+
+
 @runtime_checkable
 class TaskQueue(Protocol):
     async def enqueue(
@@ -56,6 +65,7 @@ class TaskDispatcher(Protocol):
         self,
         task: TaskRequested,
         target: str,
+        capability: str | None = None,
     ) -> None: ...
 
 
@@ -82,12 +92,14 @@ class AuthoritativeTaskStore(Protocol):
         self,
         task: TaskRequested,
         initial_status: str = "pending_dispatch",
+        required_capability: str = "general",
     ) -> None: ...
 
     async def register_child_task(
         self,
         task: TaskRequested,
         initial_status: str = "pending_dispatch",
+        required_capability: str = "analysis",
     ) -> None:
         """Atomically persist pre-validated child task status, forward lineage, and parent membership.
 
@@ -95,6 +107,10 @@ class AuthoritativeTaskStore(Protocol):
         platform application use case (RegisterChildTask) prior to invoking this method.
         """
         ...
+
+    async def get_required_capability(
+        self, task_id: str
+    ) -> RequiredCapabilityRecord | None: ...
 
     async def get_lineage(self, task_id: str) -> TaskLineage | None: ...
 
@@ -110,7 +126,13 @@ class AuthoritativeTaskStore(Protocol):
         self, task_id: str, input_version: int = 1
     ) -> TaskInput | None: ...
 
-    async def save_stage_artifact(self, artifact: StageArtifact) -> None: ...
+    async def save_stage_artifact(
+        self,
+        artifact: StageArtifact,
+        expected_assignment_id: str,
+        expected_principal_id: str,
+        expected_fencing_epoch: int,
+    ) -> None: ...
 
     async def get_stage_artifact(
         self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
@@ -144,6 +166,8 @@ class AuthoritativeTaskStore(Protocol):
         claim: ActiveClaim,
         grant: DelegationGrant | None = None,
         now: str = "",
+        expected_continuation_version: int = -1,
+        is_root: bool = True,
     ) -> tuple[ActiveClaim, bool]:
         """Atomically claim a task.
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from orchestrator.application.ports import (
     AuthoritativeTaskStore,
     CandidateFinder,
+    CapabilityMismatchError,
     CapabilityRouter,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
@@ -36,7 +37,6 @@ from orchestrator.application.queries import (
 )
 from orchestrator.application.use_cases import (
     AcknowledgeAssignment,
-    CapabilityMismatchError,
     ClaimTask,
     StageArtifactUseCase,
     SubmitTask,
@@ -54,6 +54,7 @@ from orchestrator.domain.principal import (
 from orchestrator.domain.selection import CandidateSelectionPolicy
 from orchestrator.domain.task import (
     ConflictingStageArtifactError,
+    CorruptAuthoritativeRecordError,
     NonContiguousVersionError,
 )
 from orchestrator.infrastructure.redis_adapter import RedisGateway
@@ -172,6 +173,7 @@ class ClaimTaskInput(BaseModel):
     request_id: str = Field(min_length=1)
     capability: str = Field(min_length=1)
     execution_kind: str = "initial"
+    expected_continuation_version: int | None = None
 
 
 class AcknowledgeAssignmentInput(BaseModel):
@@ -233,6 +235,7 @@ async def claim_task_endpoint(
             request_id=value.request_id,
             capability=value.capability,
             execution_kind=value.execution_kind,
+            expected_continuation_version=value.expected_continuation_version,
         )
         data: dict[str, Any] = {"assignment": res.assignment.to_dict()}
         if res.assignment_proof is not None:
@@ -242,7 +245,7 @@ async def claim_task_endpoint(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except CapabilityMismatchError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except TaskAlreadyClaimedError as exc:
+    except (TaskAlreadyClaimedError, ClaimDeliveryLeaseExpiredError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TaskNotClaimableError as exc:
         if "not found" in str(exc).lower():
@@ -250,6 +253,8 @@ async def claim_task_endpoint(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
 async def acknowledge_assignment_endpoint(
@@ -277,12 +282,14 @@ async def acknowledge_assignment_endpoint(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except ClaimNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InvalidClaimProofError as exc:
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except ClaimDeliveryLeaseExpiredError as exc:
+    except (ClaimDeliveryLeaseExpiredError, TaskAlreadyClaimedError, TaskNotClaimableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
 async def stage_artifact_endpoint(
@@ -311,14 +318,14 @@ async def stage_artifact_endpoint(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except ClaimNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InvalidClaimProofError as exc:
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except TaskNotClaimableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (ConflictingStageArtifactError, NonContiguousVersionError) as exc:
+    except (TaskNotClaimableError, TaskAlreadyClaimedError, ConflictingStageArtifactError, NonContiguousVersionError, ClaimDeliveryLeaseExpiredError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
 class NoOpResultReader:

@@ -11,6 +11,7 @@ from agent_contracts import (
     AgentCandidate,
     AgentExecutionState,
     DelegationGrant,
+    RequiredCapabilityRecord,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
@@ -22,8 +23,10 @@ from agent_contracts import (
 from fastapi import Request
 from orchestrator.application.ports import (
     AuthoritativeTaskStore,
+    CapabilityMismatchError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    FencingEpochRaceError,
     TaskAlreadyClaimedError,
     TaskDispatcher,
     TaskNotClaimableError,
@@ -32,6 +35,7 @@ from orchestrator.application.use_cases import RegisterChildTask, SubmitTask
 from orchestrator.config import Settings
 from orchestrator.domain.task import (
     ConflictingAuthorityGrantError,
+    ConflictingChildTaskRegistrationError,
     ConflictingContinuationError,
     ConflictingRootAuthorityError,
     ConflictingRootTaskRegistrationError,
@@ -64,6 +68,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.latest_continuation: dict[str, int] = {}
         self.authorities: dict[str, RootAuthorityRecord] = {}
         self.authority_grants: dict[tuple[str, str], DelegationGrant] = {}
+        self.required_capabilities: dict[str, RequiredCapabilityRecord] = {}
         self.claims: dict[str, ActiveClaim] = {}
         self.fences: dict[str, int] = {}
         self.fail_next_registration: bool = False
@@ -71,7 +76,10 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.child_registrations: list[tuple[TaskRequested, str]] = []
 
     async def register_root_task(
-        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+        required_capability: str = "general",
     ) -> None:
         if task.parent_task_id is not None or task.root_task_id != task.task_id:
             raise ValueError(f"Task '{task.task_id}' is not a root task")
@@ -79,13 +87,20 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             self.fail_next_registration = False
             raise RuntimeError("Simulated pipeline failure during root registration")
 
+        required_cap_record = RequiredCapabilityRecord(
+            task_id=task.task_id,
+            required_capability=required_capability,
+            created_at=task.created_at,
+            version=1,
+        )
         exists_marker = task.task_id in self.registrations
         exists_status = task.task_id in self.statuses
         exists_lineage = task.task_id in self.lineages
         exists_input = (task.task_id, 1) in self.inputs
         exists_authority = task.task_id in self.authorities
+        exists_cap = task.task_id in self.required_capabilities
 
-        if not (exists_marker or exists_status or exists_lineage or exists_input or exists_authority):
+        if not (exists_marker or exists_status or exists_lineage or exists_input or exists_authority or exists_cap):
             self.registrations[task.task_id] = {
                 "registered_at": task.created_at,
                 "task_id": task.task_id,
@@ -109,20 +124,23 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 root_task_id=task.task_id,
                 created_at=task.created_at,
             )
+            self.required_capabilities[task.task_id] = required_cap_record
             self.root_registrations.append((task, initial_status))
             return
 
-        if exists_marker and exists_status and exists_lineage and exists_input and exists_authority:
+        if exists_marker and exists_status and exists_lineage and exists_input and exists_authority and exists_cap:
             existing_marker = self.registrations[task.task_id]
             existing_lineage = self.lineages[task.task_id]
             existing_input = self.inputs[(task.task_id, 1)]
             existing_authority = self.authorities[task.task_id]
             existing_status = self.statuses[task.task_id]
+            existing_cap = self.required_capabilities[task.task_id]
             if (
                 existing_marker.get("task_id") == task.task_id
                 and existing_lineage.root_task_id == task.root_task_id
                 and existing_input.prompt == task.prompt
                 and existing_authority.root_task_id == task.task_id
+                and existing_cap.required_capability == required_cap_record.required_capability
                 and isinstance(existing_status, str)
             ):
                 return
@@ -135,21 +153,73 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         )
 
     async def register_child_task(
-        self, task: TaskRequested, initial_status: str = "pending_dispatch"
+        self,
+        task: TaskRequested,
+        initial_status: str = "pending_dispatch",
+        required_capability: str = "analysis",
     ) -> None:
         if task.parent_task_id is None or task.root_task_id == task.task_id:
             raise ValueError(f"Task '{task.task_id}' is not a child task")
         if self.fail_next_registration:
             self.fail_next_registration = False
             raise RuntimeError("Simulated pipeline failure during child registration")
-        self.statuses[task.task_id] = initial_status
-        self.lineages[task.task_id] = TaskLineage(
+        cap_rec = RequiredCapabilityRecord(
             task_id=task.task_id,
-            root_task_id=task.root_task_id,
-            parent_task_id=task.parent_task_id,
+            required_capability=required_capability,
+            created_at=task.created_at,
+            version=1,
         )
-        self.children.setdefault(task.parent_task_id, set()).add(task.task_id)
-        self.child_registrations.append((task, initial_status))
+        exists_status = task.task_id in self.statuses
+        exists_lineage = task.task_id in self.lineages
+        exists_capability = task.task_id in self.required_capabilities
+        is_member = task.task_id in self.children.get(task.parent_task_id, set())
+
+        # 1. All records absent: create atomically
+        if not exists_status and not exists_lineage and not exists_capability and not is_member:
+            self.statuses[task.task_id] = initial_status
+            self.lineages[task.task_id] = TaskLineage(
+                task_id=task.task_id,
+                root_task_id=task.root_task_id,
+                parent_task_id=task.parent_task_id,
+            )
+            self.required_capabilities[task.task_id] = cap_rec
+            self.inputs[(task.task_id, 1)] = TaskInput(
+                task_id=task.task_id,
+                prompt=task.prompt,
+                created_at=task.created_at,
+                input_version=1,
+                artifact_references=(),
+                metadata={},
+                version=1,
+            )
+            self.children.setdefault(task.parent_task_id, set()).add(task.task_id)
+            self.child_registrations.append((task, initial_status))
+            return
+
+        # 2. All records present and byte-identical: idempotent success
+        if exists_status and exists_lineage and exists_capability and is_member:
+            cur_lineage = self.lineages[task.task_id]
+            cur_cap = self.required_capabilities[task.task_id]
+            if (
+                cur_lineage.parent_task_id == task.parent_task_id
+                and cur_lineage.root_task_id == task.root_task_id
+                and cur_lineage.task_id == task.task_id
+                and cur_cap.required_capability == cap_rec.required_capability
+            ):
+                return
+            raise ConflictingChildTaskRegistrationError(
+                f"Child task '{task.task_id}' already exists with conflicting state"
+            )
+
+        # 3. Partial existing registration: fail closed
+        raise ConflictingChildTaskRegistrationError(
+            f"Child task '{task.task_id}' has inconsistent or partial authoritative state in storage"
+        )
+
+    async def get_required_capability(
+        self, task_id: str
+    ) -> RequiredCapabilityRecord | None:
+        return self.required_capabilities.get(task_id.strip())
 
     async def get_lineage(self, task_id: str) -> TaskLineage | None:
         return self.lineages.get(task_id.strip())
@@ -189,7 +259,43 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
     ) -> TaskInput | None:
         return self.inputs.get((task_id.strip(), input_version))
 
-    async def save_stage_artifact(self, artifact: StageArtifact) -> None:
+    async def save_stage_artifact(
+        self,
+        artifact: StageArtifact,
+        expected_assignment_id: str,
+        expected_principal_id: str,
+        expected_fencing_epoch: int,
+    ) -> None:
+        clean_assignment_id = str(expected_assignment_id).strip()
+        clean_principal_id = str(expected_principal_id).strip()
+        if not clean_assignment_id or not clean_principal_id or expected_fencing_epoch < 1:
+            raise ValueError(
+                "save_stage_artifact requires non-empty assignment_id, principal_id, and positive fencing_epoch"
+            )
+
+        claim = self.claims.get(artifact.producing_task_id)
+        if not claim:
+            raise ClaimNotFoundError(f"Active claim for task '{artifact.producing_task_id}' not found")
+        if claim.assignment_id != clean_assignment_id or claim.runtime_principal_id != clean_principal_id:
+            raise ClaimNotFoundError(
+                f"Active claim does not match assignment '{clean_assignment_id}' or principal '{clean_principal_id}'"
+            )
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Assignment must be acknowledged before staging artifacts")
+        if claim.fencing_epoch != expected_fencing_epoch:
+            raise FencingEpochRaceError(
+                f"Fencing epoch mismatch: expected {expected_fencing_epoch}, claim has {claim.fencing_epoch}"
+            )
+        cur_fence = self.fences.get(artifact.producing_task_id, 0)
+        if cur_fence != expected_fencing_epoch:
+            raise FencingEpochRaceError(f"Fencing epoch mismatch: current fence is {cur_fence}")
+        if artifact.artifact_type == "research_material" and (
+            claim.execution_kind != "initial" or claim.assigned_capability != "research"
+        ):
+            raise CapabilityMismatchError(
+                f"Artifact staging policy violation for artifact_type '{artifact.artifact_type}'"
+            )
+
         if artifact.artifact_version > 1:
             prior_key = (artifact.producing_task_id, artifact.artifact_id, artifact.artifact_version - 1)
             if prior_key not in self.artifacts:
@@ -313,11 +419,19 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         claim: ActiveClaim,
         grant: DelegationGrant | None = None,
         now: str = "",
+        expected_continuation_version: int = -1,
+        is_root: bool = True,
     ) -> tuple[ActiveClaim, bool]:
         clean_task_id = task_id.strip()
         cur_status = self.statuses.get(clean_task_id)
         if not cur_status:
             raise TaskNotClaimableError(f"Task '{clean_task_id}' not found")
+
+        req_cap = self.required_capabilities.get(clean_task_id)
+        if req_cap and req_cap.required_capability != claim.assigned_capability:
+            raise CapabilityMismatchError(
+                f"Task '{clean_task_id}' requires capability '{req_cap.required_capability}', but requested '{claim.assigned_capability}'"
+            )
 
         existing_claim = self.claims.get(clean_task_id)
         now_iso = (
@@ -338,7 +452,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                     existing_claim.state == "claimed_unacknowledged"
                     and existing_claim.delivery_expires_at <= now_iso
                 ):
-                    effective_status = "pending"
+                    effective_status = existing_claim.prior_claimable_status
                 else:
                     return (existing_claim, True)
             else:
@@ -346,17 +460,48 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                     existing_claim.state == "claimed_unacknowledged"
                     and existing_claim.delivery_expires_at <= now_iso
                 ):
-                    effective_status = "pending"
+                    effective_status = existing_claim.prior_claimable_status
                 else:
                     raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim")
 
-        if effective_status not in ("pending", "resumable"):
-            raise TaskNotClaimableError(f"Task '{clean_task_id}' is in non-claimable status '{effective_status}'")
+        if claim.execution_kind == "initial":
+            if not is_root or effective_status != "pending":
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' lifecycle mismatch for initial execution: status='{effective_status}', is_root={is_root}")
+            if expected_continuation_version is not None and expected_continuation_version > 0:
+                raise ValueError("continuation_version must remain absent for non-resumed claims")
+        elif claim.execution_kind == "delegated_child":
+            if is_root or effective_status != "pending":
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' lifecycle mismatch for delegated_child execution: status='{effective_status}', is_root={is_root}")
+            if expected_continuation_version is not None and expected_continuation_version > 0:
+                raise ValueError("continuation_version must remain absent for non-resumed claims")
+        elif claim.execution_kind == "resumed_continuation":
+            if not is_root or effective_status != "resumable":
+                raise TaskNotClaimableError(f"Task '{clean_task_id}' lifecycle mismatch for resumed_continuation execution: status='{effective_status}', is_root={is_root}")
+            if (
+                expected_continuation_version is None
+                or not isinstance(expected_continuation_version, int)
+                or type(expected_continuation_version) is bool
+                or expected_continuation_version < 1
+            ):
+                raise ValueError("expected_continuation_version must be a positive integer for resumed_continuation")
+            if clean_task_id not in self.latest_continuation:
+                raise TaskNotClaimableError(f"No continuation checkpoint found for task '{clean_task_id}'")
+            cur_latest = self.latest_continuation[clean_task_id]
+            if (
+                cur_latest is None
+                or not isinstance(cur_latest, (int, float))
+                or type(cur_latest) is bool
+                or cur_latest < 1
+                or int(cur_latest) != cur_latest
+            ):
+                raise CorruptAuthoritativeRecordError(f"Corrupt continuation latest record for task '{clean_task_id}'")
+            if int(cur_latest) != int(expected_continuation_version):
+                raise TaskNotClaimableError(f"Continuation version mismatch for task '{clean_task_id}': latest={cur_latest}, expected={expected_continuation_version}")
 
         cur_epoch = self.fences.get(clean_task_id, 0)
         expected_epoch = cur_epoch + 1
         if claim.fencing_epoch != expected_epoch:
-            raise TaskAlreadyClaimedError(
+            raise FencingEpochRaceError(
                 f"Concurrent claim conflict on task '{clean_task_id}' (fencing epoch race)"
             )
 
@@ -420,12 +565,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         )
         if claim.state == "claimed_unacknowledged" and claim.delivery_expires_at <= now_iso:
             del self.claims[clean_task_id]
-            self.statuses[clean_task_id] = "pending"
-            return True
-        return False
-        if claim.state == "claimed_unacknowledged" and claim.delivery_expires_at <= now_iso:
-            del self.claims[clean_task_id]
-            self.statuses[clean_task_id] = "pending"
+            self.statuses[clean_task_id] = claim.prior_claimable_status
             return True
         return False
 
@@ -442,7 +582,9 @@ class MockAtomicDispatcher(TaskDispatcher):
         self.dispatches: list[tuple[TaskRequested, str]] = []
         self.should_fail = should_fail
 
-    async def dispatch(self, task: TaskRequested, target: str) -> None:
+    async def dispatch(
+        self, task: TaskRequested, target: str, capability: str | None = None
+    ) -> None:
         if self.should_fail:
             raise RuntimeError(f"Simulated dispatch transport failure targeting '{target}'")
         self.dispatches.append((task, target))
@@ -889,18 +1031,10 @@ async def test_redis_gateway_dispatch_uses_atomic_pipeline_with_transaction_true
 
 
 @pytest.mark.anyio
-async def test_redis_gateway_register_child_uses_atomic_pipeline_with_transaction_true() -> None:
-    """Verifies that RedisGateway.register_child_task commits status, lineage, and parent set inside a transaction=True pipeline."""
+async def test_redis_gateway_register_child_uses_atomic_lua_script() -> None:
+    """Verifies that RedisGateway.register_child_task executes REGISTER_CHILD_TASK_LUA atomically across keys."""
     gateway = RedisGateway("redis://localhost:6379/0")
-
-    mock_pipe = MagicMock()
-    mock_pipe.set = MagicMock()
-    mock_pipe.sadd = MagicMock()
-    mock_pipe.execute = AsyncMock()
-    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
-    mock_pipe.__aexit__ = AsyncMock(return_value=None)
-
-    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+    gateway._client.eval = AsyncMock(return_value="OK")
 
     child = TaskRequested(
         task_id="child-123",
@@ -911,27 +1045,16 @@ async def test_redis_gateway_register_child_uses_atomic_pipeline_with_transactio
         version=2,
     )
 
-    await gateway.register_child_task(child, initial_status="pending_dispatch")
+    await gateway.register_child_task(child, initial_status="pending_dispatch", required_capability="analysis")
 
-    # Verified transaction=True pipeline
-    gateway._client.pipeline.assert_called_once_with(transaction=True)
-
-    mock_pipe.set.assert_any_call(
-        f"task.status:{child.task_id}",
-        json.dumps({"status": "pending_dispatch", "task_id": child.task_id}, separators=(",", ":"), sort_keys=True),
-    )
-    mock_pipe.set.assert_any_call(
-        f"task.lineage:{child.task_id}",
-        json.dumps({
-            "parent_task_id": "root-1",
-            "root_task_id": "root-1",
-            "task_id": child.task_id,
-        }, separators=(",", ":"), sort_keys=True),
-    )
-    mock_pipe.sadd.assert_called_once_with(
-        "task.children:root-1", child.task_id
-    )
-    mock_pipe.execute.assert_awaited_once()
+    gateway._client.eval.assert_awaited_once()
+    assert gateway._client.eval.await_args is not None
+    call_args = gateway._client.eval.await_args[0]
+    assert call_args[1] == 4
+    assert call_args[2] == "task.status:child-123"
+    assert call_args[3] == "task.lineage:child-123"
+    assert call_args[4] == "task.required_capability:child-123"
+    assert call_args[5] == "task.children:root-1"
 
 
 @pytest.mark.anyio
@@ -1043,6 +1166,28 @@ async def test_in_memory_task_input_write_once_semantics() -> None:
 async def test_in_memory_stage_artifact_write_once_semantics() -> None:
     store = InMemoryAuthoritativeTaskStore()
     now = datetime.now(UTC).isoformat()
+    future = "2099-01-01T00:00:00Z"
+    claim = ActiveClaim(
+        task_id="t-parent",
+        assignment_id="assign-1",
+        claim_id="claim-1",
+        root_task_id="t-parent",
+        turn_id="turn-1",
+        runtime_principal_id="principal-1",
+        bound_agent_id="research-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req-1",
+        claimed_at=now,
+        delivery_expires_at=future,
+        state="acknowledged",
+        acknowledged_at=now,
+    )
+    store.claims["t-parent"] = claim
+    store.fences["t-parent"] = 1
+
     art_v1 = StageArtifact(
         artifact_id="art-1",
         producing_task_id="t-parent",
@@ -1052,12 +1197,12 @@ async def test_in_memory_stage_artifact_write_once_semantics() -> None:
         artifact_version=1,
     )
 
-    await store.save_stage_artifact(art_v1)
+    await store.save_stage_artifact(art_v1, "assign-1", "principal-1", 1)
     retrieved = await store.get_stage_artifact("t-parent", "art-1", artifact_version=1)
     assert retrieved == art_v1
 
     # Idempotent write
-    await store.save_stage_artifact(art_v1)
+    await store.save_stage_artifact(art_v1, "assign-1", "principal-1", 1)
 
     # Conflicting write
     conflicting = StageArtifact(
@@ -1069,7 +1214,7 @@ async def test_in_memory_stage_artifact_write_once_semantics() -> None:
         artifact_version=1,
     )
     with pytest.raises(ConflictingStageArtifactError, match="already exists with conflicting data"):
-        await store.save_stage_artifact(conflicting)
+        await store.save_stage_artifact(conflicting, "assign-1", "principal-1", 1)
 
 
 @pytest.mark.anyio
@@ -1234,12 +1379,12 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
 
     # 1. Save artifact (Lua returns OK)
     gateway._client.eval = AsyncMock(return_value="OK")
-    await gateway.save_stage_artifact(art)
+    await gateway.save_stage_artifact(art, "assign-1", "principal-1", 1)
     gateway._client.eval.assert_awaited_once()
 
     # 2. Idempotent write (Lua returns IDEMPOTENT)
     gateway._client.eval = AsyncMock(return_value="IDEMPOTENT")
-    await gateway.save_stage_artifact(art)
+    await gateway.save_stage_artifact(art, "assign-1", "principal-1", 1)
 
     # 3. Conflicting write (Lua returns CONFLICT)
     gateway._client.eval = AsyncMock(return_value="CONFLICT")
@@ -1252,7 +1397,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
         artifact_version=1,
     )
     with pytest.raises(ConflictingStageArtifactError, match="already exists with conflicting data"):
-        await gateway.save_stage_artifact(conflict)
+        await gateway.save_stage_artifact(conflict, "assign-1", "principal-1", 1)
 
     # 4. Non-contiguous write (Lua returns NON_CONTIGUOUS)
     gateway._client.eval = AsyncMock(return_value="NON_CONTIGUOUS")
@@ -1265,7 +1410,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
         artifact_version=3,
     )
     with pytest.raises(NonContiguousVersionError, match="prior version 2 does not exist"):
-        await gateway.save_stage_artifact(art_v3)
+        await gateway.save_stage_artifact(art_v3, "assign-1", "principal-1", 1)
 
     # 5. Retrieval
     gateway._client.get = AsyncMock(return_value=art.to_json())
@@ -1391,6 +1536,27 @@ async def test_in_memory_version_contiguity_and_concurrency() -> None:
         await store.save_task_input(v2_input)
 
     # StageArtifact contiguity: cannot save v2 without v1
+    claim_c = ActiveClaim(
+        task_id="t-c",
+        assignment_id="assign-c",
+        claim_id="claim-c",
+        root_task_id="t-c",
+        turn_id="turn-c",
+        runtime_principal_id="principal-c",
+        bound_agent_id="research-c",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="c" * 64,
+        request_id="req-c",
+        claimed_at=now,
+        delivery_expires_at="2099-01-01T00:00:00Z",
+        state="acknowledged",
+        acknowledged_at=now,
+    )
+    store.claims["t-c"] = claim_c
+    store.fences["t-c"] = 1
+
     v2_art = StageArtifact(
         artifact_id="a-c",
         producing_task_id="t-c",
@@ -1400,7 +1566,7 @@ async def test_in_memory_version_contiguity_and_concurrency() -> None:
         artifact_version=2,
     )
     with pytest.raises(NonContiguousVersionError, match="prior version 1 does not exist"):
-        await store.save_stage_artifact(v2_art)
+        await store.save_stage_artifact(v2_art, "assign-c", "principal-c", 1)
 
     # TaskContinuation latest pointer and contiguity:
     # Saving v2 without v1 (latest pointer missing) raises CorruptAuthoritativeRecordError
@@ -1511,7 +1677,7 @@ async def test_in_memory_atomic_claim_and_acknowledgement_lifecycle() -> None:
     future = "2099-01-01T00:00:00Z"
 
     root = TaskRequested.create("Root task")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     grant = DelegationGrant(
@@ -1633,7 +1799,7 @@ async def test_in_memory_delivery_lease_expiry_restores_claimability() -> None:
     now = "2020-01-01T00:00:31Z"
 
     root = TaskRequested.create("Root task")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     claim = ActiveClaim(
@@ -1852,7 +2018,7 @@ async def test_redis_gateway_claim_and_acknowledgement_lua_branches() -> None:
 
     # 10b. Expire delivery lease: returned CORRUPT_CLAIM
     gateway._client.eval = AsyncMock(return_value=["CORRUPT_CLAIM"])
-    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt active claim"):
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt authoritative record"):
         await gateway.expire_delivery_lease("task-001", now)
 
     # 11. Dispatch hint
@@ -1876,7 +2042,7 @@ async def test_in_memory_atomic_claim_zero_mutation_invariants() -> None:
     future = "2099-01-01T00:00:00Z"
 
     root = TaskRequested.create("Root task for invariant tests")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     grant_1 = DelegationGrant(
@@ -2016,3 +2182,245 @@ async def test_in_memory_atomic_claim_zero_mutation_invariants() -> None:
     store.claims[root.task_id] = "corrupt_non_dict"  # type: ignore[assignment]
     with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt active claim"):
         await store.expire_delivery_lease(root.task_id, now=now)
+
+
+@pytest.mark.anyio
+async def test_continuation_version_numeric_hardening_and_zero_mutation() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    t_id = "root-cont-harden"
+    now = "2026-11-17T12:00:00Z"
+    future = "2099-01-01T00:00:00Z"
+
+    root = TaskRequested.create("Root for continuation numeric hardening")
+    object.__setattr__(root, "task_id", t_id)
+    object.__setattr__(root, "root_task_id", t_id)
+    await store.register_root_task(root, initial_status="pending_dispatch", required_capability="general")
+    await store.update_status(t_id, "resumable")
+
+    claim_candidate = ActiveClaim(
+        task_id=t_id,
+        assignment_id="assign-resumed-001",
+        claim_id="claim-resumed-001",
+        root_task_id=t_id,
+        turn_id="turn-resumed-001",
+        runtime_principal_id="principal-worker-1",
+        bound_agent_id="worker-1",
+        assigned_capability="general",
+        execution_kind="resumed_continuation",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req-resumed-001",
+        claimed_at=now,
+        delivery_expires_at=future,
+        prior_claimable_status="resumable",
+    )
+
+    # 1. Zero and negative expected continuation versions rejected with ValueError, zero mutations
+    for bad_ver in (0, -1, -5):
+        with pytest.raises(ValueError, match="expected_continuation_version must be a positive integer"):
+            await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=bad_ver, now=now)
+
+        assert store.statuses[t_id] == "resumable"
+        assert store.fences.get(t_id, 0) == 0
+        assert t_id not in store.claims
+
+    # 3. Nonnumeric authoritative latest-pointer fails closed, zero mutations
+    store.latest_continuation[t_id] = "corrupt_non_numeric"  # type: ignore[assignment]
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt continuation latest record"):
+        await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=1, now=now)
+
+    assert store.statuses[t_id] == "resumable"
+    assert store.fences.get(t_id, 0) == 0
+    assert t_id not in store.claims
+
+    # 4. Fractional authoritative latest-pointer fails closed, zero mutations
+    store.latest_continuation[t_id] = 1.5  # type: ignore[assignment]
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt continuation latest record"):
+        await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=1, now=now)
+
+    assert store.statuses[t_id] == "resumable"
+    assert store.fences.get(t_id, 0) == 0
+    assert t_id not in store.claims
+
+    # 5. Zero and negative authoritative latest-pointer fail closed, zero mutations
+    for bad_ptr in (0, -1, -5):
+        store.latest_continuation[t_id] = bad_ptr
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt continuation latest record"):
+            await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=1, now=now)
+
+        assert store.statuses[t_id] == "resumable"
+        assert store.fences.get(t_id, 0) == 0
+        assert t_id not in store.claims
+
+    # 6. Mismatch returns continuation-version conflict and causes zero mutations
+    store.latest_continuation[t_id] = 1
+    with pytest.raises(TaskNotClaimableError, match="Continuation version mismatch"):
+        await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=2, now=now)
+
+    assert store.statuses[t_id] == "resumable"
+    assert store.fences.get(t_id, 0) == 0
+    assert t_id not in store.claims
+
+    # 7. Valid positive integer matching version succeeds and commits state
+    res_claim, is_replay = await store.atomic_claim_task(t_id, claim_candidate, expected_continuation_version=1, now=now)
+    assert not is_replay
+    assert res_claim.fencing_epoch == 1
+    assert store.fences[t_id] == 1
+    assert store.statuses[t_id] == "working"
+    assert store.claims[t_id] == claim_candidate
+
+
+@pytest.mark.anyio
+async def test_in_memory_child_registration_atomic_boundary_and_immutability() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    root_id = "root-child-test"
+    child_id = "child-test-001"
+    now = "2026-11-17T12:00:00Z"
+
+    root = TaskRequested.create("Root task")
+    object.__setattr__(root, "task_id", root_id)
+    object.__setattr__(root, "root_task_id", root_id)
+    await store.register_root_task(root)
+
+    child = TaskRequested(
+        task_id=child_id,
+        prompt="Child prompt",
+        created_at=now,
+        root_task_id=root_id,
+        parent_task_id=root_id,
+        version=2,
+    )
+
+    # 1. First registration creates all records atomically
+    await store.register_child_task(child, initial_status="pending_dispatch", required_capability="analysis")
+    assert store.statuses[child_id] == "pending_dispatch"
+    assert store.lineages[child_id].task_id == child_id
+    assert store.required_capabilities[child_id].required_capability == "analysis"
+    assert child_id in store.children[root_id]
+
+    # 2. Byte-identical replay succeeds idempotently
+    await store.register_child_task(child, initial_status="pending_dispatch", required_capability="analysis")
+    assert store.statuses[child_id] == "pending_dispatch"
+
+    # 3. Conflicting capability replay fails with ConflictingChildTaskRegistrationError and zero mutation
+    with pytest.raises(ConflictingChildTaskRegistrationError, match="already exists with conflicting state"):
+        await store.register_child_task(child, initial_status="pending_dispatch", required_capability="research")
+    assert store.required_capabilities[child_id].required_capability == "analysis"
+
+    # 4. Conflicting lineage replay fails with ConflictingChildTaskRegistrationError and zero mutation
+    conflicting_child = TaskRequested(
+        task_id=child_id,
+        prompt="Child prompt",
+        created_at=now,
+        root_task_id="other-root",
+        parent_task_id=root_id,
+        version=2,
+    )
+    with pytest.raises(ConflictingChildTaskRegistrationError, match="already exists with conflicting state"):
+        await store.register_child_task(conflicting_child, initial_status="pending_dispatch", required_capability="analysis")
+    assert store.lineages[child_id].root_task_id == root_id
+
+    # 5. Partial prior state fails closed with ConflictingChildTaskRegistrationError and zero mutation
+    partial_child_id = "child-partial-001"
+    store.statuses[partial_child_id] = "pending_dispatch"
+    partial_child = TaskRequested(
+        task_id=partial_child_id,
+        prompt="Partial child",
+        created_at=now,
+        root_task_id=root_id,
+        parent_task_id=root_id,
+        version=2,
+    )
+    with pytest.raises(ConflictingChildTaskRegistrationError, match="inconsistent or partial authoritative state"):
+        await store.register_child_task(partial_child, initial_status="pending_dispatch", required_capability="analysis")
+    assert partial_child_id not in store.lineages
+    assert partial_child_id not in store.required_capabilities
+    assert partial_child_id not in store.children.get(root_id, set())
+
+
+@pytest.mark.anyio
+async def test_registration_capability_validation_and_zero_mutation() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    now = datetime.now(UTC).isoformat()
+    root = TaskRequested(
+        task_id="root-val-1",
+        prompt="Root prompt",
+        created_at=now,
+        root_task_id="root-val-1",
+        parent_task_id=None,
+        version=2,
+    )
+    child = TaskRequested(
+        task_id="child-val-1",
+        prompt="Child prompt",
+        created_at=now,
+        root_task_id="root-val-1",
+        parent_task_id="root-val-1",
+        version=2,
+    )
+
+    # 1. Explicit empty root capability does not become 'general'; raises ValueError before mutation
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        await store.register_root_task(root, required_capability="")
+    assert "root-val-1" not in store.registrations
+    assert "root-val-1" not in store.statuses
+    assert "root-val-1" not in store.lineages
+    assert "root-val-1" not in store.required_capabilities
+
+    # 2. Whitespace-only root capability raises ValueError
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        await store.register_root_task(root, required_capability="   ")
+    assert "root-val-1" not in store.registrations
+
+    # 3. Unknown root capability raises ValueError
+    with pytest.raises(ValueError, match="Unrecognized required_capability 'unknown'"):
+        await store.register_root_task(root, required_capability="unknown")
+    assert "root-val-1" not in store.registrations
+
+    # 4. Explicit empty child capability does not become 'analysis'; raises ValueError before mutation
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        await store.register_child_task(child, required_capability="")
+    assert "child-val-1" not in store.statuses
+    assert "child-val-1" not in store.lineages
+    assert "child-val-1" not in store.required_capabilities
+    assert "child-val-1" not in store.children.get("root-val-1", set())
+
+    # 5. Whitespace-only child capability raises ValueError
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        await store.register_child_task(child, required_capability="   ")
+    assert "child-val-1" not in store.statuses
+
+    # 6. Unknown child capability raises ValueError
+    with pytest.raises(ValueError, match="Unrecognized required_capability 'fast'"):
+        await store.register_child_task(child, required_capability="fast")
+    assert "child-val-1" not in store.statuses
+
+    # 7. Valid default registrations succeed unchanged
+    await store.register_root_task(root)
+    assert store.required_capabilities["root-val-1"].required_capability == "general"
+
+    await store.register_child_task(child)
+    assert store.required_capabilities["child-val-1"].required_capability == "analysis"
+
+    # 8. Valid explicit capabilities succeed
+    root_res = TaskRequested(
+        task_id="root-val-2",
+        prompt="Root prompt 2",
+        created_at=now,
+        root_task_id="root-val-2",
+        parent_task_id=None,
+        version=2,
+    )
+    await store.register_root_task(root_res, required_capability="research")
+    assert store.required_capabilities["root-val-2"].required_capability == "research"
+
+    child_res = TaskRequested(
+        task_id="child-val-2",
+        prompt="Child prompt 2",
+        created_at=now,
+        root_task_id="root-val-1",
+        parent_task_id="root-val-1",
+        version=2,
+    )
+    await store.register_child_task(child_res, required_capability="research")
+    assert store.required_capabilities["child-val-2"].required_capability == "research"

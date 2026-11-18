@@ -8,6 +8,7 @@ from .serialization import (
     canonical_json_dumps,
     check_no_credential_bearing_keys,
     freeze_value,
+    normalize_canonical_utc_timestamp,
     to_plain_json_structure,
 )
 
@@ -85,7 +86,9 @@ class StageArtifact:
 
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ValueError("created_at must be a non-empty string")
-        object.__setattr__(self, "created_at", self.created_at.strip())
+        object.__setattr__(
+            self, "created_at", normalize_canonical_utc_timestamp(self.created_at)
+        )
 
         if type(self.sealed) is not bool or not self.sealed:
             raise ValueError("sealed must be True for committed stage artifacts")

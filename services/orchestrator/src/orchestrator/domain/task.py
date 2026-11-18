@@ -34,6 +34,10 @@ class ConflictingRootTaskRegistrationError(Exception):
     """Raised when attempting to register a root task with conflicting or partial state."""
 
 
+class ConflictingChildTaskRegistrationError(Exception):
+    """Raised when attempting to register a child task with conflicting or partial state."""
+
+
 class NonContiguousVersionError(Exception):
     """Raised when a versioned record write skips a contiguous sequence number (N > 1 without N - 1)."""
 

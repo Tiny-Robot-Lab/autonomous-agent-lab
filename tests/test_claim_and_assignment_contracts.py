@@ -5,12 +5,16 @@ from datetime import UTC, datetime
 import pytest
 from agent_contracts import (
     ACTIVE_CLAIM_CONTRACT_VERSION,
+    ALLOWED_REQUIRED_CAPABILITIES,
     DELEGATION_GRANT_CONTRACT_VERSION,
+    REQUIRED_CAPABILITY_CONTRACT_VERSION,
     TASK_ASSIGNMENT_CONTRACT_VERSION,
     WAKE_UP_HINT_CONTRACT_VERSION,
     ActiveClaim,
     ArtifactReference,
     DelegationGrant,
+    RequiredCapabilityRecord,
+    StageArtifact,
     TaskAssignment,
     TaskInputReference,
     WakeUpHint,
@@ -559,3 +563,234 @@ def test_canonical_utc_timestamp_normalization_and_comparison_safety() -> None:
             claimed_at="2026-01-01 12:00:00",
             delivery_expires_at="2026-01-01T12:00:30Z",
         )
+
+
+def test_required_capability_record_contracts() -> None:
+    now = datetime.now(UTC).isoformat()
+    assert ALLOWED_REQUIRED_CAPABILITIES == frozenset({"general", "research", "analysis"})
+
+    # 1. Allowed capabilities are accepted
+    for cap in ("general", "research", "analysis"):
+        rec = RequiredCapabilityRecord(
+            task_id="task-123",
+            required_capability=cap,
+            created_at=now,
+        )
+        assert rec.task_id == "task-123"
+        assert rec.required_capability == cap
+        assert rec.version == REQUIRED_CAPABILITY_CONTRACT_VERSION
+
+    # Leading/trailing whitespace is normalized
+    rec_ws = RequiredCapabilityRecord(
+        task_id="  task-ws  ",
+        required_capability="  research  ",
+        created_at=now,
+    )
+    assert rec_ws.task_id == "task-ws"
+    assert rec_ws.required_capability == "research"
+
+    # Immutability
+    with pytest.raises(AttributeError):
+        rec.required_capability = "analysis"  # type: ignore[misc]
+
+    # JSON roundtrip
+    payload = rec.to_json()
+    restored = RequiredCapabilityRecord.from_json(payload)
+    assert restored == rec
+
+    # Validation errors: task_id
+    with pytest.raises(ValueError, match="task_id must be a non-empty string"):
+        RequiredCapabilityRecord(task_id="", required_capability="general", created_at=now)
+    with pytest.raises(ValueError, match="task_id must be a non-empty string"):
+        RequiredCapabilityRecord(task_id="   ", required_capability="general", created_at=now)
+
+    # Validation errors: empty and whitespace-only capabilities
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="", created_at=now)
+    with pytest.raises(ValueError, match="required_capability must be a non-empty string"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="   ", created_at=now)
+
+    # Validation errors: unknown capability rejected
+    with pytest.raises(ValueError, match="Unrecognized required_capability 'unknown'"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="unknown", created_at=now)
+    with pytest.raises(ValueError, match="Unrecognized required_capability 'fast'"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="fast", created_at=now)
+
+    # Validation errors: version
+    with pytest.raises(ValueError, match="Unsupported contract version"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="general", created_at=now, version=2)
+    with pytest.raises(TypeError, match="version must be an int"):
+        RequiredCapabilityRecord(task_id="t1", required_capability="general", created_at=now, version=True)  # type: ignore[arg-type]
+
+
+def test_required_capability_from_dict_and_parsing_rules() -> None:
+    now = datetime.now(UTC).isoformat()
+    valid_dict = {
+        "task_id": "task-test",
+        "required_capability": "analysis",
+        "created_at": now,
+        "version": 1,
+    }
+    rec = RequiredCapabilityRecord.from_dict(valid_dict)
+    assert rec.task_id == "task-test"
+    assert rec.required_capability == "analysis"
+    assert rec.version == 1
+
+    # Version omitted defaults to 1
+    without_version = {
+        "task_id": "task-test",
+        "required_capability": "general",
+        "created_at": now,
+    }
+    rec_no_ver = RequiredCapabilityRecord.from_dict(without_version)
+    assert rec_no_ver.version == 1
+    assert rec_no_ver.required_capability == "general"
+
+    # Non-dict rejected
+    with pytest.raises(TypeError, match="data must be a dict"):
+        RequiredCapabilityRecord.from_dict("not-a-dict")  # type: ignore[arg-type]
+
+    # Unexpected fields rejected
+    with pytest.raises(TypeError, match="unexpected RequiredCapabilityRecord fields: \\['extra'\\]"):
+        RequiredCapabilityRecord.from_dict({**valid_dict, "extra": "forbidden"})
+
+    # Missing required fields rejected
+    for missing_field in ("task_id", "required_capability", "created_at"):
+        incomplete = dict(valid_dict)
+        del incomplete[missing_field]
+        with pytest.raises(ValueError, match=f"{missing_field} is required"):
+            RequiredCapabilityRecord.from_dict(incomplete)
+
+    # Unsupported version rejected
+    with pytest.raises(ValueError, match="Unsupported contract version"):
+        RequiredCapabilityRecord.from_dict({**valid_dict, "version": 999})
+
+    # Non-int / bool version rejected
+    with pytest.raises(TypeError, match="version must be an int"):
+        RequiredCapabilityRecord.from_dict({**valid_dict, "version": True})
+    with pytest.raises(TypeError, match="version must be an int"):
+        RequiredCapabilityRecord.from_dict({**valid_dict, "version": "1"})
+
+    # Credential-bearing keys rejected
+    with pytest.raises(ValueError, match="Credential-bearing key"):
+        RequiredCapabilityRecord.from_dict({**valid_dict, "api_key": "secret"})
+
+    # from_json non-string rejected
+    with pytest.raises(TypeError, match="value must be a string"):
+        RequiredCapabilityRecord.from_json(123)  # type: ignore[arg-type]
+
+
+def test_active_claim_state_and_acknowledged_at_invariant() -> None:
+    now = datetime.now(UTC).isoformat()
+
+    # 1. State 'claimed_unacknowledged' requires acknowledged_at is None
+    with pytest.raises(ValueError, match="acknowledged_at must be None"):
+        ActiveClaim(
+            task_id="t1",
+            assignment_id="a1",
+            claim_id="c1",
+            root_task_id="r1",
+            turn_id="turn1",
+            runtime_principal_id="p1",
+            bound_agent_id="ag1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req1",
+            claimed_at=now,
+            delivery_expires_at=now,
+            state="claimed_unacknowledged",
+            acknowledged_at=now,
+        )
+
+    # 2. State 'acknowledged' requires non-empty acknowledged_at
+    with pytest.raises(ValueError, match="acknowledged_at must be set"):
+        ActiveClaim(
+            task_id="t1",
+            assignment_id="a1",
+            claim_id="c1",
+            root_task_id="r1",
+            turn_id="turn1",
+            runtime_principal_id="p1",
+            bound_agent_id="ag1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req1",
+            claimed_at=now,
+            delivery_expires_at=now,
+            state="acknowledged",
+            acknowledged_at=None,
+        )
+
+    # 3. Invalid prior_claimable_status rejected
+    with pytest.raises(ValueError, match="Invalid prior_claimable_status"):
+        ActiveClaim(
+            task_id="t1",
+            assignment_id="a1",
+            claim_id="c1",
+            root_task_id="r1",
+            turn_id="turn1",
+            runtime_principal_id="p1",
+            bound_agent_id="ag1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="a" * 64,
+            request_id="req1",
+            claimed_at=now,
+            delivery_expires_at=now,
+            prior_claimable_status="invalid_status",
+        )
+
+    # 4. Valid prior_claimable_status ('pending' and 'resumable')
+    claim_pending = ActiveClaim(
+        task_id="t1",
+        assignment_id="a1",
+        claim_id="c1",
+        root_task_id="r1",
+        turn_id="turn1",
+        runtime_principal_id="p1",
+        bound_agent_id="ag1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req1",
+        claimed_at=now,
+        delivery_expires_at=now,
+        prior_claimable_status="pending",
+    )
+    assert claim_pending.prior_claimable_status == "pending"
+
+    claim_resumable = ActiveClaim(
+        task_id="t1",
+        assignment_id="a1",
+        claim_id="c1",
+        root_task_id="r1",
+        turn_id="turn1",
+        runtime_principal_id="p1",
+        bound_agent_id="ag1",
+        assigned_capability="research",
+        execution_kind="resumed_continuation",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req1",
+        claimed_at=now,
+        delivery_expires_at=now,
+        prior_claimable_status="resumable",
+    )
+    assert claim_resumable.prior_claimable_status == "resumable"
+
+
+def test_stage_artifact_timestamp_normalization() -> None:
+    artifact = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="task-1",
+        artifact_type="research_material",
+        content={"material": "Foundational findings"},
+        created_at="2026-01-01T12:00:00+00:00",
+    )
+    assert artifact.created_at == "2026-01-01T12:00:00.000000Z"

@@ -11,6 +11,7 @@ from .serialization import (
 ACTIVE_CLAIM_CONTRACT_VERSION = 1
 ALLOWED_CLAIM_STATES = frozenset({"claimed_unacknowledged", "acknowledged"})
 ALLOWED_CLAIM_EXECUTION_KINDS = frozenset({"initial", "delegated_child", "resumed_continuation"})
+ALLOWED_PRIOR_CLAIMABLE_STATUSES = frozenset({"pending", "resumable"})
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class ActiveClaim:
     request_id: str
     claimed_at: str
     delivery_expires_at: str
+    prior_claimable_status: str = "pending"
     state: str = "claimed_unacknowledged"
     continuation_version: int | None = None
     delegation_grant_id: str | None = None
@@ -75,6 +77,16 @@ class ActiveClaim:
             raise ValueError(
                 f"Invalid claim state: '{self.state}'. Allowed states: {sorted(ALLOWED_CLAIM_STATES)}"
             )
+
+        if self.prior_claimable_status not in ALLOWED_PRIOR_CLAIMABLE_STATUSES:
+            raise ValueError(
+                f"Invalid prior_claimable_status: '{self.prior_claimable_status}'. Allowed: {sorted(ALLOWED_PRIOR_CLAIMABLE_STATUSES)}"
+            )
+
+        if self.state == "acknowledged" and self.acknowledged_at is None:
+            raise ValueError("acknowledged_at must be set when state is 'acknowledged'")
+        if self.state == "claimed_unacknowledged" and self.acknowledged_at is not None:
+            raise ValueError("acknowledged_at must be None when state is 'claimed_unacknowledged'")
 
         if self.execution_kind not in ALLOWED_CLAIM_EXECUTION_KINDS:
             raise ValueError(
@@ -132,6 +144,7 @@ class ActiveClaim:
             "delivery_expires_at": self.delivery_expires_at,
             "execution_kind": self.execution_kind,
             "fencing_epoch": self.fencing_epoch,
+            "prior_claimable_status": self.prior_claimable_status,
             "proof_digest": self.proof_digest,
             "request_id": self.request_id,
             "root_task_id": self.root_task_id,
@@ -164,6 +177,7 @@ class ActiveClaim:
             "delivery_expires_at",
             "execution_kind",
             "fencing_epoch",
+            "prior_claimable_status",
             "proof_digest",
             "request_id",
             "root_task_id",
@@ -188,6 +202,7 @@ class ActiveClaim:
             "assigned_capability",
             "execution_kind",
             "fencing_epoch",
+            "prior_claimable_status",
             "proof_digest",
             "request_id",
             "claimed_at",
@@ -218,6 +233,7 @@ class ActiveClaim:
             request_id=data["request_id"],
             claimed_at=data["claimed_at"],
             delivery_expires_at=data["delivery_expires_at"],
+            prior_claimable_status=data.get("prior_claimable_status", "pending"),
             state=data.get("state", "claimed_unacknowledged"),
             continuation_version=data.get("continuation_version"),
             delegation_grant_id=data.get("delegation_grant_id"),

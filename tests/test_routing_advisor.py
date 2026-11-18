@@ -934,7 +934,12 @@ async def test_20_no_candidate_rejection_preserves_provenance() -> None:
 @pytest.mark.anyio
 async def test_21_dispatch_failure_preserves_provenance() -> None:
     class FailingDispatcher(TaskDispatcher):
-        async def dispatch(self, task: TaskRequested, target: str) -> None:
+        async def dispatch(
+            self,
+            task: TaskRequested,
+            target: str,
+            capability: str | None = None,
+        ) -> None:
             raise RuntimeError("Transport connection lost during dispatch")
 
     ambiguous_assessment = RoutingAssessment(

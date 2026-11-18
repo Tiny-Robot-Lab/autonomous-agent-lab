@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
-from agent_contracts import TaskRequested
+from agent_contracts import TaskContinuation, TaskRequested
 from orchestrator.config import Settings
 from orchestrator.domain.principal import (
     compute_token_digest,
@@ -108,7 +108,7 @@ async def test_research_initial_root_claim_receives_grant_and_detached_proof(
 ) -> None:
     store = InMemoryAuthoritativeTaskStore()
     root = TaskRequested.create("Research root task")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
@@ -247,7 +247,7 @@ async def test_acknowledgement_and_artifact_staging_lifecycle(
 ) -> None:
     store = InMemoryAuthoritativeTaskStore()
     root = TaskRequested.create("Research root task")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
@@ -363,7 +363,7 @@ async def test_delivery_lease_expiry_restores_claimability_via_api() -> None:
     )
     store = InMemoryAuthoritativeTaskStore()
     root = TaskRequested.create("Root task with short lease")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     app = create_app(
@@ -474,7 +474,7 @@ async def test_expired_assignment_preserves_immutable_grants_and_advances_fencin
     # 1. Setup store with root task (register_root_task automatically sets up default root authority with research -> analysis)
     store = InMemoryAuthoritativeTaskStore()
     root = TaskRequested.create("Root task with delegation grant")
-    await store.register_root_task(root)
+    await store.register_root_task(root, required_capability="research")
     await store.update_status(root.task_id, "pending")
 
     short_lease_settings = Settings(
@@ -638,7 +638,13 @@ def test_settings_startup_validation_and_cryptographic_defaults(monkeypatch: pyt
 
     # 6. authenticated_claim fails startup when all runtime_principals are inactive
     inactive_principals = {
-        "p1": {"principal_id": "p1", "token_digest": "abc", "active": False}
+        "p1": {
+            "principal_id": "p1",
+            "bound_agent_id": "agent-1",
+            "token_digest": "a" * 64,
+            "authorized_capabilities": ["general"],
+            "active": False,
+        }
     }
     with pytest.raises(ValueError) as exc_info:
         Settings(
@@ -703,3 +709,277 @@ def test_settings_startup_validation_and_cryptographic_defaults(monkeypatch: pyt
     loaded_settings = Settings.from_env()
     assert len(loaded_settings.runtime_principals) == len(PRINCIPALS_CONFIG)
     monkeypatch.delenv("RUNTIME_PRINCIPALS_JSON", raising=False)
+
+
+@pytest.mark.anyio
+async def test_cross_capability_hijack_prevention(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+
+    # 1. Root task registered with required capability 'research'
+    research_task = TaskRequested.create("Research Task")
+    await store.register_root_task(research_task, required_capability="research")
+    await store.update_status(research_task.task_id, "pending")
+
+    # 2. Root task registered with required capability 'general'
+    general_task = TaskRequested.create("General Task")
+    await store.register_root_task(general_task, required_capability="general")
+    await store.update_status(general_task.task_id, "pending")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # General principal attempts to claim research task -> 403 Forbidden
+        res_hijack_1 = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": research_task.task_id,
+                "request_id": "req-hijack-1",
+                "capability": "general",
+                "execution_kind": "initial",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_hijack_1.status_code == 403
+        assert "requires capability 'research'" in res_hijack_1.json()["detail"]
+
+        # Research principal attempts to claim general task -> 403 Forbidden
+        res_hijack_2 = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": general_task.task_id,
+                "request_id": "req-hijack-2",
+                "capability": "research",
+                "execution_kind": "initial",
+            },
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}"},
+        )
+        assert res_hijack_2.status_code == 403
+        assert "requires capability 'general'" in res_hijack_2.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_execution_kind_lifecycle_compatibility_via_api(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+
+    root = TaskRequested.create("Root Task")
+    await store.register_root_task(root, required_capability="general")
+    await store.update_status(root.task_id, "pending")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Initial claim with expected_continuation_version provided -> 400 Bad Request
+        res_bad_cont = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-bad-cont",
+                "capability": "general",
+                "execution_kind": "initial",
+                "expected_continuation_version": 1,
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_bad_cont.status_code == 400
+        assert "expected_continuation_version must not be provided" in res_bad_cont.json()["detail"]
+
+        # 2. Resumed continuation without expected_continuation_version -> 400 Bad Request
+        res_missing_ver = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-missing-ver",
+                "capability": "general",
+                "execution_kind": "resumed_continuation",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_missing_ver.status_code == 400
+        assert "expected_continuation_version must be an integer >= 1" in res_missing_ver.json()["detail"]
+
+        # 3. Continuation not found -> 404 Not Found
+        res_cont_not_found = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-resumed-not-found",
+                "capability": "general",
+                "execution_kind": "resumed_continuation",
+                "expected_continuation_version": 1,
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_cont_not_found.status_code == 404
+        assert "not found" in res_cont_not_found.json()["detail"].lower()
+
+        # Save valid continuation 1
+        now_str = datetime.now(UTC).isoformat()
+        continuation = TaskContinuation(
+            parent_task_id=root.task_id,
+            child_task_id="child-123",
+            input_version=1,
+            continuation_capability="general",
+            stage="incorporate_analysis_child",
+            continuation_version=1,
+            created_at=now_str,
+            updated_at=now_str,
+        )
+        await store.save_continuation(continuation)
+
+        # 4. Resumed continuation on task with status 'pending' -> 409 Conflict
+        res_resumed_on_pending = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-resumed-pending",
+                "capability": "general",
+                "execution_kind": "resumed_continuation",
+                "expected_continuation_version": 1,
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_resumed_on_pending.status_code == 409
+        assert "lifecycle mismatch" in res_resumed_on_pending.json()["detail"].lower()
+
+        # 5. Initial claim on task with status 'resumable' -> 409 Conflict
+        await store.update_status(root.task_id, "resumable")
+        res_initial_on_resumable = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-initial-resumable",
+                "capability": "general",
+                "execution_kind": "initial",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_initial_on_resumable.status_code == 409
+        assert "lifecycle mismatch" in res_initial_on_resumable.json()["detail"].lower()
+
+        # 6. Delegated child claim on root task -> 409 Conflict
+        await store.update_status(root.task_id, "pending")
+        res_child_on_root = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-child-root",
+                "capability": "general",
+                "execution_kind": "delegated_child",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_child_on_root.status_code == 409
+        assert "not a delegated child" in res_child_on_root.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_missing_authoritative_task_input_rejects_claim(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+
+    root = TaskRequested.create("Root Task Without Input")
+    await store.register_root_task(root, required_capability="general")
+    await store.update_status(root.task_id, "pending")
+
+    # Manually remove TaskInput to simulate missing input record
+    del store.inputs[(root.task_id, 1)]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": root.task_id,
+                "request_id": "req-missing-input",
+                "capability": "general",
+                "execution_kind": "initial",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res.status_code == 409
+        assert "no authoritative input record" in res.json()["detail"].lower()
+
+
+def test_principal_registry_startup_validation() -> None:
+    # 1. Malformed token_digest (not 64 lowercase hex)
+    bad_digest_cfg = {
+        "p1": {
+            "principal_id": "p1",
+            "bound_agent_id": "ag1",
+            "token_digest": "not-valid-hex-64-characters",
+            "authorized_capabilities": ["general"],
+            "active": True,
+        }
+    }
+    with pytest.raises(ValueError, match="token_digest must be a 64-character lowercase hexadecimal string"):
+        Settings(
+            task_delivery_mode="authenticated_claim",
+            runtime_credential_pepper=PEPPER,
+            assignment_proof_pepper=PROOF_PEPPER,
+            runtime_principals=bad_digest_cfg,
+        )
+
+    # 2. Duplicate token_digest across principals
+    dup_digest_cfg = {
+        "p1": {
+            "principal_id": "p1",
+            "bound_agent_id": "ag1",
+            "token_digest": "a" * 64,
+            "authorized_capabilities": ["general"],
+            "active": True,
+        },
+        "p2": {
+            "principal_id": "p2",
+            "bound_agent_id": "ag2",
+            "token_digest": "a" * 64,
+            "authorized_capabilities": ["general"],
+            "active": True,
+        },
+    }
+    with pytest.raises(ValueError, match="duplicate token_digest"):
+        Settings(
+            task_delivery_mode="authenticated_claim",
+            runtime_credential_pepper=PEPPER,
+            assignment_proof_pepper=PROOF_PEPPER,
+            runtime_principals=dup_digest_cfg,
+        )
+
+    # 3. Duplicate active bound_agent_id across active principals
+    dup_agent_cfg = {
+        "p1": {
+            "principal_id": "p1",
+            "bound_agent_id": "shared-agent",
+            "token_digest": "a" * 64,
+            "authorized_capabilities": ["general"],
+            "active": True,
+        },
+        "p2": {
+            "principal_id": "p2",
+            "bound_agent_id": "shared-agent",
+            "token_digest": "b" * 64,
+            "authorized_capabilities": ["research"],
+            "active": True,
+        },
+    }
+    with pytest.raises(ValueError, match="duplicate bound_agent_id for active principal"):
+        Settings(
+            task_delivery_mode="authenticated_claim",
+            runtime_credential_pepper=PEPPER,
+            assignment_proof_pepper=PROOF_PEPPER,
+            runtime_principals=dup_agent_cfg,
+        )
+
+    # 4. Unrecognized capability in authorized_capabilities
+    unknown_cap_cfg = {
+        "p1": {
+            "principal_id": "p1",
+            "bound_agent_id": "ag1",
+            "token_digest": "a" * 64,
+            "authorized_capabilities": ["unrecognized_capability"],
+            "active": True,
+        }
+    }
+    with pytest.raises(ValueError, match="unrecognized or empty capability in authorized_capabilities"):
+        Settings(
+            task_delivery_mode="authenticated_claim",
+            runtime_credential_pepper=PEPPER,
+            assignment_proof_pepper=PROOF_PEPPER,
+            runtime_principals=unknown_cap_cfg,
+        )

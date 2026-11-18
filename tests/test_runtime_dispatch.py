@@ -616,7 +616,12 @@ async def test_runtime_dispatch_prefers_explicit_task_dispatcher() -> None:
         def __init__(self) -> None:
             self.dispatches: list[tuple[TaskRequested, str]] = []
 
-        async def dispatch(self, task: TaskRequested, target: str) -> None:
+        async def dispatch(
+            self,
+            task: TaskRequested,
+            target: str,
+            capability: str | None = None,
+        ) -> None:
             self.dispatches.append((task, target))
 
     dispatcher = PureDispatcher()

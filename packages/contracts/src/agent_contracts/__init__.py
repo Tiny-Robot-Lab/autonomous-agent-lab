@@ -1,5 +1,8 @@
 from .active_claim import (
     ACTIVE_CLAIM_CONTRACT_VERSION,
+    ALLOWED_CLAIM_EXECUTION_KINDS,
+    ALLOWED_CLAIM_STATES,
+    ALLOWED_PRIOR_CLAIMABLE_STATUSES,
     ActiveClaim,
 )
 from .artifact_reference import ArtifactReference
@@ -48,6 +51,11 @@ from .messages import (
     InferenceExecutionTelemetry,
     TaskRequested,
     ToolExecutionTelemetry,
+)
+from .required_capability import (
+    ALLOWED_REQUIRED_CAPABILITIES,
+    REQUIRED_CAPABILITY_CONTRACT_VERSION,
+    RequiredCapabilityRecord,
 )
 from .results import InferenceResponse, TaskResult
 from .root_authority import RootAuthorityRecord
@@ -119,7 +127,11 @@ from .wake_up_hint import (
 __all__ = [
     "ACTIVE_CLAIM_CONTRACT_VERSION",
     "ALLOWED_ARTIFACT_TYPES",
+    "ALLOWED_CLAIM_EXECUTION_KINDS",
+    "ALLOWED_CLAIM_STATES",
     "ALLOWED_CONTINUATION_STAGES",
+    "ALLOWED_PRIOR_CLAIMABLE_STATUSES",
+    "ALLOWED_REQUIRED_CAPABILITIES",
     "ALL_TASK_LIFECYCLE_STATUSES",
     "CHILD_LIFECYCLE_STATUSES",
     "DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS",
@@ -128,6 +140,7 @@ __all__ = [
     "MAX_STAGE_ARTIFACT_BYTES",
     "NONTERMINAL_TASK_LIFECYCLE_STATUSES",
     "PARENT_LIFECYCLE_STATUSES",
+    "REQUIRED_CAPABILITY_CONTRACT_VERSION",
     "STAGE_CONTROL_FIELDS_ALLOWLIST",
     "TASK_ASSIGNMENT_CONTRACT_VERSION",
     "TERMINAL_TASK_LIFECYCLE_STATUSES",
@@ -156,6 +169,7 @@ __all__ = [
     "LivenessPolicy",
     "NonFallbackInferenceError",
     "ProviderFailureSummary",
+    "RequiredCapabilityRecord",
     "RootAuthorityRecord",
     "RoutingDecision",
     "RoutingProvenance",
