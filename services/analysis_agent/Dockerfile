@@ -1,8 +1,9 @@
 FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src:/app/contracts
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src:/app/contracts:/app/infrastructure
 WORKDIR /app
 COPY services/analysis_agent/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY packages/contracts/src /app/contracts
+COPY packages/infrastructure/src /app/infrastructure
 COPY services/analysis_agent/src /app/src
 CMD ["python", "-m", "analysis_agent.main"]
