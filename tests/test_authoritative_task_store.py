@@ -10,7 +10,10 @@ from agent_contracts import (
     AgentAvailabilityState,
     AgentCandidate,
     AgentExecutionState,
+    ArtifactReference,
+    AssignmentYieldRecord,
     DelegationGrant,
+    DelegationProposalRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     StageArtifact,
@@ -18,18 +21,23 @@ from agent_contracts import (
     TaskInput,
     TaskRequested,
     WakeUpHint,
+    compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
 )
 from fastapi import Request
 from orchestrator.application.ports import (
     AuthoritativeTaskStore,
     CapabilityMismatchError,
+    ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    DelegationConflictError,
     FencingEpochRaceError,
+    GrantAlreadyConsumedError,
     TaskAlreadyClaimedError,
     TaskDispatcher,
     TaskNotClaimableError,
+    WaveBudgetExceededError,
 )
 from orchestrator.application.use_cases import RegisterChildTask, SubmitTask
 from orchestrator.config import Settings
@@ -71,6 +79,13 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.required_capabilities: dict[str, RequiredCapabilityRecord] = {}
         self.claims: dict[str, ActiveClaim] = {}
         self.fences: dict[str, int] = {}
+        self.proposals: dict[tuple[str, str], DelegationProposalRecord] = {}
+        self.yield_records: dict[tuple[str, str], AssignmentYieldRecord] = {}
+        self.consumed_waves: dict[str, set[str]] = {}
+        self.consumed_grants: dict[str, set[str]] = {}
+        self.claim_deadlines: dict[str, str] = {}
+        self.hints: list[WakeUpHint] = []
+        self.delegation_decisions: dict[str, set[str]] = {}
         self.fail_next_registration: bool = False
         self.root_registrations: list[tuple[TaskRequested, str]] = []
         self.child_registrations: list[tuple[TaskRequested, str]] = []
@@ -474,6 +489,11 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 raise TaskNotClaimableError(f"Task '{clean_task_id}' lifecycle mismatch for delegated_child execution: status='{effective_status}', is_root={is_root}")
             if expected_continuation_version is not None and expected_continuation_version > 0:
                 raise ValueError("continuation_version must remain absent for non-resumed claims")
+            deadline = self.claim_deadlines.get(clean_task_id)
+            if deadline and now_iso > deadline:
+                raise ChildClaimDeadlineExpiredError(
+                    f"Claim deadline for child task '{clean_task_id}' has expired ({deadline})"
+                )
         elif claim.execution_kind == "resumed_continuation":
             if not is_root or effective_status != "resumable":
                 raise TaskNotClaimableError(f"Task '{clean_task_id}' lifecycle mismatch for resumed_continuation execution: status='{effective_status}', is_root={is_root}")
@@ -568,6 +588,230 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             self.statuses[clean_task_id] = claim.prior_claimable_status
             return True
         return False
+
+    async def accept_delegation_proposal(
+        self,
+        parent_task_id: str,
+        proposal: DelegationProposalRecord,
+        child_task_input: TaskInput,
+        parent_continuation: TaskContinuation,
+        yield_record: AssignmentYieldRecord,
+        wake_up_hint: WakeUpHint,
+        expected_fencing_epoch: int,
+        now: str,
+    ) -> tuple[DelegationProposalRecord, bool]:
+        clean_parent = parent_task_id.strip()
+        proposal_key = (clean_parent, proposal.proposal_id.strip())
+
+        # Phase 1: Replay check
+        existing = self.proposals.get(proposal_key)
+        if existing is not None:
+            if (
+                existing.assignment_id == proposal.assignment_id
+                and existing.runtime_principal_id == proposal.runtime_principal_id
+                and existing.bound_agent_id == proposal.bound_agent_id
+                and existing.parent_task_id == clean_parent
+                and existing.proposal_id == proposal.proposal_id
+                and existing.proposal_fingerprint == proposal.proposal_fingerprint
+            ):
+                return (existing, True)
+            raise DelegationConflictError(
+                f"Conflicting proposal replay for proposal '{proposal.proposal_id}'"
+            )
+
+        # Phase 1: Validations
+        cur_status = self.statuses.get(clean_parent)
+        if not cur_status:
+            raise ParentTaskNotFoundError(f"Parent task '{clean_parent}' not found")
+        if cur_status != "working":
+            raise TaskNotClaimableError(
+                f"Parent task '{clean_parent}' must be in 'working' status, got '{cur_status}'"
+            )
+
+        waves = self.consumed_waves.setdefault(clean_parent, set())
+        if "1" in waves:
+            raise WaveBudgetExceededError(f"Wave budget exceeded for parent task '{clean_parent}'")
+
+        grants = self.consumed_grants.setdefault(clean_parent, set())
+        if proposal.delegation_grant_id in grants:
+            raise GrantAlreadyConsumedError(
+                f"Authority grant '{proposal.delegation_grant_id}' has already been consumed"
+            )
+
+        claim = self.claims.get(clean_parent)
+        if not claim:
+            raise ClaimNotFoundError(f"Active claim for parent task '{clean_parent}' not found")
+        if claim.assignment_id != proposal.assignment_id or claim.runtime_principal_id != proposal.runtime_principal_id:
+            raise ClaimNotFoundError("Assignment ID or principal mismatch on parent claim")
+        if claim.bound_agent_id != proposal.bound_agent_id:
+            raise ClaimNotFoundError("Bound agent mismatch on parent claim")
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Parent assignment must be acknowledged before proposing delegation")
+        if claim.assigned_capability != "research":
+            raise CapabilityMismatchError("Only research assignments may propose delegation")
+        if claim.execution_kind != "initial":
+            raise TaskNotClaimableError("Only initial research root claims may propose delegation")
+
+        cur_fence = self.fences.get(clean_parent, 0)
+        if cur_fence != expected_fencing_epoch or claim.fencing_epoch != expected_fencing_epoch:
+            raise FencingEpochRaceError(
+                f"Fencing epoch mismatch for parent task '{clean_parent}': expected {expected_fencing_epoch}, current {cur_fence}"
+            )
+
+        parent_lineage = self.lineages.get(clean_parent)
+        if (
+            not parent_lineage
+            or not parent_lineage.is_root
+            or parent_lineage.task_id != clean_parent
+            or parent_lineage.root_task_id != clean_parent
+            or bool(parent_lineage.parent_task_id)
+        ):
+            raise TaskNotClaimableError(f"Parent task '{clean_parent}' is not an eligible root task")
+
+        # Verify root authority record
+        root_auth = self.authorities.get(clean_parent)
+        if not root_auth:
+            raise ParentTaskNotFoundError(f"Root authority record for '{clean_parent}' not found")
+        if root_auth.root_task_id != clean_parent:
+            raise DelegationConflictError("Root authority binding mismatch")
+        d = getattr(root_auth, "max_delegation_depth", None)
+        w = getattr(root_auth, "max_delegation_waves", None)
+        c = getattr(root_auth, "max_children_per_wave", None)
+        if (
+            type(d) is not int or d != 1
+            or type(w) is not int or w != 1
+            or type(c) is not int or c != 1
+        ):
+            raise WaveBudgetExceededError("Root authority policy bounds violation")
+        if ("research", "analysis") not in root_auth.allowed_delegation_edges:
+            raise DelegationConflictError("Delegation edge research->analysis not permitted by root authority")
+
+        # Verify delegation grant record
+        grant_rec = self.authority_grants.get((clean_parent, proposal.delegation_grant_id))
+        if not grant_rec:
+            raise ParentTaskNotFoundError(f"Delegation grant '{proposal.delegation_grant_id}' not found")
+        if grant_rec.grant_id != proposal.delegation_grant_id:
+            raise DelegationConflictError("Delegation grant ID mismatch")
+        if grant_rec.root_task_id != clean_parent:
+            raise DelegationConflictError("Delegation grant root task binding mismatch")
+        if grant_rec.issued_to_assignment_id != proposal.assignment_id:
+            raise ClaimNotFoundError("Delegation grant issued assignment mismatch")
+        if grant_rec.issued_to_principal_id != proposal.runtime_principal_id:
+            raise ClaimNotFoundError("Delegation grant issued principal mismatch")
+        if not claim.turn_id or not grant_rec.turn_id or grant_rec.turn_id != claim.turn_id:
+            raise ClaimNotFoundError("Delegation grant turn mismatch")
+        if grant_rec.source_capability != "research" or grant_rec.target_capability != "analysis":
+            raise CapabilityMismatchError("Delegation grant capability mismatch")
+        if grant_rec.fencing_epoch != expected_fencing_epoch:
+            raise FencingEpochRaceError("Delegation grant fencing epoch mismatch")
+        gd = getattr(grant_rec, "max_depth", None)
+        gw = getattr(grant_rec, "max_waves", None)
+        gc = getattr(grant_rec, "max_children", None)
+        if (
+            type(gd) is not int or gd != 1
+            or type(gw) is not int or gw != 1
+            or type(gc) is not int or gc != 1
+        ):
+            raise WaveBudgetExceededError("Delegation grant bounds violation")
+
+        # Verify sealed artifact exists
+        if child_task_input.artifact_references:
+            art_ref = child_task_input.artifact_references[0]
+            art = self.artifacts.get((art_ref.producing_task_id, art_ref.artifact_id, art_ref.artifact_version))
+            if not art or not art.sealed:
+                raise ValueError("Referenced artifact not found or not sealed")
+            if art.producing_task_id != clean_parent:
+                raise ValueError("Artifact producing task mismatch")
+            if art.artifact_type != "research_material":
+                raise ValueError(f"Artifact type must be research_material, got {art.artifact_type}")
+            if art.artifact_id != art_ref.artifact_id or art.artifact_version != art_ref.artifact_version:
+                raise ValueError("Artifact identity mismatch")
+            if not art.producing_turn_id or type(art.producing_turn_id) is not str:
+                raise ValueError("Artifact producing_turn_id missing")
+            if art.producing_turn_id != claim.turn_id:
+                raise ValueError("Artifact producing_turn_id does not match active claim turn_id")
+            if type(art.payload_schema_version) is not int or art.payload_schema_version != 1:
+                raise ValueError(f"Unsupported artifact payload_schema_version: {art.payload_schema_version}")
+            if type(art.version) is not int or art.version != 1:
+                raise ValueError(f"Unsupported artifact contract version: {art.version}")
+        else:
+            raise ValueError("Child task input must reference at least one sealed artifact")
+
+        # Verify parent TaskInput version exists and is valid
+        parent_input = self.inputs.get((clean_parent, parent_continuation.input_version))
+        if parent_input is None:
+            raise ValueError(f"Parent TaskInput version {parent_continuation.input_version} not found")
+        if parent_input.task_id != clean_parent:
+            raise ValueError("Parent TaskInput task_id mismatch")
+        if parent_input.input_version != parent_continuation.input_version:
+            raise ValueError("Parent TaskInput input_version mismatch")
+        if type(parent_input.version) is not int or parent_input.version != 1:
+            raise CorruptAuthoritativeRecordError(f"Unsupported TaskInput contract version: {parent_input.version}")
+        if not parent_input.prompt or not isinstance(parent_input.prompt, str):
+            raise CorruptAuthoritativeRecordError("Parent TaskInput prompt is invalid")
+
+        # Verify immutable target keys do not exist before write
+        clean_child = proposal.child_task_id.strip()
+        if (
+            clean_child in self.statuses
+            or clean_child in self.lineages
+            or clean_child in self.required_capabilities
+            or (clean_child, 1) in self.inputs
+            or clean_child in self.claim_deadlines
+            or clean_child in self.fences
+        ):
+            raise ConflictingChildTaskRegistrationError(f"Child task '{clean_child}' already exists")
+
+        if (clean_parent, yield_record.assignment_id) in self.yield_records:
+            raise ConflictingChildTaskRegistrationError(f"Yield record for '{clean_parent}' already exists")
+
+        # Verify continuation version 1 does not exist
+        if (clean_parent, 1) in self.continuations or clean_parent in self.latest_continuation:
+            raise ConflictingContinuationError(f"Continuation version 1 already exists for task '{clean_parent}'")
+
+        # Phase 2: Commits
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        self.proposals[proposal_key] = proposal
+        self.statuses[clean_child] = "pending"
+        self.claim_deadlines[clean_child] = proposal.child_claim_deadline
+        self.fences[clean_child] = 0
+        self.required_capabilities[clean_child] = RequiredCapabilityRecord(
+            task_id=clean_child,
+            required_capability="analysis",
+            created_at=now_iso,
+            version=1,
+        )
+        self.lineages[clean_child] = TaskLineage(
+            task_id=clean_child,
+            root_task_id=parent_lineage.root_task_id,
+            parent_task_id=clean_parent,
+        )
+        self.inputs[(clean_child, 1)] = child_task_input
+        self.children.setdefault(clean_parent, set()).add(clean_child)
+        self.continuations[(clean_parent, 1)] = parent_continuation
+        self.latest_continuation[clean_parent] = 1
+        self.statuses[clean_parent] = "waiting_for_children"
+        del self.claims[clean_parent]
+        self.yield_records[(clean_parent, yield_record.assignment_id)] = yield_record
+        waves.add("1")
+        grants.add(proposal.delegation_grant_id)
+        self.delegation_decisions.setdefault(clean_parent, set()).add(proposal.delegation_decision_id)
+        self.hints.append(wake_up_hint)
+
+        return (proposal, False)
+
+    async def get_delegation_proposal(
+        self,
+        parent_task_id: str,
+        proposal_id: str,
+    ) -> DelegationProposalRecord | None:
+        clean_parent = str(parent_task_id).strip()
+        clean_proposal_id = str(proposal_id).strip()
+        return self.proposals.get((clean_parent, clean_proposal_id))
 
 
 class MockAtomicDispatcher(TaskDispatcher):
@@ -2424,3 +2668,257 @@ async def test_registration_capability_validation_and_zero_mutation() -> None:
     )
     await store.register_child_task(child_res, required_capability="research")
     assert store.required_capabilities["child-val-2"].required_capability == "research"
+
+
+@pytest.mark.anyio
+async def test_in_memory_accept_delegation_proposal_and_replay():
+    store = InMemoryAuthoritativeTaskStore()
+    now = normalize_canonical_utc_timestamp(datetime.now(UTC))
+
+    # Setup parent root task
+    root_task = TaskRequested(
+        task_id="parent-1",
+        prompt="Conduct research",
+        created_at=now,
+        root_task_id="parent-1",
+        parent_task_id=None,
+        version=2,
+    )
+    await store.register_root_task(root_task, initial_status="pending", required_capability="research")
+
+    # Claim parent task as Research
+    claim = ActiveClaim(
+        task_id="parent-1",
+        assignment_id="asgn-1",
+        claim_id="claim-1",
+        root_task_id="parent-1",
+        turn_id="turn-1",
+        runtime_principal_id="research-agent-1",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="digest-1",
+        request_id="req-1",
+        claimed_at=now,
+        delivery_expires_at="2099-01-01T00:00:00.000000Z",
+        prior_claimable_status="pending",
+    )
+    grant = DelegationGrant(
+        grant_id="grant-1",
+        root_task_id="parent-1",
+        issued_to_assignment_id="asgn-1",
+        issued_to_principal_id="research-agent-1",
+        fencing_epoch=1,
+        turn_id="turn-1",
+        issued_at=now,
+    )
+    await store.atomic_claim_task("parent-1", claim, grant=grant, now=now)
+    await store.acknowledge_claim("parent-1", "asgn-1", "research-agent-1", now)
+
+    # Save stage artifact
+    art = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id="parent-1",
+        artifact_type="research_material",
+        content={"material": "sample research"},
+        created_at=now,
+        producing_turn_id="turn-1",
+        artifact_version=1,
+    )
+    await store.save_stage_artifact(art, "asgn-1", "research-agent-1", 1)
+
+    # Prepare delegation proposal
+    art_ref = ArtifactReference(
+        artifact_id="art-1",
+        artifact_version=1,
+        producing_task_id="parent-1",
+    )
+    fp = compute_proposal_fingerprint(
+        parent_task_id="parent-1",
+        proposal_id="prop-1",
+        assignment_id="asgn-1",
+        target_capability="analysis",
+        child_intent="Analyze anomalies",
+        artifact_reference=art_ref,
+        parent_input_version=1,
+    )
+    proposal = DelegationProposalRecord(
+        parent_task_id="parent-1",
+        proposal_id="prop-1",
+        child_task_id="child-1",
+        delegation_decision_id="dec-1",
+        assignment_id="asgn-1",
+        runtime_principal_id="research-agent-1",
+        bound_agent_id="research-agent-1",
+        proof_digest="digest-1",
+        proposal_fingerprint=fp,
+        delegation_grant_id="grant-1",
+        child_claim_deadline="2099-01-01T00:02:00.000000Z",
+        accepted_at=now,
+        target_capability="analysis",
+        continuation_version=1,
+    )
+    child_input = TaskInput(
+        task_id="child-1",
+        prompt="Analyze anomalies",
+        created_at=now,
+        input_version=1,
+        artifact_references=(art_ref,),
+    )
+    continuation = TaskContinuation(
+        parent_task_id="parent-1",
+        child_task_id="child-1",
+        created_at=now,
+        updated_at=now,
+        input_version=1,
+        continuation_capability="research",
+        stage="incorporate_analysis_child",
+        artifact_references=(art_ref,),
+        continuation_version=1,
+    )
+    yield_rec = AssignmentYieldRecord(
+        assignment_id="asgn-1",
+        parent_task_id="parent-1",
+        principal_id="research-agent-1",
+        proposal_id="prop-1",
+        child_task_id="child-1",
+        delegation_decision_id="dec-1",
+        continuation_version=1,
+        yielded_at=now,
+    )
+    hint = WakeUpHint(
+        hint_id="hint-1",
+        capability="analysis",
+        created_at=now,
+        execution_kind="delegated_child",
+        task_id="child-1",
+    )
+
+    # 1. First acceptance
+    accepted, is_replay = await store.accept_delegation_proposal(
+        parent_task_id="parent-1",
+        proposal=proposal,
+        child_task_input=child_input,
+        parent_continuation=continuation,
+        yield_record=yield_rec,
+        wake_up_hint=hint,
+        expected_fencing_epoch=1,
+        now=now,
+    )
+    assert not is_replay
+    assert accepted == proposal
+    assert store.statuses["parent-1"] == "waiting_for_children"
+    assert store.statuses["child-1"] == "pending"
+    assert "parent-1" not in store.claims  # Retired active claim
+    assert store.yield_records[("parent-1", "asgn-1")] == yield_rec
+    assert "1" in store.consumed_waves["parent-1"]
+    assert "grant-1" in store.consumed_grants["parent-1"]
+    assert len(store.hints) == 1
+
+    # 2. Idempotent replay: returns stored proposal, zero mutations, no second hint
+    replayed, is_replay_2 = await store.accept_delegation_proposal(
+        parent_task_id="parent-1",
+        proposal=proposal,
+        child_task_input=child_input,
+        parent_continuation=continuation,
+        yield_record=yield_rec,
+        wake_up_hint=hint,
+        expected_fencing_epoch=1,
+        now=now,
+    )
+    assert is_replay_2
+    assert replayed == proposal
+    assert len(store.hints) == 1
+
+    # 3. Conflicting replay (mismatched fingerprint) fails closed
+    conflicting_proposal = DelegationProposalRecord(
+        parent_task_id="parent-1",
+        proposal_id="prop-1",
+        child_task_id="child-1",
+        delegation_decision_id="dec-1",
+        assignment_id="asgn-1",
+        runtime_principal_id="research-agent-1",
+        bound_agent_id="research-agent-1",
+        proof_digest="digest-1",
+        proposal_fingerprint="conflicting-fingerprint",
+        delegation_grant_id="grant-1",
+        child_claim_deadline="2099-01-01T00:02:00.000000Z",
+        accepted_at=now,
+        target_capability="analysis",
+        continuation_version=1,
+    )
+    with pytest.raises(DelegationConflictError, match="Conflicting proposal replay"):
+        await store.accept_delegation_proposal(
+            parent_task_id="parent-1",
+            proposal=conflicting_proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+
+
+@pytest.mark.anyio
+async def test_in_memory_child_claim_deadline_enforcement():
+    store = InMemoryAuthoritativeTaskStore()
+    now_past = "2026-01-01T00:00:00.000000Z"
+    deadline = "2026-01-01T00:02:00.000000Z"
+    now_after_deadline = "2026-01-01T00:02:01.000000Z"
+
+    store.statuses["child-1"] = "pending"
+    store.lineages["child-1"] = TaskLineage(task_id="child-1", root_task_id="root-1", parent_task_id="root-1")
+    store.required_capabilities["child-1"] = RequiredCapabilityRecord(task_id="child-1", required_capability="analysis", created_at=now_past)
+    store.claim_deadlines["child-1"] = deadline
+
+    claim = ActiveClaim(
+        task_id="child-1",
+        assignment_id="asgn-c-1",
+        claim_id="claim-c-1",
+        root_task_id="root-1",
+        turn_id="turn-c-1",
+        runtime_principal_id="analysis-agent-1",
+        bound_agent_id="analysis-agent-1",
+        assigned_capability="analysis",
+        execution_kind="delegated_child",
+        fencing_epoch=1,
+        proof_digest="digest-c",
+        request_id="req-c-1",
+        claimed_at=now_after_deadline,
+        delivery_expires_at="2099-01-01T00:00:00.000000Z",
+        prior_claimable_status="pending",
+    )
+
+    # Claim after deadline is rejected
+    with pytest.raises(ChildClaimDeadlineExpiredError, match="Claim deadline for child task 'child-1' has expired"):
+        await store.atomic_claim_task("child-1", claim, now=now_after_deadline, is_root=False)
+
+    # Claim at or before deadline succeeds
+    now_within = "2026-01-01T00:02:00.000000Z"
+    active, is_rep = await store.atomic_claim_task("child-1", claim, now=now_within, is_root=False)
+    assert not is_rep
+    assert active.task_id == "child-1"
+    assert store.statuses["child-1"] == "working"
+
+
+def test_consolidated_exception_class_identity():
+    from orchestrator.application import ports
+    from orchestrator.domain import task
+    from orchestrator.presentation import api
+
+    # Proves the 4 exception classes are removed from domain/task.py
+    for exc_name in (
+        "DelegationConflictError",
+        "WaveBudgetExceededError",
+        "GrantAlreadyConsumedError",
+        "ChildClaimDeadlineExpiredError",
+    ):
+        assert not hasattr(task, exc_name), f"{exc_name} must not be defined in domain.task"
+
+    # Proves the exception raised by store/ports is identical to the one caught in presentation/api
+    assert ports.DelegationConflictError is api.DelegationConflictError
+    assert ports.WaveBudgetExceededError is api.WaveBudgetExceededError
+    assert ports.GrantAlreadyConsumedError is api.GrantAlreadyConsumedError
+    assert ports.ChildClaimDeadlineExpiredError is api.ChildClaimDeadlineExpiredError

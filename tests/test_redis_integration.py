@@ -12,7 +12,10 @@ from agent_contracts import (
     ActiveClaim,
     AgentCapabilityMetadata,
     AgentEvent,
+    ArtifactReference,
+    AssignmentYieldRecord,
     DelegationGrant,
+    DelegationProposalRecord,
     InferenceExecutionTelemetry,
     RootAuthorityRecord,
     StageArtifact,
@@ -21,6 +24,7 @@ from agent_contracts import (
     TaskRequested,
     TaskResult,
     WakeUpHint,
+    compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
 )
 from analysis_agent.application.processor import AnalysisProcessor
@@ -30,11 +34,15 @@ from analysis_agent.infrastructure.deterministic_analyzer import (
 from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
 from orchestrator.application.ports import (
     CapabilityMismatchError,
+    ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    DelegationConflictError,
     FencingEpochRaceError,
+    GrantAlreadyConsumedError,
     TaskAlreadyClaimedError,
     TaskNotClaimableError,
+    WaveBudgetExceededError,
 )
 from orchestrator.domain.task import (
     ConflictingAuthorityGrantError,
@@ -1381,7 +1389,6 @@ async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) 
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
     gateway = RedisGateway(redis_url)
@@ -1440,7 +1447,6 @@ async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
     # Gateway configured in authenticated_claim mode
@@ -1507,7 +1513,6 @@ async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
     finally:
         await client.aclose()
         await gateway.aclose()
-
 async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
     client = redis.from_url(clean_redis, decode_responses=True)
@@ -1737,7 +1742,6 @@ async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
@@ -1851,7 +1855,6 @@ async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
@@ -1934,7 +1937,6 @@ async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) ->
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
@@ -2062,7 +2064,6 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_child_registration_atomic_boundary_and_immutability(clean_redis: str) -> None:
     gateway = RedisGateway(clean_redis)
@@ -2152,7 +2153,6 @@ async def test_redis_child_registration_atomic_boundary_and_immutability(clean_r
     finally:
         await client.aclose()
         await gateway.aclose()
-
 @pytest.mark.anyio
 async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean_redis: str) -> None:
     gateway_claim = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
@@ -2332,6 +2332,1914 @@ async def test_redis_registration_capability_validation_and_zero_mutation(clean_
         child_res_cap = await gateway.get_required_capability(child_res_id)
         assert child_res_cap is not None
         assert child_res_cap.required_capability == "research"
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+@pytest.mark.anyio
+async def test_redis_delegation_acceptance_and_zero_mutation(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        now = datetime.now(UTC).isoformat()
+        parent_id = f"parent_{uuid.uuid4().hex[:8]}"
+        root_task = TaskRequested(
+            task_id=parent_id,
+            prompt="Research topic",
+            created_at=now,
+            root_task_id=parent_id,
+            parent_task_id=None,
+            version=2,
+        )
+        await gateway.register_root_task(root_task, initial_status="pending", required_capability="research")
+
+        # Claim as Research
+        asgn_id = f"asgn_{uuid.uuid4().hex[:8]}"
+        claim = ActiveClaim(
+            task_id=parent_id,
+            assignment_id=asgn_id,
+            claim_id=f"claim_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=f"turn_{uuid.uuid4().hex[:8]}",
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="digest_root",
+            request_id=f"req_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+        )
+        grant = DelegationGrant(
+            grant_id="grant-1",
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=1,
+            turn_id=claim.turn_id,
+            issued_at=now,
+        )
+        await gateway.atomic_claim_task(parent_id, claim, grant=grant, now=now)
+        await gateway.acknowledge_claim(parent_id, asgn_id, "research-principal", now)
+
+        # Stage artifact
+        art = StageArtifact(
+            artifact_id="art-1",
+            producing_task_id=parent_id,
+            artifact_type="research_material",
+            content={"material": "findings"},
+            created_at=now,
+            producing_turn_id=claim.turn_id,
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(art, asgn_id, "research-principal", 1)
+
+        # Prepare proposal
+        art_ref = ArtifactReference(
+            artifact_id="art-1",
+            artifact_version=1,
+            producing_task_id=parent_id,
+        )
+        fp = compute_proposal_fingerprint(
+            parent_task_id=parent_id,
+            proposal_id="prop-1",
+            assignment_id=asgn_id,
+            target_capability="analysis",
+            child_intent="Analyze findings",
+            artifact_reference=art_ref,
+            parent_input_version=1,
+        )
+        child_id = f"child_{uuid.uuid4().hex[:8]}"
+        deadline_iso = "2099-01-01T00:02:00.000000Z"
+        proposal = DelegationProposalRecord(
+            parent_task_id=parent_id,
+            proposal_id="prop-1",
+            child_task_id=child_id,
+            delegation_decision_id="dec-1",
+            assignment_id=asgn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            proof_digest="digest_root",
+            proposal_fingerprint=fp,
+            delegation_grant_id="grant-1",
+            child_claim_deadline=deadline_iso,
+            accepted_at=now,
+            target_capability="analysis",
+            continuation_version=1,
+        )
+        child_input = TaskInput(
+            task_id=child_id,
+            prompt="Analyze findings",
+            created_at=now,
+            input_version=1,
+            artifact_references=(art_ref,),
+        )
+        continuation = TaskContinuation(
+            parent_task_id=parent_id,
+            child_task_id=child_id,
+            created_at=now,
+            updated_at=now,
+            input_version=1,
+            continuation_capability="research",
+            stage="incorporate_analysis_child",
+            artifact_references=(art_ref,),
+            continuation_version=1,
+        )
+        yield_rec = AssignmentYieldRecord(
+            assignment_id=asgn_id,
+            parent_task_id=parent_id,
+            principal_id="research-principal",
+            proposal_id="prop-1",
+            child_task_id=child_id,
+            delegation_decision_id="dec-1",
+            continuation_version=1,
+            yielded_at=now,
+        )
+        hint = WakeUpHint(
+            hint_id="hint-1",
+            capability="analysis",
+            created_at=now,
+            execution_kind="delegated_child",
+            task_id=child_id,
+        )
+
+        # 1. Accept proposal atomically
+        accepted, is_rep = await gateway.accept_delegation_proposal(
+            parent_task_id=parent_id,
+            proposal=proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+        assert not is_rep
+        assert accepted == proposal
+
+        # Verify all 17 keys committed correctly
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-1") == 1
+        assert await client.exists(f"task.status:{child_id}") == 1
+        assert await client.exists(f"task.lineage:{child_id}") == 1
+        assert await client.exists(f"task.required_capability:{child_id}") == 1
+        assert await client.exists(f"task.input:{child_id}:1") == 1
+        assert await client.exists(f"task.claim_deadline:{child_id}") == 1
+        assert await client.sismember(f"task.children:{parent_id}", child_id) == 1
+        assert await client.exists(f"task.continuation:{parent_id}:1") == 1
+        assert await client.get(f"task.continuation_latest:{parent_id}") == "1"
+        parent_status_raw = await client.get(f"task.status:{parent_id}")
+        assert parent_status_raw is not None
+        assert json.loads(parent_status_raw)["status"] == "waiting_for_children"
+        assert await client.exists(f"task.claim:{parent_id}") == 0  # Retired active claim
+        assert await client.exists(f"task.assignment_yield:{parent_id}:{asgn_id}") == 1
+        assert await client.sismember(f"task.consumed_waves:{parent_id}", "1") == 1
+        assert await client.sismember(f"task.consumed_grants:{parent_id}", "grant-1") == 1
+        assert await client.sismember(f"task.delegation_decisions:{parent_id}", "dec-1") == 1
+
+        hints = await client.lrange("agent.hints.analysis", 0, -1)
+        assert len(hints) == 1
+
+        # 2. Idempotent replay: zero writes, no second hint
+        replayed, is_rep2 = await gateway.accept_delegation_proposal(
+            parent_task_id=parent_id,
+            proposal=proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+        assert is_rep2
+        assert replayed == proposal
+        assert await client.llen("agent.hints.analysis") == 1
+
+        # 3. Wave already consumed rejection
+        second_child = f"child2_{uuid.uuid4().hex[:8]}"
+        proposal_wave2 = DelegationProposalRecord(
+            parent_task_id=parent_id,
+            proposal_id="prop-2",
+            child_task_id=second_child,
+            delegation_decision_id="dec-2",
+            assignment_id=asgn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            proof_digest="digest_root",
+            proposal_fingerprint="fp2",
+            delegation_grant_id="grant-2",
+            child_claim_deadline=deadline_iso,
+            accepted_at=now,
+            target_capability="analysis",
+            continuation_version=2,
+        )
+        child_input_2 = TaskInput(
+            task_id=second_child,
+            prompt="Second child",
+            created_at=now,
+            input_version=1,
+            artifact_references=(art_ref,),
+        )
+        continuation_2 = TaskContinuation(
+            parent_task_id=parent_id,
+            child_task_id=second_child,
+            created_at=now,
+            updated_at=now,
+            input_version=1,
+            continuation_capability="research",
+            stage="incorporate_analysis_child",
+            artifact_references=(art_ref,),
+            continuation_version=2,
+        )
+        yield_rec_2 = AssignmentYieldRecord(
+            assignment_id=asgn_id,
+            parent_task_id=parent_id,
+            principal_id="research-principal",
+            proposal_id="prop-2",
+            child_task_id=second_child,
+            delegation_decision_id="dec-2",
+            continuation_version=2,
+            yielded_at=now,
+        )
+        hint_2 = WakeUpHint(
+            hint_id="hint-2",
+            capability="analysis",
+            created_at=now,
+            execution_kind="delegated_child",
+            task_id=second_child,
+        )
+
+        with pytest.raises(TaskNotClaimableError, match="must be in 'working' status"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal_wave2,
+                child_task_input=child_input_2,
+                parent_continuation=continuation_2,
+                yield_record=yield_rec_2,
+                wake_up_hint=hint_2,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{second_child}") == 0
+
+        # 4. Delegated child pull-claim
+        claim_child = ActiveClaim(
+            task_id=child_id,
+            assignment_id=f"asgn_c_{uuid.uuid4().hex[:8]}",
+            claim_id=f"claim_c_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=f"turn_c_{uuid.uuid4().hex[:8]}",
+            runtime_principal_id="analysis-principal",
+            bound_agent_id="analysis-agent-1",
+            assigned_capability="analysis",
+            execution_kind="delegated_child",
+            fencing_epoch=1,
+            proof_digest="digest_child",
+            request_id=f"req_c_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+        )
+        active_child_claim, _ = await gateway.atomic_claim_task(child_id, claim_child, now=now, is_root=False)
+        assert active_child_claim.task_id == child_id
+        child_status_raw = await client.get(f"task.status:{child_id}")
+        assert child_status_raw is not None
+        assert json.loads(child_status_raw)["status"] == "working"
+
+        # 5. Expired child claim deadline is rejected
+        child_exp_id = f"child_exp_{uuid.uuid4().hex[:8]}"
+        await client.set(f"task.status:{child_exp_id}", json.dumps({"status": "pending", "task_id": child_exp_id}))
+        await client.set(f"task.required_capability:{child_exp_id}", json.dumps({"required_capability": "analysis", "task_id": child_exp_id, "created_at": now, "version": 1}))
+        await client.set(f"task.claim_deadline:{child_exp_id}", "2020-01-01T00:00:00.000000Z")
+
+        claim_exp = ActiveClaim(
+            task_id=child_exp_id,
+            assignment_id=f"asgn_exp_{uuid.uuid4().hex[:8]}",
+            claim_id=f"claim_exp_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=f"turn_exp_{uuid.uuid4().hex[:8]}",
+            runtime_principal_id="analysis-principal",
+            bound_agent_id="analysis-agent-1",
+            assigned_capability="analysis",
+            execution_kind="delegated_child",
+            fencing_epoch=1,
+            proof_digest="digest_exp",
+            request_id=f"req_exp_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+        )
+        with pytest.raises(ChildClaimDeadlineExpiredError, match="Claim deadline for child task"):
+            await gateway.atomic_claim_task(child_exp_id, claim_exp, now=now, is_root=False)
+
+        # 6. get_delegation_proposal roundtrip and error handling
+        rec = await gateway.get_delegation_proposal(parent_id, "prop-1")
+        assert rec is not None
+        assert rec.proposal_id == "prop-1"
+        assert rec.child_task_id == child_id
+
+        assert await gateway.get_delegation_proposal(parent_id, "nonexistent") is None
+        assert await gateway.get_delegation_proposal("", "prop-1") is None
+
+        # Corrupt JSON at proposal key
+        await client.set(f"task.delegation_proposal:{parent_id}:corrupt-prop", "invalid-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Failed to decode delegation proposal"):
+            await gateway.get_delegation_proposal(parent_id, "corrupt-prop")
+
+        # Wrong Redis key type at proposal key
+        await client.sadd(f"task.delegation_proposal:{parent_id}:set-prop", "val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Wrong Redis type"):
+            await gateway.get_delegation_proposal(parent_id, "set-prop")
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+@pytest.mark.anyio
+async def test_redis_lua_delegation_authority_and_artifact_validations(clean_redis: str) -> None:
+    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = RedisGateway(clean_redis)
+    now = datetime.now(UTC).isoformat()
+    parent_id = f"parent_val_{uuid.uuid4().hex[:8]}"
+
+    try:
+        # 1. Setup valid root task
+        root_task = TaskRequested(
+            task_id=parent_id,
+            root_task_id=parent_id,
+            parent_task_id=None,
+            prompt="Initial research task",
+            created_at=now,
+            version=2,
+        )
+        await gateway.register_root_task(root_task, initial_status="pending", required_capability="research")
+        asgn_id = f"asgn_{uuid.uuid4().hex[:8]}"
+        grant = DelegationGrant(
+            grant_id="grant-val-1",
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=1,
+            turn_id="turn-1",
+            issued_at=now,
+        )
+        claim = ActiveClaim(
+            task_id=parent_id,
+            assignment_id=asgn_id,
+            claim_id=f"claim_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=grant.turn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="digest_root",
+            request_id=f"req_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+            delegation_grant_id=grant.grant_id,
+        )
+        await gateway.atomic_claim_task(parent_id, claim, grant=grant, now=now)
+        await gateway.acknowledge_claim(parent_id, asgn_id, "research-principal", now)
+
+        # Stage artifact
+        art = StageArtifact(
+            artifact_id="art-1",
+            producing_task_id=parent_id,
+            artifact_type="research_material",
+            content={"material": "findings"},
+            created_at=now,
+            producing_turn_id="turn-1",
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(art, asgn_id, "research-principal", 1)
+
+        art_ref = ArtifactReference(
+            artifact_id="art-1",
+            artifact_version=1,
+            producing_task_id=parent_id,
+        )
+        fp = compute_proposal_fingerprint(
+            parent_task_id=parent_id,
+            proposal_id="prop-val-1",
+            assignment_id=asgn_id,
+            target_capability="analysis",
+            child_intent="Analyze valid findings",
+            artifact_reference=art_ref,
+            parent_input_version=1,
+        )
+        child_id = f"child_val_{uuid.uuid4().hex[:8]}"
+        proposal = DelegationProposalRecord(
+            parent_task_id=parent_id,
+            proposal_id="prop-val-1",
+            child_task_id=child_id,
+            delegation_decision_id="dec-val-1",
+            assignment_id=asgn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            proof_digest="digest_root",
+            proposal_fingerprint=fp,
+            delegation_grant_id=grant.grant_id,
+            child_claim_deadline="2099-01-01T00:02:00.000000Z",
+            accepted_at=now,
+            target_capability="analysis",
+            continuation_version=1,
+        )
+        child_input = TaskInput(
+            task_id=child_id,
+            prompt="Analyze valid findings",
+            created_at=now,
+            input_version=1,
+            artifact_references=(art_ref,),
+        )
+        continuation = TaskContinuation(
+            parent_task_id=parent_id,
+            child_task_id=child_id,
+            created_at=now,
+            updated_at=now,
+            input_version=1,
+            continuation_capability="research",
+            stage="incorporate_analysis_child",
+            artifact_references=(art_ref,),
+            continuation_version=1,
+        )
+        yield_rec = AssignmentYieldRecord(
+            assignment_id=asgn_id,
+            parent_task_id=parent_id,
+            principal_id="research-principal",
+            proposal_id="prop-val-1",
+            child_task_id=child_id,
+            delegation_decision_id="dec-val-1",
+            continuation_version=1,
+            yielded_at=now,
+        )
+        hint = WakeUpHint(
+            hint_id="hint-val-1",
+            capability="analysis",
+            created_at=now,
+            execution_kind="delegated_child",
+            task_id=child_id,
+        )
+
+        # Test A: Corrupt grant in Redis -> CorruptAuthoritativeRecordError
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", "corrupt-grant-data")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Authoritative record or type corruption"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+
+        # Restore valid grant
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", grant.to_json())
+
+        # Test B: Grant fencing epoch mismatch -> FencingEpochRaceError
+        bad_epoch_grant = DelegationGrant(
+            grant_id=grant.grant_id,
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=2,  # mismatch with expected 1
+            turn_id="turn-1",
+            issued_at=now,
+        )
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", bad_epoch_grant.to_json())
+        with pytest.raises(FencingEpochRaceError, match="grant mismatch"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+
+        # Restore valid grant
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", grant.to_json())
+
+        # Test C: Corrupt root authority -> CorruptAuthoritativeRecordError
+        await client.set(f"task.authority:{parent_id}", "corrupt-auth-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="Authoritative record or type corruption"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+
+        # Restore valid root authority
+        valid_auth = RootAuthorityRecord.create_default(parent_id, created_at=now)
+        await client.set(f"task.authority:{parent_id}", valid_auth.to_json())
+
+        # Test D: Unsealed artifact -> ValueError
+        unsealed_art = {
+            "artifact_id": "art-1",
+            "producing_task_id": parent_id,
+            "artifact_type": "research_material",
+            "content": {"material": "findings"},
+            "created_at": now,
+            "producing_turn_id": "turn-1",
+            "artifact_version": 1,
+            "payload_schema_version": 1,
+            "sealed": False,
+            "version": 1,
+        }
+        await client.set(f"task.artifact:{parent_id}:art-1:1", json.dumps(unsealed_art))
+        with pytest.raises(ValueError, match="ARTIFACT_NOT_SEALED"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+
+        # Restore valid sealed artifact
+        await client.set(f"task.artifact:{parent_id}:art-1:1", art.to_json())
+
+        # Test E: Artifact producing task mismatch -> ValueError
+        wrong_producer_art = dict(unsealed_art)
+        wrong_producer_art["sealed"] = True
+        wrong_producer_art["producing_task_id"] = "other-parent"
+        await client.set(f"task.artifact:{parent_id}:art-1:1", json.dumps(wrong_producer_art))
+        with pytest.raises(ValueError, match="ARTIFACT_PROVENANCE_MISMATCH"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+
+        # Restore valid sealed artifact
+        await client.set(f"task.artifact:{parent_id}:art-1:1", art.to_json())
+
+        # Test Lineage 1: Non-null parent_task_id is rejected with TaskNotClaimableError (PARENT_NOT_ROOT)
+        non_root_lineage = {
+            "task_id": parent_id,
+            "root_task_id": parent_id,
+            "parent_task_id": "grandparent-task-id",
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(non_root_lineage))
+        with pytest.raises(TaskNotClaimableError, match="PARENT_NOT_ROOT"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        # Verify zero mutations
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Lineage 2: Root task ID mismatch is rejected with zero mutations (CORRUPT_PARENT_LINEAGE)
+        mismatched_root_lineage = {
+            "task_id": parent_id,
+            "root_task_id": "different-root-task-id",
+            "parent_task_id": None,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(mismatched_root_lineage))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_PARENT_LINEAGE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        # Verify zero mutations
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Lineage 3: Task ID mismatch is rejected with zero mutations (CORRUPT_PARENT_LINEAGE)
+        mismatched_task_lineage = {
+            "task_id": "different-task-id",
+            "root_task_id": parent_id,
+            "parent_task_id": None,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(mismatched_task_lineage))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_PARENT_LINEAGE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        # Verify zero mutations
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Lineage 4: Missing task_id is rejected with zero mutations (CORRUPT_PARENT_LINEAGE)
+        missing_task_id_lineage = {
+            "root_task_id": parent_id,
+            "parent_task_id": None,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(missing_task_id_lineage))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_PARENT_LINEAGE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Lineage 5: Missing root_task_id is rejected with zero mutations (CORRUPT_PARENT_LINEAGE)
+        missing_root_id_lineage = {
+            "task_id": parent_id,
+            "parent_task_id": None,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(missing_root_id_lineage))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_PARENT_LINEAGE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Lineage 6: Missing parent_task_id field entirely is rejected with zero mutations (CORRUPT_PARENT_LINEAGE)
+        missing_parent_id_lineage = {
+            "task_id": parent_id,
+            "root_task_id": parent_id,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(missing_parent_id_lineage))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_PARENT_LINEAGE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Restore canonical root lineage
+        canonical_lineage = {
+            "task_id": parent_id,
+            "root_task_id": parent_id,
+            "parent_task_id": None,
+        }
+        await client.set(f"task.lineage:{parent_id}", json.dumps(canonical_lineage))
+
+        # Test Turn 1: Missing claim turn_id is rejected with CORRUPT_CLAIM (zero mutations)
+        corrupt_claim_dict = json.loads(claim.to_json())
+        corrupt_claim_dict["state"] = "acknowledged"
+        del corrupt_claim_dict["turn_id"]
+        await client.set(f"task.claim:{parent_id}", json.dumps(corrupt_claim_dict))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_CLAIM"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Restore valid acknowledged claim
+        ack_claim_dict = json.loads(claim.to_json())
+        ack_claim_dict["state"] = "acknowledged"
+        await client.set(f"task.claim:{parent_id}", json.dumps(ack_claim_dict))
+
+        # Test Turn 2: Missing grant turn_id is rejected with CORRUPT_GRANT (zero mutations)
+        corrupt_grant_dict = json.loads(grant.to_json())
+        del corrupt_grant_dict["turn_id"]
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", json.dumps(corrupt_grant_dict))
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_GRANT"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Test Turn 3: Mismatched turn_id between grant and claim is rejected with GRANT_TURN_MISMATCH (zero mutations)
+        mismatched_turn_grant = DelegationGrant(
+            grant_id=grant.grant_id,
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=1,
+            turn_id="turn-different-999",
+            issued_at=now,
+        )
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", mismatched_turn_grant.to_json())
+        with pytest.raises(ClaimNotFoundError, match="GRANT_TURN_MISMATCH"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:prop-val-1") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Restore valid grant
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", grant.to_json())
+
+        # Test F: Valid proposal acceptance succeeds!
+        accepted, is_rep = await gateway.accept_delegation_proposal(
+            parent_task_id=parent_id,
+            proposal=proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+        assert not is_rep
+        assert accepted == proposal
+        assert await client.get(f"task.fence:{child_id}") == "0"
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+async def assert_zero_delegation_mutations(
+    client: redis.Redis,
+    parent_id: str,
+    proposal_id: str,
+    child_id: str,
+    seeded_child_keys: set[str] | None = None,
+    seeded_waves: set[str] | None = None,
+    seeded_grants: set[str] | None = None,
+    seeded_continuations: set[str] | None = None,
+) -> None:
+    seeded_child = seeded_child_keys or set()
+    seeded_w = seeded_waves or set()
+    seeded_g = seeded_grants or set()
+    seeded_c = seeded_continuations or set()
+
+    assert await client.exists(f"task.delegation_proposal:{parent_id}:{proposal_id}") == 0
+    for key_suffix in ("status", "lineage", "required_capability", "claim_deadline", "fence"):
+        k = f"task.{key_suffix}:{child_id}"
+        if k not in seeded_child:
+            assert await client.exists(k) == 0
+    if f"task.input:{child_id}:1" not in seeded_child:
+        assert await client.exists(f"task.input:{child_id}:1") == 0
+
+    assert await client.sismember(f"task.children:{parent_id}", child_id) == 0
+    if "1" not in seeded_c:
+        assert await client.exists(f"task.continuation:{parent_id}:1") == 0
+        assert await client.exists(f"task.continuation_latest:{parent_id}") == 0
+
+    yield_keys = await client.keys(f"task.assignment_yield:{parent_id}:*")
+    assert len(yield_keys) == 0
+
+    all_waves = set(await client.smembers(f"task.consumed_waves:{parent_id}"))
+    assert all_waves == seeded_w
+
+    all_grants = set(await client.smembers(f"task.consumed_grants:{parent_id}"))
+    assert all_grants == seeded_g
+
+    all_decisions = await client.keys(f"task.delegation_decisions:{parent_id}")
+    assert len(all_decisions) == 0
+
+    assert await client.llen("agent.hints.analysis") == 0
+
+
+@pytest.mark.anyio
+async def test_redis_lua_delegation_zero_mutation_rejection_coverage(clean_redis: str) -> None:
+    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = RedisGateway(clean_redis)
+    now = datetime.now(UTC).isoformat()
+    parent_id = f"parent_rej_{uuid.uuid4().hex[:8]}"
+    prop_id = "prop-rej-1"
+    child_id = f"child_rej_{uuid.uuid4().hex[:8]}"
+
+    try:
+        root_task = TaskRequested(
+            task_id=parent_id,
+            root_task_id=parent_id,
+            parent_task_id=None,
+            prompt="Initial research task",
+            created_at=now,
+            version=2,
+        )
+        await gateway.register_root_task(root_task, initial_status="pending", required_capability="research")
+        asgn_id = f"asgn_{uuid.uuid4().hex[:8]}"
+        grant = DelegationGrant(
+            grant_id="grant-rej-1",
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=1,
+            turn_id="turn-rej-1",
+            issued_at=now,
+        )
+        claim = ActiveClaim(
+            task_id=parent_id,
+            assignment_id=asgn_id,
+            claim_id=f"claim_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=grant.turn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="digest_root",
+            request_id=f"req_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+            delegation_grant_id=grant.grant_id,
+        )
+        await gateway.atomic_claim_task(parent_id, claim, grant=grant, now=now)
+        await gateway.acknowledge_claim(parent_id, asgn_id, "research-principal", now)
+
+        art = StageArtifact(
+            artifact_id="art-1",
+            producing_task_id=parent_id,
+            artifact_type="research_material",
+            content={"material": "findings"},
+            created_at=now,
+            producing_turn_id="turn-rej-1",
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(art, asgn_id, "research-principal", 1)
+
+        art_ref = ArtifactReference(
+            artifact_id="art-1",
+            artifact_version=1,
+            producing_task_id=parent_id,
+        )
+        fp = compute_proposal_fingerprint(
+            parent_task_id=parent_id,
+            proposal_id=prop_id,
+            assignment_id=asgn_id,
+            target_capability="analysis",
+            child_intent="Analyze valid findings",
+            artifact_reference=art_ref,
+            parent_input_version=1,
+        )
+        proposal = DelegationProposalRecord(
+            parent_task_id=parent_id,
+            proposal_id=prop_id,
+            child_task_id=child_id,
+            delegation_decision_id="dec-rej-1",
+            assignment_id=asgn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            proof_digest="digest_root",
+            proposal_fingerprint=fp,
+            delegation_grant_id=grant.grant_id,
+            child_claim_deadline="2099-01-01T00:02:00.000000Z",
+            accepted_at=now,
+            target_capability="analysis",
+            continuation_version=1,
+        )
+        child_input = TaskInput(
+            task_id=child_id,
+            prompt="Analyze valid findings",
+            created_at=now,
+            input_version=1,
+            artifact_references=(art_ref,),
+        )
+        continuation = TaskContinuation(
+            parent_task_id=parent_id,
+            child_task_id=child_id,
+            created_at=now,
+            updated_at=now,
+            input_version=1,
+            continuation_capability="research",
+            stage="incorporate_analysis_child",
+            artifact_references=(art_ref,),
+            continuation_version=1,
+        )
+        yield_rec = AssignmentYieldRecord(
+            assignment_id=asgn_id,
+            parent_task_id=parent_id,
+            principal_id="research-principal",
+            proposal_id=prop_id,
+            child_task_id=child_id,
+            delegation_decision_id="dec-rej-1",
+            continuation_version=1,
+            yielded_at=now,
+        )
+        hint = WakeUpHint(
+            hint_id="hint-rej-1",
+            capability="analysis",
+            created_at=now,
+            execution_kind="delegated_child",
+            task_id=child_id,
+        )
+
+        # 1. continuation version 1 already exists -> ConflictingContinuationError
+        await client.set(f"task.continuation:{parent_id}:1", continuation.to_json())
+        with pytest.raises(ConflictingContinuationError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id, seeded_continuations={"1"})
+        await client.delete(f"task.continuation:{parent_id}:1")
+
+        # 2. child status already exists -> ConflictingChildTaskRegistrationError
+        await client.set(f"task.status:{child_id}", json.dumps({"status": "pending", "task_id": child_id}))
+        with pytest.raises(ConflictingChildTaskRegistrationError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id, seeded_child_keys={f"task.status:{child_id}"})
+        await client.delete(f"task.status:{child_id}")
+
+        # 3. wave 1 already consumed -> WaveBudgetExceededError
+        await client.sadd(f"task.consumed_waves:{parent_id}", "1")
+        with pytest.raises(WaveBudgetExceededError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id, seeded_waves={"1"})
+        await client.srem(f"task.consumed_waves:{parent_id}", "1")
+
+        # 4. delegation grant already consumed -> GrantAlreadyConsumedError
+        await client.sadd(f"task.consumed_grants:{parent_id}", grant.grant_id)
+        with pytest.raises(GrantAlreadyConsumedError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id, seeded_grants={grant.grant_id})
+        await client.srem(f"task.consumed_grants:{parent_id}", grant.grant_id)
+
+        # 5. Wrong Redis type for parent status
+        saved_status = await client.get(f"task.status:{parent_id}")
+        await client.delete(f"task.status:{parent_id}")
+        await client.sadd(f"task.status:{parent_id}", "wrong_set_val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_PARENT_STATUS"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete(f"task.status:{parent_id}")
+        if saved_status:
+            await client.set(f"task.status:{parent_id}", saved_status)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 6. Wrong Redis type for parent claim
+        saved_claim = await client.get(f"task.claim:{parent_id}")
+        await client.delete(f"task.claim:{parent_id}")
+        await client.sadd(f"task.claim:{parent_id}", "wrong_set_val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_CLAIM"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete(f"task.claim:{parent_id}")
+        if saved_claim:
+            await client.set(f"task.claim:{parent_id}", saved_claim)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 7. Wrong Redis type for root authority
+        saved_auth = await client.get(f"task.authority:{parent_id}")
+        await client.delete(f"task.authority:{parent_id}")
+        await client.sadd(f"task.authority:{parent_id}", "wrong_set_val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_ROOT_AUTHORITY"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete(f"task.authority:{parent_id}")
+        if saved_auth:
+            await client.set(f"task.authority:{parent_id}", saved_auth)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 8. Wrong Redis type for delegation grant
+        saved_grant = await client.get(f"task.authority_grant:{parent_id}:{grant.grant_id}")
+        await client.delete(f"task.authority_grant:{parent_id}:{grant.grant_id}")
+        await client.sadd(f"task.authority_grant:{parent_id}:{grant.grant_id}", "wrong_set_val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_GRANT_RECORD"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete(f"task.authority_grant:{parent_id}:{grant.grant_id}")
+        if saved_grant:
+            await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", saved_grant)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 9. Wrong Redis type for artifact
+        saved_art = await client.get(f"task.artifact:{parent_id}:art-1:1")
+        await client.delete(f"task.artifact:{parent_id}:art-1:1")
+        await client.sadd(f"task.artifact:{parent_id}:art-1:1", "wrong_set_val")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_ARTIFACT"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete(f"task.artifact:{parent_id}:art-1:1")
+        if saved_art:
+            await client.set(f"task.artifact:{parent_id}:art-1:1", saved_art)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 10. Wrong Redis type for hint queue (string instead of list)
+        await client.set("agent.hints.analysis", "string_instead_of_list")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="WRONG_KEY_TYPE_HINT_QUEUE"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        await client.delete("agent.hints.analysis")
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 11. Corrupt JSON for parent claim
+        await client.set(f"task.claim:{parent_id}", "corrupt-non-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_CLAIM"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        if saved_claim:
+            await client.set(f"task.claim:{parent_id}", saved_claim)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 12. Corrupt JSON for root authority
+        await client.set(f"task.authority:{parent_id}", "corrupt-non-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_ROOT_AUTHORITY"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        if saved_auth:
+            await client.set(f"task.authority:{parent_id}", saved_auth)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 13. Corrupt JSON for delegation grant
+        await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", "corrupt-non-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_GRANT"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        if saved_grant:
+            await client.set(f"task.authority_grant:{parent_id}:{grant.grant_id}", saved_grant)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+
+        # 14. Corrupt JSON for artifact
+        await client.set(f"task.artifact:{parent_id}:art-1:1", "corrupt-non-json")
+        with pytest.raises(CorruptAuthoritativeRecordError, match="CORRUPT_ARTIFACT"):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        if saved_art:
+            await client.set(f"task.artifact:{parent_id}:art-1:1", saved_art)
+        await assert_zero_delegation_mutations(client, parent_id, prop_id, child_id)
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+@pytest.mark.anyio
+async def test_redis_concurrent_first_acceptance_atomicity(clean_redis: str) -> None:
+    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = RedisGateway(clean_redis)
+    now = datetime.now(UTC).isoformat()
+    parent_id = f"parent_conc_{uuid.uuid4().hex[:8]}"
+    prop_id = "prop-conc-1"
+    child_id = f"child_conc_{uuid.uuid4().hex[:8]}"
+
+    try:
+        root_task = TaskRequested(
+            task_id=parent_id,
+            root_task_id=parent_id,
+            parent_task_id=None,
+            prompt="Initial research task",
+            created_at=now,
+            version=2,
+        )
+        await gateway.register_root_task(root_task, initial_status="pending", required_capability="research")
+        asgn_id = f"asgn_{uuid.uuid4().hex[:8]}"
+        grant = DelegationGrant(
+            grant_id="grant-conc-1",
+            root_task_id=parent_id,
+            issued_to_assignment_id=asgn_id,
+            issued_to_principal_id="research-principal",
+            fencing_epoch=1,
+            turn_id="turn-conc-1",
+            issued_at=now,
+        )
+        claim = ActiveClaim(
+            task_id=parent_id,
+            assignment_id=asgn_id,
+            claim_id=f"claim_{uuid.uuid4().hex[:8]}",
+            root_task_id=parent_id,
+            turn_id=grant.turn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            assigned_capability="research",
+            execution_kind="initial",
+            fencing_epoch=1,
+            proof_digest="digest_root",
+            request_id=f"req_{uuid.uuid4().hex[:8]}",
+            claimed_at=now,
+            delivery_expires_at="2099-01-01T00:00:00.000000Z",
+            prior_claimable_status="pending",
+            delegation_grant_id=grant.grant_id,
+        )
+        await gateway.atomic_claim_task(parent_id, claim, grant=grant, now=now)
+        await gateway.acknowledge_claim(parent_id, asgn_id, "research-principal", now)
+
+        art = StageArtifact(
+            artifact_id="art-1",
+            producing_task_id=parent_id,
+            artifact_type="research_material",
+            content={"material": "findings"},
+            created_at=now,
+            producing_turn_id="turn-conc-1",
+            artifact_version=1,
+        )
+        await gateway.save_stage_artifact(art, asgn_id, "research-principal", 1)
+
+        art_ref = ArtifactReference(
+            artifact_id="art-1",
+            artifact_version=1,
+            producing_task_id=parent_id,
+        )
+        fp = compute_proposal_fingerprint(
+            parent_task_id=parent_id,
+            proposal_id=prop_id,
+            assignment_id=asgn_id,
+            target_capability="analysis",
+            child_intent="Analyze valid findings",
+            artifact_reference=art_ref,
+            parent_input_version=1,
+        )
+        proposal = DelegationProposalRecord(
+            parent_task_id=parent_id,
+            proposal_id=prop_id,
+            child_task_id=child_id,
+            delegation_decision_id="dec-conc-1",
+            assignment_id=asgn_id,
+            runtime_principal_id="research-principal",
+            bound_agent_id="research-agent-1",
+            proof_digest="digest_root",
+            proposal_fingerprint=fp,
+            delegation_grant_id=grant.grant_id,
+            child_claim_deadline="2099-01-01T00:02:00.000000Z",
+            accepted_at=now,
+            target_capability="analysis",
+            continuation_version=1,
+        )
+        child_input = TaskInput(
+            task_id=child_id,
+            prompt="Analyze valid findings",
+            created_at=now,
+            input_version=1,
+            artifact_references=(art_ref,),
+        )
+        continuation = TaskContinuation(
+            parent_task_id=parent_id,
+            child_task_id=child_id,
+            created_at=now,
+            updated_at=now,
+            input_version=1,
+            continuation_capability="research",
+            stage="incorporate_analysis_child",
+            artifact_references=(art_ref,),
+            continuation_version=1,
+        )
+        yield_rec = AssignmentYieldRecord(
+            assignment_id=asgn_id,
+            parent_task_id=parent_id,
+            principal_id="research-principal",
+            proposal_id=prop_id,
+            child_task_id=child_id,
+            delegation_decision_id="dec-conc-1",
+            continuation_version=1,
+            yielded_at=now,
+        )
+        hint = WakeUpHint(
+            hint_id="hint-conc-1",
+            capability="analysis",
+            created_at=now,
+            execution_kind="delegated_child",
+            task_id=child_id,
+        )
+
+        # Issue two concurrent identical first-acceptance operations
+        (res1, is_rep1), (res2, is_rep2) = await asyncio.gather(
+            gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            ),
+            gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            ),
+        )
+
+        # One call reports first acceptance, the other reports idempotent replay
+        assert (not is_rep1 and is_rep2) or (is_rep1 and not is_rep2)
+
+        # Both return identical accepted records
+        assert res1.proposal_id == res2.proposal_id == prop_id
+        assert res1.child_task_id == res2.child_task_id == child_id
+        assert res1.delegation_decision_id == res2.delegation_decision_id == "dec-conc-1"
+        assert res1.proposal_fingerprint == res2.proposal_fingerprint == fp
+
+        # Authoritative state invariants: exactly one of each record committed
+        assert await client.exists(f"task.delegation_proposal:{parent_id}:{prop_id}") == 1
+        assert await client.exists(f"task.status:{child_id}") == 1
+        assert await client.get(f"task.fence:{child_id}") == "0"
+        assert await client.smembers(f"task.children:{parent_id}") == {child_id}
+        assert await client.exists(f"task.continuation:{parent_id}:1") == 1
+        assert await client.get(f"task.continuation_latest:{parent_id}") == "1"
+        assert await client.exists(f"task.assignment_yield:{parent_id}:{asgn_id}") == 1
+        assert await client.smembers(f"task.consumed_waves:{parent_id}") == {"1"}
+        assert await client.smembers(f"task.consumed_grants:{parent_id}") == {grant.grant_id}
+        assert await client.smembers(f"task.delegation_decisions:{parent_id}") == {"dec-conc-1"}
+
+        # Exactly one Analysis hint emitted
+        assert await client.llen("agent.hints.analysis") == 1
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+async def _setup_claimed_parent(gateway: RedisGateway) -> tuple[str, str, DelegationGrant, ActiveClaim, ArtifactReference, str]:
+    now = datetime.now(UTC).isoformat()
+    parent_id = f"parent_{uuid.uuid4().hex[:8]}"
+    root_task = TaskRequested(
+        task_id=parent_id,
+        prompt="Research topic",
+        created_at=now,
+        root_task_id=parent_id,
+        parent_task_id=None,
+        version=2,
+    )
+    await gateway.register_root_task(root_task, initial_status="pending", required_capability="research")
+
+    asgn_id = f"asgn_{uuid.uuid4().hex[:8]}"
+    claim = ActiveClaim(
+        task_id=parent_id,
+        assignment_id=asgn_id,
+        claim_id=f"claim_{uuid.uuid4().hex[:8]}",
+        root_task_id=parent_id,
+        turn_id=f"turn_{uuid.uuid4().hex[:8]}",
+        runtime_principal_id="research-principal",
+        bound_agent_id="research-agent-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        fencing_epoch=1,
+        proof_digest="digest_root",
+        request_id=f"req_{uuid.uuid4().hex[:8]}",
+        claimed_at=now,
+        delivery_expires_at="2099-01-01T00:00:00.000000Z",
+        prior_claimable_status="pending",
+    )
+    grant = DelegationGrant(
+        grant_id="grant-1",
+        root_task_id=parent_id,
+        issued_to_assignment_id=asgn_id,
+        issued_to_principal_id="research-principal",
+        fencing_epoch=1,
+        turn_id=claim.turn_id,
+        issued_at=now,
+    )
+    await gateway.atomic_claim_task(parent_id, claim, grant=grant, now=now)
+    await gateway.acknowledge_claim(parent_id, asgn_id, "research-principal", now)
+
+    art = StageArtifact(
+        artifact_id="art-1",
+        producing_task_id=parent_id,
+        artifact_type="research_material",
+        content={"material": "findings"},
+        created_at=now,
+        producing_turn_id=claim.turn_id,
+        artifact_version=1,
+        payload_schema_version=1,
+        sealed=True,
+    )
+    await gateway.save_stage_artifact(art, asgn_id, "research-principal", 1)
+
+    art_ref = ArtifactReference(
+        artifact_id="art-1",
+        artifact_version=1,
+        producing_task_id=parent_id,
+    )
+    return parent_id, asgn_id, grant, claim, art_ref, now
+
+
+def _build_test_proposal(
+    parent_id: str,
+    asgn_id: str,
+    grant: DelegationGrant,
+    art_ref: ArtifactReference,
+    now: str,
+    child_id: str | None = None,
+    prop_id: str = "prop-1",
+    bound_agent_id: str = "research-agent-1",
+) -> tuple[DelegationProposalRecord, TaskInput, TaskContinuation, AssignmentYieldRecord, WakeUpHint, str]:
+    child_id = child_id or f"child_{uuid.uuid4().hex[:8]}"
+    fp = compute_proposal_fingerprint(
+        parent_task_id=parent_id,
+        proposal_id=prop_id,
+        assignment_id=asgn_id,
+        target_capability="analysis",
+        child_intent="Analyze valid findings",
+        artifact_reference=art_ref,
+        parent_input_version=1,
+    )
+    proposal = DelegationProposalRecord(
+        parent_task_id=parent_id,
+        proposal_id=prop_id,
+        child_task_id=child_id,
+        delegation_decision_id="dec-1",
+        assignment_id=asgn_id,
+        runtime_principal_id="research-principal",
+        bound_agent_id=bound_agent_id,
+        proof_digest="digest_root",
+        proposal_fingerprint=fp,
+        delegation_grant_id=grant.grant_id,
+        child_claim_deadline="2099-01-01T00:02:00.000000Z",
+        accepted_at=now,
+        target_capability="analysis",
+        continuation_version=1,
+    )
+    child_input = TaskInput(
+        task_id=child_id,
+        prompt="Analyze valid findings",
+        created_at=now,
+        input_version=1,
+        artifact_references=(art_ref,),
+    )
+    continuation = TaskContinuation(
+        parent_task_id=parent_id,
+        child_task_id=child_id,
+        created_at=now,
+        updated_at=now,
+        input_version=1,
+        continuation_version=1,
+    )
+    yield_rec = AssignmentYieldRecord(
+        assignment_id=asgn_id,
+        parent_task_id=parent_id,
+        principal_id="research-principal",
+        proposal_id=prop_id,
+        child_task_id=child_id,
+        delegation_decision_id="dec-1",
+        continuation_version=1,
+        yielded_at=now,
+    )
+    hint = WakeUpHint(
+        hint_id=f"hint_{uuid.uuid4().hex[:8]}",
+        capability="analysis",
+        created_at=now,
+        execution_kind="delegated_child",
+        task_id=child_id,
+    )
+    return proposal, child_input, continuation, yield_rec, hint, child_id
+
+
+async def test_redis_lua_delegation_exact_bounds_enforcement(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
+
+        # 1. Root authority violations: max_delegation_depth, max_delegation_waves, max_children_per_wave
+        authority_key = f"task.authority:{parent_id}"
+        canonical_authority = json.loads(await client.get(authority_key) or "{}")
+
+        bad_authority_cases = [
+            ("max_delegation_depth", 0),
+            ("max_delegation_depth", 2),
+            ("max_delegation_depth", 1.5),
+            ("max_delegation_depth", "1"),
+            ("max_delegation_depth", True),
+            ("max_delegation_depth", None),
+            ("max_delegation_waves", 0),
+            ("max_delegation_waves", 2),
+            ("max_delegation_waves", 1.5),
+            ("max_delegation_waves", "1"),
+            ("max_delegation_waves", True),
+            ("max_delegation_waves", None),
+            ("max_children_per_wave", 0),
+            ("max_children_per_wave", 2),
+            ("max_children_per_wave", 1.5),
+            ("max_children_per_wave", "1"),
+            ("max_children_per_wave", True),
+            ("max_children_per_wave", None),
+        ]
+
+        for field, bad_val in bad_authority_cases:
+            tampered = dict(canonical_authority)
+            if bad_val is None:
+                tampered.pop(field, None)
+            else:
+                tampered[field] = bad_val
+            await client.set(authority_key, json.dumps(tampered))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-auth-{field}-{bad_val}"
+            )
+            with pytest.raises(WaveBudgetExceededError):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+        # Restore canonical authority
+        await client.set(authority_key, json.dumps(canonical_authority))
+
+        # 2. Grant bounds violations: max_depth, max_waves, max_children
+        grant_key = f"task.authority_grant:{parent_id}:{grant.grant_id}"
+        canonical_grant = json.loads(await client.get(grant_key) or "{}")
+
+        bad_grant_cases = [
+            ("max_depth", 0),
+            ("max_depth", 2),
+            ("max_depth", 1.5),
+            ("max_depth", "1"),
+            ("max_depth", True),
+            ("max_depth", None),
+            ("max_waves", 0),
+            ("max_waves", 2),
+            ("max_waves", 1.5),
+            ("max_waves", "1"),
+            ("max_waves", True),
+            ("max_waves", None),
+            ("max_children", 0),
+            ("max_children", 2),
+            ("max_children", 1.5),
+            ("max_children", "1"),
+            ("max_children", True),
+            ("max_children", None),
+        ]
+
+        for field, bad_val in bad_grant_cases:
+            tampered_grant = dict(canonical_grant)
+            if bad_val is None:
+                tampered_grant.pop(field, None)
+            else:
+                tampered_grant[field] = bad_val
+            await client.set(grant_key, json.dumps(tampered_grant))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-grant-{field}-{bad_val}"
+            )
+            with pytest.raises(WaveBudgetExceededError):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+async def test_redis_lua_delegation_parent_input_validation(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
+        input_key = f"task.input:{parent_id}:1"
+        canonical_input = json.loads(await client.get(input_key) or "{}")
+
+        # Case 1: Corrupt non-JSON
+        await client.set(input_key, "corrupt-non-json{")
+        proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+            parent_id, asgn_id, grant, art_ref, now, prop_id="prop-corrupt-json"
+        )
+        with pytest.raises(CorruptAuthoritativeRecordError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Case 2: Missing or mismatched task_id
+        for bad_task_id, expected_err in [(None, CorruptAuthoritativeRecordError), ("wrong-task-id", ValueError)]:
+            tampered = dict(canonical_input)
+            if bad_task_id is None:
+                tampered.pop("task_id", None)
+            else:
+                tampered["task_id"] = bad_task_id
+            await client.set(input_key, json.dumps(tampered))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-taskid-{bad_task_id}"
+            )
+            with pytest.raises(expected_err):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+        # Case 3: Missing or mismatched input_version
+        for bad_version, expected_err in [(None, CorruptAuthoritativeRecordError), (99, ValueError)]:
+            tampered = dict(canonical_input)
+            if bad_version is None:
+                tampered.pop("input_version", None)
+            else:
+                tampered["input_version"] = bad_version
+            await client.set(input_key, json.dumps(tampered))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-ver-{bad_version}"
+            )
+            with pytest.raises(expected_err):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+        # Case 4: Unsupported contract version
+        tampered = dict(canonical_input)
+        tampered["version"] = 2
+        await client.set(input_key, json.dumps(tampered))
+        proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+            parent_id, asgn_id, grant, art_ref, now, prop_id="prop-contract-ver"
+        )
+        with pytest.raises(CorruptAuthoritativeRecordError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # Case 5: Missing or empty prompt
+        for bad_prompt in [None, "", "   ", 12345]:
+            tampered = dict(canonical_input)
+            if bad_prompt is None:
+                tampered.pop("prompt", None)
+            else:
+                tampered["prompt"] = bad_prompt
+            await client.set(input_key, json.dumps(tampered))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-prompt-{bad_prompt}"
+            )
+            with pytest.raises(CorruptAuthoritativeRecordError):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+async def test_redis_lua_delegation_artifact_provenance_validation(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
+        artifact_key = f"task.artifact:{parent_id}:{art_ref.artifact_id}:{art_ref.artifact_version}"
+        canonical_artifact = json.loads(await client.get(artifact_key) or "{}")
+
+        bad_artifact_cases = [
+            ("producing_turn_id", None),
+            ("producing_turn_id", ""),
+            ("producing_turn_id", "turn-different-from-claim"),
+            ("payload_schema_version", None),
+            ("payload_schema_version", 2),
+            ("version", None),
+            ("version", 2),
+            ("created_at", None),
+            ("created_at", ""),
+            ("content", None),
+            ("content", "not-a-dict"),
+        ]
+
+        for field, bad_val in bad_artifact_cases:
+            tampered = dict(canonical_artifact)
+            if bad_val is None:
+                tampered.pop(field, None)
+            else:
+                tampered[field] = bad_val
+            await client.set(artifact_key, json.dumps(tampered))
+
+            proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+                parent_id, asgn_id, grant, art_ref, now, prop_id=f"prop-art-{field}-{bad_val}"
+            )
+            with pytest.raises((ValueError, CorruptAuthoritativeRecordError)):
+                await gateway.accept_delegation_proposal(
+                    parent_task_id=parent_id,
+                    proposal=proposal,
+                    child_task_input=child_input,
+                    parent_continuation=continuation,
+                    yield_record=yield_rec,
+                    wake_up_hint=hint,
+                    expected_fencing_epoch=1,
+                    now=now,
+                )
+            assert await client.exists(f"task.status:{child_id}") == 0
+            assert await client.llen("agent.hints.analysis") == 0
+
+    finally:
+        await client.aclose()
+        await gateway.aclose()
+
+async def test_redis_lua_delegation_bound_agent_id_enforcement(clean_redis: str) -> None:
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    client = redis.from_url(clean_redis, decode_responses=True)
+    try:
+        parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
+
+        # 1. Claim mismatch: claim is bound to "research-agent-1", proposal supplied for "other-agent"
+        mismatched_proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+            parent_id, asgn_id, grant, art_ref, now, prop_id="prop-mismatch-1", bound_agent_id="other-agent"
+        )
+        with pytest.raises(ClaimNotFoundError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=mismatched_proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.exists(f"task.status:{child_id}") == 0
+        assert await client.llen("agent.hints.analysis") == 0
+
+        # 2. Matching first acceptance succeeds
+        valid_proposal, child_input, continuation, yield_rec, hint, child_id = _build_test_proposal(
+            parent_id, asgn_id, grant, art_ref, now, prop_id="prop-valid-1", bound_agent_id="research-agent-1"
+        )
+        res, is_rep = await gateway.accept_delegation_proposal(
+            parent_task_id=parent_id,
+            proposal=valid_proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+        assert not is_rep
+        assert res.proposal_id == "prop-valid-1"
+        assert res.bound_agent_id == "research-agent-1"
+        assert await client.llen("agent.hints.analysis") == 1
+
+        # 3. Active replay with matching bound_agent_id succeeds
+        replayed, is_rep2 = await gateway.accept_delegation_proposal(
+            parent_task_id=parent_id,
+            proposal=valid_proposal,
+            child_task_input=child_input,
+            parent_continuation=continuation,
+            yield_record=yield_rec,
+            wake_up_hint=hint,
+            expected_fencing_epoch=1,
+            now=now,
+        )
+        assert is_rep2
+        assert replayed == res
+        assert await client.llen("agent.hints.analysis") == 1
+
+        # 4. Replay with conflicting bound_agent_id fails closed
+        conflicting_bound = DelegationProposalRecord(
+            parent_task_id=valid_proposal.parent_task_id,
+            proposal_id=valid_proposal.proposal_id,
+            child_task_id=valid_proposal.child_task_id,
+            delegation_decision_id=valid_proposal.delegation_decision_id,
+            assignment_id=valid_proposal.assignment_id,
+            runtime_principal_id=valid_proposal.runtime_principal_id,
+            bound_agent_id="different-replaying-agent",
+            proof_digest=valid_proposal.proof_digest,
+            proposal_fingerprint=valid_proposal.proposal_fingerprint,
+            delegation_grant_id=valid_proposal.delegation_grant_id,
+            child_claim_deadline=valid_proposal.child_claim_deadline,
+            accepted_at=valid_proposal.accepted_at,
+            target_capability=valid_proposal.target_capability,
+            continuation_version=valid_proposal.continuation_version,
+        )
+        with pytest.raises(DelegationConflictError):
+            await gateway.accept_delegation_proposal(
+                parent_task_id=parent_id,
+                proposal=conflicting_bound,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=hint,
+                expected_fencing_epoch=1,
+                now=now,
+            )
+        assert await client.llen("agent.hints.analysis") == 1
+
     finally:
         await client.aclose()
         await gateway.aclose()

@@ -19,6 +19,7 @@ from .queries import (
     QueryAgentsByCapability,
 )
 from .use_cases import (
+    AcceptDelegationProposal,
     AcknowledgeAssignment,
     CapabilityMismatchError,
     ClaimTask,
@@ -29,6 +30,7 @@ from .use_cases import (
 )
 
 __all__ = [
+    "AcceptDelegationProposal",
     "AcknowledgeAssignment",
     "AuthoritativeTaskStore",
     "CandidateFinder",

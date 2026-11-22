@@ -4,7 +4,9 @@ from agent_contracts import (
     ActiveClaim,
     AgentCandidate,
     AgentEvent,
+    AssignmentYieldRecord,
     DelegationGrant,
+    DelegationProposalRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     RoutingDecision,
@@ -47,6 +49,26 @@ class CapabilityMismatchError(Exception):
 
 class FencingEpochRaceError(TaskAlreadyClaimedError):
     """Raised when a concurrent claim conflict or epoch race is detected."""
+
+
+class ChildClaimDeadlineExpiredError(TaskNotClaimableError):
+    """Raised when an attempt is made to claim a child task after its claim deadline has passed."""
+
+
+class DelegationConflictError(Exception):
+    """Raised when a delegation proposal conflicts with existing authoritative state."""
+
+
+class WaveBudgetExceededError(Exception):
+    """Raised when a delegation attempt violates the maximum allowed waves for the task."""
+
+
+class GrantAlreadyConsumedError(Exception):
+    """Raised when an authority grant has already been consumed."""
+
+
+class DelegationReplayAuthorizationError(Exception):
+    """Raised when retired delegation proposal replay authorization fails."""
 
 
 @runtime_checkable
@@ -185,6 +207,31 @@ class AuthoritativeTaskStore(Protocol):
     ) -> ActiveClaim: ...
 
     async def expire_delivery_lease(self, task_id: str, now: str) -> bool: ...
+
+    async def accept_delegation_proposal(
+        self,
+        parent_task_id: str,
+        proposal: DelegationProposalRecord,
+        child_task_input: TaskInput,
+        parent_continuation: TaskContinuation,
+        yield_record: AssignmentYieldRecord,
+        wake_up_hint: WakeUpHint,
+        expected_fencing_epoch: int,
+        now: str,
+    ) -> tuple[DelegationProposalRecord, bool]:
+        """Atomically accept a research -> analysis delegation proposal.
+
+        Returns (accepted_proposal_record, is_replay).
+        """
+        ...
+
+    async def get_delegation_proposal(
+        self,
+        parent_task_id: str,
+        proposal_id: str,
+    ) -> DelegationProposalRecord | None:
+        """Retrieve an accepted delegation proposal record by parent_task_id and proposal_id."""
+        ...
 
 
 class StateReader(Protocol):
