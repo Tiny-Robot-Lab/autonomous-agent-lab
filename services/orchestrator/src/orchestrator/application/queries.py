@@ -35,8 +35,8 @@ class GetTaskResult:
     def __init__(self, reader: ResultReader) -> None:
         self._reader = reader
 
-    async def execute(self, task_id: str) -> dict[str, Any] | None:
-        return await self._reader.get_result(task_id)
+    async def execute(self, task_id: str, now: str = "") -> dict[str, Any] | None:
+        return await self._reader.get_result(task_id, now=now)
 
 
 class GetRoutingDecision:

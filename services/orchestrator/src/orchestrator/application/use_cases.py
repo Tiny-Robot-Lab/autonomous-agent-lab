@@ -1,5 +1,6 @@
 import hmac
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -9,6 +10,7 @@ from agent_contracts import (
     AgentEvent,
     ArtifactReference,
     AssignmentYieldRecord,
+    ClaimExpiryRecord,
     ClaimTaskResponse,
     CompletionCommand,
     CompletionResponse,
@@ -16,6 +18,9 @@ from agent_contracts import (
     DelegationProposalRecord,
     DelegationProposalRequest,
     DelegationProposalResponse,
+    RecoveryDecisionCommand,
+    RecoveryDecisionRecord,
+    ResumedContinuationContext,
     RoutingDecision,
     RoutingProvenance,
     StageArtifact,
@@ -25,6 +30,7 @@ from agent_contracts import (
     TaskInputReference,
     TaskRequested,
     TaskResult,
+    TerminalOutcome,
     WakeUpHint,
     compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
@@ -65,12 +71,15 @@ from .ports import (
     CandidateFinder,
     CapabilityMismatchError,
     CapabilityRouter,
+    ClaimDeadlineNotExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    ClaimTimeoutConflictError,
     CompletionReplayAuthorizationError,
     DelegationReplayAuthorizationError,
     EventPublisher,
     InvalidClaimProofError,
+    RecoveryPreconditionFailedError,
     RoutingAdvisor,
     RoutingRecorder,
     TaskAlreadyClaimedError,
@@ -760,6 +769,7 @@ class AcknowledgeAssignment:
         task_store: AuthoritativeTaskStore,
         assignment_proof_pepper: str,
         clock: Any = None,
+        execution_claim_timeout_seconds: float = 900.0,
     ) -> None:
         if task_store is None:
             raise TypeError("AcknowledgeAssignment requires an AuthoritativeTaskStore")
@@ -767,6 +777,7 @@ class AcknowledgeAssignment:
         self._master_secret = parse_master_secret(assignment_proof_pepper)
         self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._execution_claim_timeout_seconds = float(execution_claim_timeout_seconds)
 
     async def execute(
         self,
@@ -813,12 +824,20 @@ class AcknowledgeAssignment:
         if not verify_assignment_proof(self._verifier_key, assignment_proof, claim.proof_digest):
             raise InvalidClaimProofError("Assignment proof verification failed")
 
-        now_iso = normalize_canonical_utc_timestamp(self._clock())
+        now_val = self._clock()
+        if isinstance(now_val, datetime):
+            now_dt = now_val
+        else:
+            now_dt = datetime.fromisoformat(str(now_val))
+        now_iso = normalize_canonical_utc_timestamp(now_dt)
+        exec_expires_dt = now_dt + timedelta(seconds=self._execution_claim_timeout_seconds)
+        exec_expires_iso = normalize_canonical_utc_timestamp(exec_expires_dt)
         return await self._task_store.acknowledge_claim(
             task_id=clean_task_id,
             assignment_id=clean_assign_id,
             principal_id=principal.principal_id,
             acknowledged_at=now_iso,
+            execution_expires_at=exec_expires_iso,
         )
 
 
@@ -1372,3 +1391,368 @@ class CompleteTurn:
                 )
 
         return CompletionResponse(outcome=outcome, replayed=True, result=result)
+
+
+@dataclass(frozen=True)
+class EvaluateExpiryResult:
+    task_id: str
+    action: str  # "claim_timed_out", "recovery_required", "none"
+    status: str
+    outcome: TerminalOutcome | None = None
+    expiry_record: ClaimExpiryRecord | None = None
+
+
+class EvaluateExpiry:
+    """Targeted claim/deadline expiry evaluation use case.
+
+    Governed by ADR-0007 and Issue #223:
+    - Target: child task pending claim deadline expiry or acknowledged claim execution expiry;
+    - Requires 'recovery_operator' capability;
+    - If pending child deadline has expired, atomically materializes claim_timed_out;
+    - If working task execution lease has expired, atomically transitions to recovery_required;
+    - Idempotent and safe: no-op if not expired or already transitioned;
+    - Does not increment task fencing epoch.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("EvaluateExpiry requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        now: str = "",
+    ) -> EvaluateExpiryResult:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("recovery_operator"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'recovery_operator'"
+            )
+
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            raise ValueError("task_id must be a non-empty string")
+
+        now_val = now if (now and str(now).strip()) else self._clock()
+        if isinstance(now_val, datetime):
+            now_iso = normalize_canonical_utc_timestamp(now_val)
+        else:
+            now_iso = normalize_canonical_utc_timestamp(str(now_val))
+
+        status = await self._task_store.get_status(clean_task_id, now=now_iso)
+        if status is None:
+            raise ParentTaskNotFoundError(f"Task '{clean_task_id}' not found")
+
+        lineage = await self._task_store.get_lineage(clean_task_id)
+
+        # 1. Pending child deadline check
+        if status == "pending" and lineage and not lineage.is_root:
+            try:
+                outcome, _ = await self._task_store.materialize_claim_timeout(clean_task_id, now_iso)
+                return EvaluateExpiryResult(
+                    task_id=clean_task_id,
+                    action="claim_timed_out",
+                    status="claim_timed_out",
+                    outcome=outcome,
+                )
+            except ClaimDeadlineNotExpiredError:
+                return EvaluateExpiryResult(
+                    task_id=clean_task_id,
+                    action="none",
+                    status="pending",
+                )
+            except ClaimTimeoutConflictError:
+                cur_status = await self._task_store.get_status(clean_task_id, now=now_iso) or status
+                if cur_status == "claim_timed_out":
+                    outcome = await self._task_store.get_terminal_outcome(clean_task_id)
+                    return EvaluateExpiryResult(
+                        task_id=clean_task_id,
+                        action="claim_timed_out",
+                        status="claim_timed_out",
+                        outcome=outcome,
+                    )
+                return EvaluateExpiryResult(
+                    task_id=clean_task_id,
+                    action="none",
+                    status=cur_status,
+                )
+
+        # 2. Working task execution lease check
+        if status == "working":
+            claim = await self._task_store.get_active_claim(clean_task_id)
+            if (
+                claim
+                and claim.state == "acknowledged"
+                and claim.execution_expires_at
+                and now_iso > claim.execution_expires_at
+            ):
+                try:
+                    expiry_record, _ = await self._task_store.transition_expired_claim(clean_task_id, now_iso)
+                    return EvaluateExpiryResult(
+                        task_id=clean_task_id,
+                        action="recovery_required",
+                        status="recovery_required",
+                        expiry_record=expiry_record,
+                    )
+                except ClaimTimeoutConflictError:
+                    cur_status = await self._task_store.get_status(clean_task_id, now=now_iso) or status
+                    if cur_status == "recovery_required":
+                        expiry_record = await self._task_store.get_claim_expiry(clean_task_id)
+                        return EvaluateExpiryResult(
+                            task_id=clean_task_id,
+                            action="recovery_required",
+                            status="recovery_required",
+                            expiry_record=expiry_record,
+                        )
+                    return EvaluateExpiryResult(
+                        task_id=clean_task_id,
+                        action="none",
+                        status=cur_status,
+                    )
+
+        # 3. Already in terminal / recovery state (e.g. from targeted hook or exact replay)
+        if status == "recovery_required":
+            expiry_record = await self._task_store.get_claim_expiry(clean_task_id)
+            return EvaluateExpiryResult(
+                task_id=clean_task_id,
+                action="recovery_required",
+                status="recovery_required",
+                expiry_record=expiry_record,
+            )
+
+        if status == "claim_timed_out":
+            outcome = await self._task_store.get_terminal_outcome(clean_task_id)
+            return EvaluateExpiryResult(
+                task_id=clean_task_id,
+                action="claim_timed_out",
+                status="claim_timed_out",
+                outcome=outcome,
+            )
+
+        outcome_terminal = None
+        if status in ("completed", "failed"):
+            outcome_terminal = await self._task_store.get_terminal_outcome(clean_task_id)
+
+        return EvaluateExpiryResult(
+            task_id=clean_task_id,
+            action="none",
+            status=status,
+            outcome=outcome_terminal,
+        )
+
+
+class ResolveExpiredClaim:
+    """Operator-directed recovery resolution for expired execution claims.
+
+    Governed by ADR-0007 and Issue #223:
+    - Requires 'recovery_operator' capability;
+    - Accepts RecoveryDecisionCommand with disposition 'restore_claimable';
+    - Verifies ClaimExpiryRecord matches expired_claim_id, expired_assignment_id, expired_fencing_epoch;
+    - Restores task to prior_claimable_status recorded in ClaimExpiryRecord;
+    - Stores immutable RecoveryDecisionRecord;
+    - Does NOT increment task.fence (next pull-claim creates next fencing epoch);
+    - Idempotent on repeated calls with matching decision fingerprint.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("ResolveExpiredClaim requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        command: RecoveryDecisionCommand,
+        now: str = "",
+    ) -> tuple[RecoveryDecisionRecord, str]:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("recovery_operator"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'recovery_operator'"
+            )
+
+        if command.disposition != "restore_claimable":
+            raise RecoveryPreconditionFailedError(
+                f"Unsupported recovery disposition '{command.disposition}', only 'restore_claimable' is supported"
+            )
+
+        now_val = now if (now and str(now).strip()) else self._clock()
+        if isinstance(now_val, datetime):
+            now_iso = normalize_canonical_utc_timestamp(now_val)
+        else:
+            now_iso = normalize_canonical_utc_timestamp(str(now_val))
+
+        return await self._task_store.resolve_expired_claim(
+            command=command,
+            operator_principal_id=principal.principal_id,
+            now=now_iso,
+        )
+
+
+class GetResumedContinuationContext:
+    """Authenticated continuation-context reader for resumed parent turns.
+
+    Governed by ADR-0006, ADR-0007, and Issue #223:
+    - Dedicated authenticated boundary (GET /api/tasks/{task_id}/continuation-context);
+    - Validates caller principal has 'research' capability;
+    - Validates active claim exists for task_id and matches assignment_id;
+    - Validates claim.runtime_principal_id == principal.principal_id;
+    - Validates claim.bound_agent_id == principal.bound_agent_id;
+    - Validates claim.assigned_capability == 'research';
+    - Validates claim.state == 'acknowledged';
+    - Validates claim.execution_kind == 'resumed_continuation';
+    - Validates claim.continuation_version == 1;
+    - Validates current fencing epoch matches claim.fencing_epoch;
+    - Cryptographically verifies X-Assignment-Proof via verify_assignment_proof;
+    - Retrieves parent_task_input (v1);
+    - Retrieves continuation (v1, stage='incorporate_analysis_child');
+    - Retrieves sealed stage_artifact (referenced by continuation);
+    - Retrieves child_outcome for continuation.child_task_id;
+    - Retrieves child_result for continuation.child_task_id (if child_outcome is completed);
+    - Returns ResumedContinuationContext.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("GetResumedContinuationContext requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+    ) -> ResumedContinuationContext:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("research"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'research'"
+            )
+
+        clean_task = str(task_id).strip()
+        clean_assignment = str(assignment_id).strip()
+        clean_proof = str(assignment_proof).strip()
+
+        if not clean_task:
+            raise ValueError("task_id must be a non-empty string")
+        if not clean_assignment:
+            raise ValueError("assignment_id must be a non-empty string")
+        if not clean_proof:
+            raise ValueError("assignment_proof must be a non-empty string")
+
+        claim = await self._task_store.get_active_claim(clean_task)
+        if claim is None or claim.assignment_id != clean_assignment:
+            raise ClaimNotFoundError(
+                f"Active claim for task '{clean_task}' and assignment '{clean_assignment}' not found"
+            )
+
+        if claim.runtime_principal_id != principal.principal_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assignment}' is not owned by principal '{principal.principal_id}'"
+            )
+        if claim.bound_agent_id != principal.bound_agent_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assignment}' is bound to agent '{claim.bound_agent_id}', "
+                f"not '{principal.bound_agent_id}'"
+            )
+        if claim.assigned_capability != "research":
+            raise CapabilityMismatchError(
+                f"Claim assigned_capability '{claim.assigned_capability}' is not 'research'"
+            )
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Assignment must be acknowledged before reading continuation context")
+        if claim.execution_kind != "resumed_continuation":
+            raise TaskNotClaimableError(
+                f"Continuation context is only available for 'resumed_continuation', got '{claim.execution_kind}'"
+            )
+        if claim.continuation_version != 1:
+            raise TaskNotClaimableError(
+                f"Continuation context requires continuation_version=1, got {claim.continuation_version}"
+            )
+
+        cur_epoch = await self._task_store.get_fencing_epoch(clean_task)
+        if claim.fencing_epoch != cur_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{clean_assignment}': "
+                f"claim={claim.fencing_epoch}, current={cur_epoch}"
+            )
+
+        if not verify_assignment_proof(self._verifier_key, clean_proof, claim.proof_digest):
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        # 1. Authoritative TaskInput v1
+        task_input = await self._task_store.get_task_input(clean_task, 1)
+        if task_input is None:
+            raise CorruptAuthoritativeRecordError(f"Parent TaskInput v1 not found for task '{clean_task}'")
+
+        # 2. Authoritative Continuation v1
+        continuation = await self._task_store.get_continuation(clean_task, 1)
+        if continuation is None or continuation.stage != "incorporate_analysis_child":
+            raise CorruptAuthoritativeRecordError(
+                f"Continuation v1 with stage 'incorporate_analysis_child' not found for task '{clean_task}'"
+            )
+
+        # 3. Sealed StageArtifact
+        if not continuation.artifact_references:
+            raise CorruptAuthoritativeRecordError(f"No artifact references in continuation v1 for task '{clean_task}'")
+        art_ref = continuation.artifact_references[0]
+        if art_ref.producing_task_id != clean_task:
+            raise CorruptAuthoritativeRecordError(
+                f"Artifact reference producing_task_id '{art_ref.producing_task_id}' does not match parent task '{clean_task}'"
+            )
+        stage_artifact = await self._task_store.get_stage_artifact(
+            producing_task_id=art_ref.producing_task_id,
+            artifact_id=art_ref.artifact_id,
+            artifact_version=art_ref.artifact_version,
+        )
+        if stage_artifact is None or not stage_artifact.sealed:
+            raise CorruptAuthoritativeRecordError(
+                f"Primary sealed stage artifact '{art_ref.artifact_id}' missing or unsealed for task '{clean_task}'"
+            )
+
+        # 4. Child terminal outcome
+        child_outcome = await self._task_store.get_terminal_outcome(continuation.child_task_id)
+        if child_outcome is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Child outcome not found for child task '{continuation.child_task_id}'"
+            )
+
+        # 5. Child result (if completed)
+        child_result: TaskResult | None = None
+        if child_outcome.terminal_status == "completed":
+            child_result = await self._task_store.get_canonical_result(continuation.child_task_id)
+            if child_result is None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Canonical child result missing for completed child task '{continuation.child_task_id}'"
+                )
+
+        return ResumedContinuationContext(
+            parent_task_input=task_input,
+            continuation=continuation,
+            stage_artifact=stage_artifact,
+            child_outcome=child_outcome,
+            child_result=child_result,
+            version=1,
+        )

@@ -9,11 +9,18 @@ import pytest
 from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
+    ArtifactReference,
     CompletionCommand,
     FallbackEligibleInferenceError,
     FallbackTransition,
+    ResumedContinuationContext,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
     TaskResult,
+    WakeUpHint,
+    build_claim_timed_out_terminal_outcome,
 )
 from orchestrator.application.queries import GetAgentStates, GetRecentEvents
 from research_agent.application.processor import ResearchExecutionError, ResearchProcessor
@@ -3703,3 +3710,309 @@ async def test_gemini_research_provider_error_redacts_secret() -> None:
     err_text = str(exc_info.value)
     assert secret_key not in err_text
     assert "[REDACTED]" in err_text
+
+
+def _make_hint(**overrides: Any) -> WakeUpHint:
+    hint = WakeUpHint(
+        hint_id="h-base",
+        capability="research",
+        created_at="2026-11-22T00:00:00Z",
+        execution_kind="resumed_continuation",
+        task_id="t-base",
+        expected_continuation_version=1,
+    )
+    for k, v in overrides.items():
+        object.__setattr__(hint, k, v)
+    return hint
+
+
+def _make_malformed_hint() -> Any:
+    class MalformedHint(WakeUpHint):
+        def __init__(self) -> None:
+            pass
+
+        def __repr__(self) -> str:
+            return "<MalformedHint>"
+
+    return MalformedHint()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("case_name", "rejected_hint"),
+    [
+        ("empty_task_id", _make_hint(task_id="")),
+        (
+            "missing_task_id_none",
+            WakeUpHint(
+                hint_id="h-missing",
+                capability="research",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="resumed_continuation",
+                task_id=None,
+                expected_continuation_version=1,
+            ),
+        ),
+        ("blank_task_id_whitespace", _make_hint(task_id="   ")),
+        (
+            "execution_kind_initial",
+            WakeUpHint(
+                hint_id="h-init",
+                capability="research",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="initial",
+                task_id="task-init",
+                expected_continuation_version=1,
+            ),
+        ),
+        (
+            "execution_kind_delegated_child",
+            WakeUpHint(
+                hint_id="h-child",
+                capability="research",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="delegated_child",
+                task_id="task-child",
+                expected_continuation_version=1,
+            ),
+        ),
+        ("missing_execution_kind", _make_hint(execution_kind=None)),
+        (
+            "expected_continuation_version_none",
+            WakeUpHint(
+                hint_id="h-ver-none",
+                capability="research",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="resumed_continuation",
+                task_id="task-ver-none",
+                expected_continuation_version=None,
+            ),
+        ),
+        ("expected_continuation_version_zero", _make_hint(expected_continuation_version=0)),
+        (
+            "expected_continuation_version_two",
+            WakeUpHint(
+                hint_id="h-ver-two",
+                capability="research",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="resumed_continuation",
+                task_id="task-ver-two",
+                expected_continuation_version=2,
+            ),
+        ),
+        (
+            "capability_other_than_research",
+            WakeUpHint(
+                hint_id="h-cap-analysis",
+                capability="analysis",
+                created_at="2026-11-22T00:00:00Z",
+                execution_kind="resumed_continuation",
+                task_id="task-cap-analysis",
+                expected_continuation_version=1,
+            ),
+        ),
+        ("malformed_hint_object", _make_malformed_hint()),
+    ],
+)
+async def test_run_research_agent_hint_handling_rejects_malformed_hints(
+    case_name: str,
+    rejected_hint: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("AGENT_ID", "research-agent-test")
+    monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+    monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+
+    ordinary_task = TaskRequested(
+        task_id="task-ordinary",
+        root_task_id="task-ordinary",
+        parent_task_id=None,
+        prompt="Ordinary research prompt",
+        created_at="2026-11-22T00:00:00Z",
+    )
+
+    with (
+        patch("research_agent.main.RedisBus") as mock_bus_cls,
+        patch("research_agent.main.OrchestratorClient") as mock_orch_cls,
+        patch("research_agent.main.ResearchProcessor") as mock_proc_cls,
+    ):
+        mock_bus = AsyncMock()
+        mock_bus_cls.return_value = mock_bus
+
+        mock_orch = AsyncMock()
+        mock_orch_cls.return_value = mock_orch
+        mock_orch.claim_task.return_value = (
+            {"assignment_id": "asgn-ord", "task_id": "task-ordinary", "fencing_epoch": 1},
+            "proof-ord",
+        )
+
+        mock_proc = AsyncMock()
+        mock_proc_cls.return_value = mock_proc
+
+        # The bus yields the rejected hint, then the ordinary task, then cancels to exit loop
+        mock_bus.next_signal.side_effect = [
+            rejected_hint,
+            ordinary_task,
+            asyncio.CancelledError(),
+        ]
+
+        from research_agent.main import run_research_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_research_agent()
+
+        # For the rejected hint, assert claim_task was never awaited
+        rejected_task_id = getattr(rejected_hint, "task_id", None)
+        for call in mock_orch.claim_task.call_args_list:
+            assert call.kwargs.get("execution_kind") != "resumed_continuation"
+            if rejected_task_id:
+                assert call.args[0] != rejected_task_id
+                assert call.kwargs.get("task_id") != rejected_task_id
+
+        # claim_task was called exactly once, strictly for the ordinary task
+        assert mock_orch.claim_task.await_count == 1
+        claim_args = mock_orch.claim_task.call_args[0]
+        assert claim_args[0] == "task-ordinary"
+        assert claim_args[2] == "research"
+        assert claim_args[3] == "initial"
+
+        # acknowledge_assignment was awaited only for the ordinary task
+        mock_orch.acknowledge_assignment.assert_awaited_once_with(
+            "task-ordinary", "asgn-ord", "proof-ord"
+        )
+
+        # get_resumed_continuation_context was never awaited
+        mock_orch.get_resumed_continuation_context.assert_not_called()
+
+        # processor.run_once was awaited only for the ordinary task, never for the rejected hint
+        mock_proc.run_once.assert_awaited_once_with(
+            ordinary_task,
+            assignment_id="asgn-ord",
+            assignment_proof="proof-ord",
+            execution_kind="initial",
+        )
+
+        # No completion command was submitted
+        mock_orch.submit_completion.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_run_research_agent_hint_handling_valid_control_proceeds_to_resumed_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("AGENT_ID", "research-agent-test")
+    monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+    monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+
+    now_iso = "2026-11-22T00:00:00Z"
+    valid_hint = WakeUpHint(
+        hint_id="hint-valid-ctrl",
+        capability="research",
+        created_at=now_iso,
+        execution_kind="resumed_continuation",
+        task_id="task-valid-ctrl",
+        expected_continuation_version=1,
+    )
+
+    parent_input = TaskInput(
+        task_id="task-valid-ctrl",
+        prompt="Resumed parent prompt",
+        created_at=now_iso,
+    )
+    continuation = TaskContinuation(
+        parent_task_id="task-valid-ctrl",
+        child_task_id="child-ctrl-1",
+        created_at=now_iso,
+        updated_at=now_iso,
+        stage="incorporate_analysis_child",
+        continuation_version=1,
+        artifact_references=(
+            ArtifactReference(
+                producing_task_id="task-valid-ctrl",
+                artifact_id="art-ctrl-1",
+                artifact_version=1,
+            ),
+        ),
+    )
+    stage_artifact = StageArtifact(
+        artifact_id="art-ctrl-1",
+        producing_task_id="task-valid-ctrl",
+        artifact_type="research_material",
+        content={"material": "Sample research material"},
+        created_at=now_iso,
+        sealed=True,
+    )
+    child_outcome = build_claim_timed_out_terminal_outcome(
+        task_id="child-ctrl-1",
+        claim_deadline=now_iso,
+        completed_at=now_iso,
+    )
+    resumed_context = ResumedContinuationContext(
+        parent_task_input=parent_input,
+        continuation=continuation,
+        stage_artifact=stage_artifact,
+        child_outcome=child_outcome,
+    )
+
+    with (
+        patch("research_agent.main.RedisBus") as mock_bus_cls,
+        patch("research_agent.main.OrchestratorClient") as mock_orch_cls,
+        patch("research_agent.main.ResearchProcessor") as mock_proc_cls,
+    ):
+        mock_bus = AsyncMock()
+        mock_bus_cls.return_value = mock_bus
+
+        mock_orch = AsyncMock()
+        mock_orch_cls.return_value = mock_orch
+        mock_orch.claim_task.return_value = (
+            {"assignment_id": "asgn-resumed-ctrl", "task_id": "task-valid-ctrl", "fencing_epoch": 2},
+            "proof-resumed-ctrl",
+        )
+        mock_orch.get_resumed_continuation_context.return_value = resumed_context
+
+        mock_proc = AsyncMock()
+        mock_proc_cls.return_value = mock_proc
+
+        mock_bus.next_signal.side_effect = [
+            valid_hint,
+            asyncio.CancelledError(),
+        ]
+
+        from research_agent.main import run_research_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_research_agent()
+
+        # 1. Authenticated pull-claim for resumed turn
+        mock_orch.claim_task.assert_awaited_once()
+        _, claim_kwargs = mock_orch.claim_task.call_args
+        assert claim_kwargs["task_id"] == "task-valid-ctrl"
+        assert claim_kwargs["capability"] == "research"
+        assert claim_kwargs["execution_kind"] == "resumed_continuation"
+        assert claim_kwargs["expected_continuation_version"] == 1
+
+        # 2. Acknowledge assignment
+        mock_orch.acknowledge_assignment.assert_awaited_once_with(
+            "task-valid-ctrl", "asgn-resumed-ctrl", "proof-resumed-ctrl"
+        )
+
+        # 3. Read continuation context
+        mock_orch.get_resumed_continuation_context.assert_awaited_once_with(
+            "task-valid-ctrl", "asgn-resumed-ctrl", "proof-resumed-ctrl"
+        )
+
+        # 4. Processor run_once for resumed continuation with properly constructed TaskRequested
+        mock_proc.run_once.assert_awaited_once()
+        proc_task = mock_proc.run_once.call_args[0][0]
+        proc_kwargs = mock_proc.run_once.call_args[1]
+        assert proc_task.task_id == "task-valid-ctrl"
+        assert proc_task.prompt == "Resumed parent prompt"
+        assert proc_task.root_task_id == "task-valid-ctrl"
+        assert proc_task.parent_task_id is None
+        assert proc_task.created_at == now_iso
+        assert proc_kwargs["assignment_id"] == "asgn-resumed-ctrl"
+        assert proc_kwargs["assignment_proof"] == "proof-resumed-ctrl"
+        assert proc_kwargs["execution_kind"] == "resumed_continuation"
+        assert proc_kwargs["continuation_version"] == 1

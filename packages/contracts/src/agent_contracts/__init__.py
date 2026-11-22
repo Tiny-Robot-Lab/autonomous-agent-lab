@@ -18,6 +18,14 @@ from .availability import (
 )
 from .candidates import AgentCandidate
 from .capabilities import AgentCapabilityMetadata
+from .claim_expiry import (
+    CLAIM_EXPIRY_CONTRACT_VERSION,
+    ClaimExpiryRecord,
+)
+from .continuation_context import (
+    CONTINUATION_CONTEXT_CONTRACT_VERSION,
+    ResumedContinuationContext,
+)
 from .delegation_grant import (
     DELEGATION_GRANT_CONTRACT_VERSION,
     DelegationGrant,
@@ -65,6 +73,13 @@ from .messages import (
     TaskRequested,
     ToolExecutionTelemetry,
 )
+from .recovery import (
+    ALLOWED_RECOVERY_DISPOSITIONS,
+    RECOVERY_CONTRACT_VERSION,
+    RecoveryDecisionCommand,
+    RecoveryDecisionRecord,
+    compute_recovery_decision_fingerprint,
+)
 from .required_capability import (
     ALLOWED_REQUIRED_CAPABILITIES,
     REQUIRED_CAPABILITY_CONTRACT_VERSION,
@@ -102,6 +117,7 @@ from .terminal_completion import (
     ALLOWED_COMPLETION_EXECUTION_KINDS,
     ALLOWED_COMPLETION_FAILURE_CODES,
     ALLOWED_COMPLETION_TERMINAL_STATUSES,
+    CLAIM_TIMED_OUT_SAFE_SUMMARY,
     COMPLETION_FORBIDDEN_AUTHORITY_FIELDS,
     COMPLETION_OUTCOME_ID_PREFIX,
     COMPLETION_OUTCOME_ID_SEPARATOR,
@@ -116,10 +132,12 @@ from .terminal_completion import (
     CompletionRecord,
     CompletionResponse,
     TerminalOutcome,
+    build_claim_timed_out_terminal_outcome,
     build_completion_audit,
     build_terminal_outcome,
     classify_completion_failure,
     compute_completion_fingerprint,
+    compute_timeout_fingerprint,
     derive_terminal_outcome_id,
 )
 from .tool_authorization import (
@@ -172,14 +190,18 @@ __all__ = [
     "ALLOWED_CONTINUATION_STAGES",
     "ALLOWED_CONTROL_FIELDS",
     "ALLOWED_PRIOR_CLAIMABLE_STATUSES",
+    "ALLOWED_RECOVERY_DISPOSITIONS",
     "ALLOWED_REQUIRED_CAPABILITIES",
     "ALLOWED_TARGET_CAPABILITIES",
     "ALL_TASK_LIFECYCLE_STATUSES",
     "ASSIGNMENT_YIELD_CONTRACT_VERSION",
     "CHILD_LIFECYCLE_STATUSES",
+    "CLAIM_EXPIRY_CONTRACT_VERSION",
+    "CLAIM_TIMED_OUT_SAFE_SUMMARY",
     "COMPLETION_FORBIDDEN_AUTHORITY_FIELDS",
     "COMPLETION_OUTCOME_ID_PREFIX",
     "COMPLETION_OUTCOME_ID_SEPARATOR",
+    "CONTINUATION_CONTEXT_CONTRACT_VERSION",
     "DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS",
     "DELEGATION_GRANT_CONTRACT_VERSION",
     "DELEGATION_PROPOSAL_CONTRACT_VERSION",
@@ -193,6 +215,7 @@ __all__ = [
     "NONTERMINAL_TASK_LIFECYCLE_STATUSES",
     "PARENT_LIFECYCLE_STATUSES",
     "RAW_FAILURE_TEXT_FIELDS",
+    "RECOVERY_CONTRACT_VERSION",
     "REQUIRED_CAPABILITY_CONTRACT_VERSION",
     "SAFE_COMPLETION_SUMMARIES",
     "STAGE_CONTROL_FIELDS_ALLOWLIST",
@@ -212,6 +235,7 @@ __all__ = [
     "ArtifactReference",
     "AssignmentCompletionRecord",
     "AssignmentYieldRecord",
+    "ClaimExpiryRecord",
     "ClaimTaskResponse",
     "CompletionCommand",
     "CompletionRecord",
@@ -232,7 +256,10 @@ __all__ = [
     "LivenessPolicy",
     "NonFallbackInferenceError",
     "ProviderFailureSummary",
+    "RecoveryDecisionCommand",
+    "RecoveryDecisionRecord",
     "RequiredCapabilityRecord",
+    "ResumedContinuationContext",
     "RootAuthorityRecord",
     "RoutingDecision",
     "RoutingProvenance",
@@ -274,6 +301,7 @@ __all__ = [
     "ToolSelector",
     "WakeUpHint",
     "__version__",
+    "build_claim_timed_out_terminal_outcome",
     "build_completion_audit",
     "build_terminal_outcome",
     "canonical_json_dumps",
@@ -281,6 +309,8 @@ __all__ = [
     "classify_completion_failure",
     "compute_completion_fingerprint",
     "compute_proposal_fingerprint",
+    "compute_recovery_decision_fingerprint",
+    "compute_timeout_fingerprint",
     "derive_terminal_outcome_id",
     "evaluate_agent_record",
     "evaluate_availability",

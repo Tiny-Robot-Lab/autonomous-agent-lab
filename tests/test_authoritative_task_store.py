@@ -14,10 +14,13 @@ from agent_contracts import (
     ArtifactReference,
     AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    ClaimExpiryRecord,
     CompletionCommand,
     CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
+    RecoveryDecisionCommand,
+    RecoveryDecisionRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     StageArtifact,
@@ -27,6 +30,7 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    build_claim_timed_out_terminal_outcome,
     build_completion_audit,
     build_terminal_outcome,
     compute_proposal_fingerprint,
@@ -37,13 +41,17 @@ from orchestrator.application.ports import (
     AuthoritativeTaskStore,
     CapabilityMismatchError,
     ChildClaimDeadlineExpiredError,
+    ClaimDeadlineNotExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    ClaimTimeoutConflictError,
     CompletionConflictError,
     DelegationConflictError,
     FencingEpochRaceError,
     GrantAlreadyConsumedError,
     InvalidClaimProofError,
+    RecoveryConflictError,
+    RecoveryPreconditionFailedError,
     TaskAlreadyClaimedError,
     TaskDispatcher,
     TaskNotClaimableError,
@@ -101,6 +109,8 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.canonical_results: dict[str, TaskResult] = {}
         self.assignment_completions: dict[tuple[str, str], AssignmentCompletionRecord] = {}
         self.child_markers: dict[str, dict[str, str]] = {}
+        self.claim_expiries: dict[str, ClaimExpiryRecord] = {}
+        self.recovery_decisions: dict[tuple[str, str], RecoveryDecisionRecord] = {}
         self.fail_next_registration: bool = False
         self.root_registrations: list[tuple[TaskRequested, str]] = []
         self.child_registrations: list[tuple[TaskRequested, str]] = []
@@ -263,8 +273,45 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             raise ValueError("task_id must be a non-empty string")
         self.statuses[clean_id] = status.strip()
 
-    async def get_status(self, task_id: str) -> str | None:
-        return self.statuses.get(task_id.strip())
+    async def get_status(self, task_id: str, now: str = "") -> str | None:
+        clean_task_id = task_id.strip()
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        deadline = self.claim_deadlines.get(clean_task_id)
+        if deadline and now_iso > deadline and clean_task_id not in self.terminal_outcomes:
+            try:
+                await self.materialize_claim_timeout(clean_task_id, now_iso)
+            except Exception:  # noqa: BLE001, S110
+                pass
+        claim = self.claims.get(clean_task_id)
+        if (
+            claim
+            and claim.state == "acknowledged"
+            and claim.execution_expires_at
+            and now_iso > claim.execution_expires_at
+            and clean_task_id not in self.terminal_outcomes
+        ):
+            try:
+                await self.transition_expired_claim(clean_task_id, now_iso)
+            except Exception:  # noqa: BLE001, S110
+                pass
+        outcome = self.terminal_outcomes.get(clean_task_id)
+        if outcome is not None:
+            return outcome.terminal_status
+        return self.statuses.get(clean_task_id)
+
+    async def get_result(self, task_id: str, now: str = "") -> dict[str, Any]:
+        clean_task_id = task_id.strip()
+        status = await self.get_status(clean_task_id, now=now)
+        res = self.canonical_results.get(clean_task_id)
+        return {
+            "task_id": clean_task_id,
+            "status": status,
+            "output": res.output if res else None,
+        }
 
     async def save_task_input(self, task_input: TaskInput) -> None:
         if task_input.input_version > 1:
@@ -477,6 +524,11 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 and existing_claim.request_id == claim.request_id
             ):
                 if existing_claim.state == "acknowledged":
+                    if existing_claim.execution_expires_at and now_iso > existing_claim.execution_expires_at:
+                        await self.transition_expired_claim(clean_task_id, now_iso)
+                        raise TaskNotClaimableError(
+                            f"Task '{clean_task_id}' execution claim has expired and transitioned to recovery_required"
+                        )
                     raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' assignment is already acknowledged")
                 if (
                     existing_claim.state == "claimed_unacknowledged"
@@ -491,6 +543,15 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                     and existing_claim.delivery_expires_at <= now_iso
                 ):
                     effective_status = existing_claim.prior_claimable_status
+                elif (
+                    existing_claim.state == "acknowledged"
+                    and existing_claim.execution_expires_at
+                    and now_iso > existing_claim.execution_expires_at
+                ):
+                    await self.transition_expired_claim(clean_task_id, now_iso)
+                    raise TaskNotClaimableError(
+                        f"Task '{clean_task_id}' execution claim has expired and transitioned to recovery_required"
+                    )
                 else:
                     raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim")
 
@@ -506,6 +567,10 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 raise ValueError("continuation_version must remain absent for non-resumed claims")
             deadline = self.claim_deadlines.get(clean_task_id)
             if deadline and now_iso > deadline:
+                try:
+                    await self.materialize_claim_timeout(clean_task_id, now_iso)
+                except Exception:  # noqa: BLE001, S110
+                    pass
                 raise ChildClaimDeadlineExpiredError(
                     f"Claim deadline for child task '{clean_task_id}' has expired ({deadline})"
                 )
@@ -564,6 +629,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         assignment_id: str,
         principal_id: str,
         acknowledged_at: str,
+        execution_expires_at: str | None = None,
     ) -> ActiveClaim:
         clean_task_id = task_id.strip()
         claim = self.claims.get(clean_task_id)
@@ -580,6 +646,8 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         ack_dict = claim.to_dict()
         ack_dict["state"] = "acknowledged"
         ack_dict["acknowledged_at"] = clean_now
+        if execution_expires_at is not None:
+            ack_dict["execution_expires_at"] = normalize_canonical_utc_timestamp(execution_expires_at)
         updated = ActiveClaim.from_dict(ack_dict)
         self.claims[clean_task_id] = updated
         return updated
@@ -1102,6 +1170,283 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         clean_parent = str(parent_task_id).strip()
         clean_proposal_id = str(proposal_id).strip()
         return self.proposals.get((clean_parent, clean_proposal_id))
+
+    async def materialize_claim_timeout(
+        self,
+        child_task_id: str,
+        now: str,
+    ) -> tuple[TerminalOutcome, bool]:
+        clean_child = child_task_id.strip()
+        clean_now = normalize_canonical_utc_timestamp(now)
+        cur_status = self.statuses.get(clean_child)
+        if not cur_status:
+            raise ParentTaskNotFoundError(f"Child task '{clean_child}' not found")
+
+        if cur_status == "claim_timed_out":
+            outcome = self.terminal_outcomes.get(clean_child)
+            if not outcome or outcome.terminal_status != "claim_timed_out" or outcome.task_id != clean_child:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' missing or conflicting terminal outcome")
+            if clean_child in self.canonical_results:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has unexpected canonical result")
+            if clean_child in self.claims:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has active claim")
+
+            lineage = self.lineages.get(clean_child)
+            if not lineage or lineage.task_id != clean_child or not lineage.parent_task_id or not lineage.root_task_id:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' missing or corrupt lineage")
+            parent_task_id = lineage.parent_task_id
+
+            children = self.children.get(parent_task_id, set())
+            if clean_child not in children:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' not in parent's children set")
+
+            latest_ver = self.latest_continuation.get(parent_task_id, 0)
+            if latest_ver != 1:
+                raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' latest continuation version is {latest_ver}, expected 1")
+
+            cont = self.continuations.get((parent_task_id, 1))
+            if (
+                not cont
+                or cont.parent_task_id != parent_task_id
+                or cont.continuation_version != 1
+                or cont.stage != "incorporate_analysis_child"
+                or cont.child_task_id != clean_child
+            ):
+                raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' continuation v1 does not match stage/child/version")
+
+            marker = self.child_markers.get(clean_child)
+            if (
+                not marker
+                or marker.get("child_task_id") != clean_child
+                or marker.get("parent_task_id") != parent_task_id
+                or marker.get("outcome_id") != outcome.outcome_id
+                or marker.get("continuation_version") != 1
+                or marker.get("status") != "claim_timed_out"
+            ):
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' missing or conflicting completion marker")
+
+            parent_st = self.statuses.get(parent_task_id)
+            if parent_st != "resumable":
+                raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' is '{parent_st}', expected 'resumable'")
+
+            return (outcome, True)
+
+        if cur_status != "pending":
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' is in '{cur_status}' status, expected 'pending'")
+
+        if clean_child in self.terminal_outcomes:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' already has a terminal outcome")
+        if clean_child in self.canonical_results:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' already has a canonical result")
+        if clean_child in self.child_markers:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' already has a completion marker")
+
+        claim = self.claims.get(clean_child)
+        if claim:
+            if claim.state == "acknowledged":
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has active acknowledged claim")
+            elif claim.state == "claimed_unacknowledged" and claim.delivery_expires_at > clean_now:
+                raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has active unacknowledged delivery lease")
+
+        lineage = self.lineages.get(clean_child)
+        if not lineage or not lineage.parent_task_id:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has no parent lineage")
+        parent_task_id = lineage.parent_task_id
+
+        deadline = self.claim_deadlines.get(clean_child)
+        if not deadline:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' has no claim deadline")
+        if clean_now <= deadline:
+            raise ClaimDeadlineNotExpiredError(f"Child task '{clean_child}' claim deadline {deadline} has not expired at {clean_now}")
+
+        parent_status = self.statuses.get(parent_task_id)
+        if not parent_status:
+            raise ParentTaskNotFoundError(f"Parent task '{parent_task_id}' not found")
+        if parent_status != "waiting_for_children":
+            raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' is '{parent_status}', expected 'waiting_for_children'")
+
+        children = self.children.get(parent_task_id, set())
+        if clean_child not in children:
+            raise ClaimTimeoutConflictError(f"Child task '{clean_child}' not in parent's children set")
+
+        latest_ver = self.latest_continuation.get(parent_task_id, 0)
+        if latest_ver != 1:
+            raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' latest continuation version is {latest_ver}, expected 1")
+        cont = self.continuations.get((parent_task_id, 1))
+        if (
+            not cont
+            or cont.parent_task_id != parent_task_id
+            or cont.continuation_version != latest_ver
+            or cont.stage != "incorporate_analysis_child"
+            or cont.child_task_id != clean_child
+        ):
+            raise ClaimTimeoutConflictError(f"Parent task '{parent_task_id}' continuation v1 does not match stage/child/version")
+
+        outcome = build_claim_timed_out_terminal_outcome(
+            task_id=clean_child,
+            claim_deadline=deadline,
+            completed_at=clean_now,
+        )
+        self.terminal_outcomes[clean_child] = outcome
+        self.statuses[clean_child] = "claim_timed_out"
+        self.child_markers[clean_child] = {
+            "child_task_id": clean_child,
+            "continuation_version": 1,
+            "outcome_id": outcome.outcome_id,
+            "parent_task_id": parent_task_id,
+            "status": "claim_timed_out",
+        }
+        self.statuses[parent_task_id] = "resumable"
+        hint = WakeUpHint(
+            hint_id=f"hint-{uuid4()}",
+            capability="research",
+            created_at=clean_now,
+            execution_kind="resumed_continuation",
+            task_id=parent_task_id,
+            expected_continuation_version=1,
+        )
+        self.hints.append(hint)
+        return (outcome, False)
+
+    async def transition_expired_claim(
+        self,
+        task_id: str,
+        now: str,
+    ) -> tuple[ClaimExpiryRecord, bool]:
+        clean_task = task_id.strip()
+        clean_now = normalize_canonical_utc_timestamp(now)
+        cur_status = self.statuses.get(clean_task)
+        if not cur_status:
+            raise ParentTaskNotFoundError(f"Task '{clean_task}' not found")
+
+        if cur_status == "recovery_required":
+            existing = self.claim_expiries.get(clean_task)
+            if existing is not None:
+                return (existing, True)
+            raise ClaimTimeoutConflictError(f"Task '{clean_task}' is recovery_required but missing expiry record")
+
+        if cur_status != "working":
+            raise ClaimTimeoutConflictError(f"Task '{clean_task}' is in '{cur_status}', expected 'working'")
+
+        if clean_task in self.terminal_outcomes or clean_task in self.canonical_results:
+            raise ClaimTimeoutConflictError(f"Task '{clean_task}' is already completed")
+
+        claim = self.claims.get(clean_task)
+        if not claim:
+            raise ClaimNotFoundError(f"No active claim on task '{clean_task}'")
+        if claim.state != "acknowledged":
+            raise ClaimTimeoutConflictError(f"Claim on task '{clean_task}' is in state '{claim.state}', expected 'acknowledged'")
+
+        if not claim.execution_expires_at:
+            raise ClaimTimeoutConflictError(f"Claim on task '{clean_task}' has no execution_expires_at")
+        if clean_now <= claim.execution_expires_at:
+            raise ClaimTimeoutConflictError(f"Claim execution lease {claim.execution_expires_at} has not expired at {clean_now}")
+
+        cur_fence = self.fences.get(clean_task, 0)
+        if cur_fence != claim.fencing_epoch:
+            raise FencingEpochRaceError(f"Fence mismatch: current {cur_fence} != claim {claim.fencing_epoch}")
+
+        if claim.execution_kind == "resumed_continuation":
+            if claim.prior_claimable_status != "resumable":
+                raise ClaimTimeoutConflictError(f"Corrupt prior_claimable_status '{claim.prior_claimable_status}' for resumed_continuation")
+        else:
+            if claim.prior_claimable_status != "pending":
+                raise ClaimTimeoutConflictError(f"Corrupt prior_claimable_status '{claim.prior_claimable_status}'")
+
+        expiry_record = ClaimExpiryRecord(
+            task_id=clean_task,
+            claim_id=claim.claim_id,
+            assignment_id=claim.assignment_id,
+            principal_id=claim.runtime_principal_id,
+            bound_agent_id=claim.bound_agent_id,
+            execution_kind=claim.execution_kind,
+            expired_fencing_epoch=claim.fencing_epoch,
+            acknowledged_at=claim.acknowledged_at or clean_now,
+            execution_expires_at=claim.execution_expires_at,
+            expired_at=clean_now,
+            prior_claimable_status=claim.prior_claimable_status,
+            continuation_version=claim.continuation_version,
+        )
+        del self.claims[clean_task]
+        self.claim_expiries[clean_task] = expiry_record
+        self.statuses[clean_task] = "recovery_required"
+        return (expiry_record, False)
+
+    async def resolve_expired_claim(
+        self,
+        command: RecoveryDecisionCommand,
+        operator_principal_id: str,
+        now: str,
+    ) -> tuple[RecoveryDecisionRecord, str]:
+        clean_task = command.task_id.strip()
+        clean_now = normalize_canonical_utc_timestamp(now)
+        key = (clean_task, command.recovery_decision_id.strip())
+
+        existing = self.recovery_decisions.get(key)
+        if existing is not None:
+            if existing.semantic_fingerprint == command.semantic_fingerprint():
+                return (existing, existing.restored_status)
+            raise RecoveryConflictError(f"Conflicting recovery decision '{command.recovery_decision_id}'")
+
+        cur_status = self.statuses.get(clean_task)
+        if not cur_status:
+            raise ParentTaskNotFoundError(f"Task '{clean_task}' not found")
+        if cur_status != "recovery_required":
+            raise RecoveryPreconditionFailedError(f"Task '{clean_task}' is in '{cur_status}', expected 'recovery_required'")
+
+        if clean_task in self.terminal_outcomes:
+            raise RecoveryConflictError(f"Task '{clean_task}' has already completed")
+        if clean_task in self.claims:
+            raise RecoveryConflictError(f"Task '{clean_task}' has an active claim")
+
+        expiry = self.claim_expiries.get(clean_task)
+        if not expiry:
+            raise RecoveryPreconditionFailedError(f"Task '{clean_task}' has no ClaimExpiryRecord")
+
+        if (
+            expiry.claim_id != command.expired_claim_id
+            or expiry.assignment_id != command.expired_assignment_id
+            or expiry.expired_fencing_epoch != command.expired_fencing_epoch
+        ):
+            raise RecoveryConflictError("Recovery decision does not match ClaimExpiryRecord")
+
+        if command.disposition != "restore_claimable":
+            raise RecoveryPreconditionFailedError(f"Unsupported recovery disposition '{command.disposition}'")
+
+        cur_fence = self.fences.get(clean_task, 0)
+        if cur_fence != command.expired_fencing_epoch:
+            raise FencingEpochRaceError(f"Fence mismatch: current {cur_fence} != expected {command.expired_fencing_epoch}")
+
+        restored_status = expiry.prior_claimable_status
+        if restored_status not in ("pending", "resumable"):
+            raise RecoveryPreconditionFailedError(f"Invalid prior_claimable_status '{restored_status}' in expiry record")
+
+        record = RecoveryDecisionRecord(
+            task_id=clean_task,
+            recovery_decision_id=command.recovery_decision_id.strip(),
+            operator_principal_id=operator_principal_id.strip(),
+            expired_claim_id=command.expired_claim_id,
+            expired_assignment_id=command.expired_assignment_id,
+            expired_fencing_epoch=command.expired_fencing_epoch,
+            disposition=command.disposition,
+            prior_status="recovery_required",
+            restored_status=restored_status,
+            resolved_at=clean_now,
+            semantic_fingerprint=command.semantic_fingerprint(),
+        )
+        self.recovery_decisions[key] = record
+        self.statuses[clean_task] = restored_status
+        return (record, restored_status)
+
+    async def get_claim_expiry(self, task_id: str) -> ClaimExpiryRecord | None:
+        return self.claim_expiries.get(task_id.strip())
+
+    async def get_recovery_decision(
+        self,
+        task_id: str,
+        recovery_decision_id: str,
+    ) -> RecoveryDecisionRecord | None:
+        return self.recovery_decisions.get((task_id.strip(), recovery_decision_id.strip()))
 
 
 class MockAtomicDispatcher(TaskDispatcher):
@@ -3212,3 +3557,203 @@ def test_consolidated_exception_class_identity():
     assert ports.WaveBudgetExceededError is api.WaveBudgetExceededError
     assert ports.GrantAlreadyConsumedError is api.GrantAlreadyConsumedError
     assert ports.ChildClaimDeadlineExpiredError is api.ChildClaimDeadlineExpiredError
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_materialize_claim_timeout_branches() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now_iso = "2026-11-22T12:00:01.000000Z"
+    deadline_iso = "2026-11-22T12:00:00.000000Z"
+    outcome = build_claim_timed_out_terminal_outcome(
+        task_id="child-1",
+        claim_deadline=deadline_iso,
+        completed_at=now_iso,
+    )
+    hint = WakeUpHint(
+        hint_id="hint-1",
+        capability="research",
+        created_at=now_iso,
+        execution_kind="resumed_continuation",
+        task_id="parent-1",
+        expected_continuation_version=1,
+    )
+
+    gateway.get_lineage = AsyncMock(
+        return_value=TaskLineage(task_id="child-1", root_task_id="parent-1", parent_task_id="parent-1")
+    )
+    gateway._client.get = AsyncMock(return_value=deadline_iso)
+
+    # 1. CHILD_NOT_PENDING
+    gateway._client.eval = AsyncMock(return_value=["CHILD_NOT_PENDING", "completed"])
+    with pytest.raises(TaskNotClaimableError, match="status: got 'completed'"):
+        await gateway.materialize_claim_timeout("child-1", now_iso)
+
+    # 2. DEADLINE_NOT_EXPIRED
+    gateway._client.eval = AsyncMock(return_value=["DEADLINE_NOT_EXPIRED", deadline_iso])
+    with pytest.raises(TaskNotClaimableError, match="has not expired"):
+        await gateway.materialize_claim_timeout("child-1", now_iso)
+
+    # 3. PARENT_NOT_FOUND
+    gateway._client.eval = AsyncMock(return_value=["PARENT_NOT_FOUND"])
+    with pytest.raises(TaskNotClaimableError, match="Required record not found"):
+        await gateway.materialize_claim_timeout("child-1", now_iso)
+
+    # 4. ACTIVE_CLAIM_EXISTS
+    gateway._client.eval = AsyncMock(return_value=["ACTIVE_CLAIM_EXISTS"])
+    with pytest.raises(TaskAlreadyClaimedError, match="(?i)active claim exists"):
+        await gateway.materialize_claim_timeout("child-1", now_iso)
+
+    # 5. OK
+    gateway._client.eval = AsyncMock(return_value=["OK", outcome.to_json(), hint.to_json()])
+    res, is_rep = await gateway.materialize_claim_timeout("child-1", now_iso)
+    assert not is_rep
+    assert res.task_id == "child-1"
+    assert res.terminal_status == "claim_timed_out"
+
+    # 6. IDEMPOTENT (no hint emitted)
+    gateway._client.eval = AsyncMock(return_value=["IDEMPOTENT", outcome.to_json(), ""])
+    res2, is_rep2 = await gateway.materialize_claim_timeout("child-1", now_iso)
+    assert is_rep2
+    assert res2.outcome_id == outcome.outcome_id
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_transition_expired_claim_branches() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now_iso = "2026-11-22T12:00:01.000000Z"
+    claim = ActiveClaim(
+        task_id="task-1",
+        root_task_id="task-1",
+        assignment_id="asgn-1",
+        claim_id="claim-1",
+        turn_id="turn-1",
+        fencing_epoch=2,
+        runtime_principal_id="p-1",
+        bound_agent_id="a-1",
+        assigned_capability="research",
+        execution_kind="initial",
+        prior_claimable_status="pending",
+        proof_digest="digest",
+        request_id="req-1",
+        delivery_expires_at="2026-11-22T12:00:00.000000Z",
+        claimed_at="2026-11-22T11:00:00.000000Z",
+        state="acknowledged",
+        acknowledged_at="2026-11-22T11:00:00.000000Z",
+        execution_expires_at="2026-11-22T12:00:00.000000Z",
+    )
+    rec = ClaimExpiryRecord(
+        task_id="task-1",
+        claim_id="claim-1",
+        assignment_id="asgn-1",
+        principal_id="p-1",
+        bound_agent_id="a-1",
+        execution_kind="initial",
+        expired_fencing_epoch=2,
+        acknowledged_at="2026-11-22T11:00:00.000000Z",
+        execution_expires_at="2026-11-22T12:00:00.000000Z",
+        expired_at=now_iso,
+        prior_claimable_status="pending",
+    )
+
+    gateway.get_active_claim = AsyncMock(return_value=claim)
+
+    # 1. NOT_WORKING
+    gateway._client.eval = AsyncMock(return_value=["NOT_WORKING", "pending"])
+    with pytest.raises(TaskNotClaimableError, match="not in 'working' status"):
+        await gateway.transition_expired_claim("task-1", now_iso)
+
+    # 2. EXECUTION_NOT_EXPIRED
+    gateway._client.eval = AsyncMock(return_value=["EXECUTION_NOT_EXPIRED", "2099-01-01T00:00:00Z"])
+    with pytest.raises(TaskNotClaimableError, match="has not expired"):
+        await gateway.transition_expired_claim("task-1", now_iso)
+
+    # 3. OK
+    gateway._client.eval = AsyncMock(return_value=["OK", rec.to_json()])
+    res, is_rep = await gateway.transition_expired_claim("task-1", now_iso)
+    assert not is_rep
+    assert res.task_id == "task-1"
+    assert res.claim_id == "claim-1"
+
+    # 4. IDEMPOTENT via Lua
+    gateway._client.eval = AsyncMock(return_value=["IDEMPOTENT", rec.to_json()])
+    res2, is_rep2 = await gateway.transition_expired_claim("task-1", now_iso)
+    assert is_rep2
+    assert res2.claim_id == "claim-1"
+
+    # 5. IDEMPOTENT via pre-check (active claim absent, expiry record and recovery_required status present)
+    gateway.get_active_claim = AsyncMock(return_value=None)
+    gateway.get_claim_expiry = AsyncMock(return_value=rec)
+    gateway.get_status = AsyncMock(return_value="recovery_required")
+    res3, is_rep3 = await gateway.transition_expired_claim("task-1", now_iso)
+    assert is_rep3
+    assert res3.claim_id == "claim-1"
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_resolve_expired_claim_branches() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    now_iso = "2026-11-22T12:00:01.000000Z"
+    cmd = RecoveryDecisionCommand(
+        recovery_decision_id="rec-1",
+        task_id="task-1",
+        expired_claim_id="claim-1",
+        expired_assignment_id="asgn-1",
+        expired_fencing_epoch=2,
+        disposition="restore_claimable",
+    )
+    rec = RecoveryDecisionRecord(
+        recovery_decision_id="rec-1",
+        task_id="task-1",
+        expired_claim_id="claim-1",
+        expired_assignment_id="asgn-1",
+        expired_fencing_epoch=2,
+        disposition="restore_claimable",
+        semantic_fingerprint=cmd.semantic_fingerprint(),
+        prior_status="recovery_required",
+        restored_status="pending",
+        operator_principal_id="p-operator",
+        resolved_at=now_iso,
+    )
+    expiry = ClaimExpiryRecord(
+        task_id="task-1",
+        claim_id="claim-1",
+        assignment_id="asgn-1",
+        principal_id="p-1",
+        bound_agent_id="a-1",
+        execution_kind="initial",
+        expired_fencing_epoch=2,
+        acknowledged_at=now_iso,
+        execution_expires_at=now_iso,
+        expired_at=now_iso,
+        prior_claimable_status="pending",
+    )
+
+    gateway.get_claim_expiry = AsyncMock(return_value=expiry)
+
+    # 1. NOT_RECOVERY_REQUIRED
+    gateway._client.eval = AsyncMock(return_value=["NOT_RECOVERY_REQUIRED", "completed"])
+    with pytest.raises(RecoveryPreconditionFailedError, match="not in 'recovery_required' status"):
+        await gateway.resolve_expired_claim(cmd, "p-operator", now_iso)
+
+    # 2. DECISION_CONFLICT
+    gateway._client.eval = AsyncMock(return_value=["DECISION_CONFLICT"])
+    with pytest.raises(RecoveryConflictError, match="conflicts with existing decision payload"):
+        await gateway.resolve_expired_claim(cmd, "p-operator", now_iso)
+
+    # 3. FENCE_MISMATCH
+    gateway._client.eval = AsyncMock(return_value=["FENCE_MISMATCH"])
+    with pytest.raises(RecoveryPreconditionFailedError, match="Fencing epoch mismatch"):
+        await gateway.resolve_expired_claim(cmd, "p-operator", now_iso)
+
+    # 4. OK
+    gateway._client.eval = AsyncMock(return_value=["OK", rec.to_json()])
+    resolved_rec, is_idempotent = await gateway.resolve_expired_claim(cmd, "p-operator", now_iso)
+    assert resolved_rec.recovery_decision_id == "rec-1"
+    assert not is_idempotent
+    assert resolved_rec.restored_status == "pending"
+
+    # 5. IDEMPOTENT
+    gateway._client.eval = AsyncMock(return_value=["IDEMPOTENT", rec.to_json()])
+    replayed_rec, is_idempotent2 = await gateway.resolve_expired_claim(cmd, "p-operator", now_iso)
+    assert replayed_rec.recovery_decision_id == "rec-1"
+    assert is_idempotent2

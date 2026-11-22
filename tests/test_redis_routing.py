@@ -252,9 +252,9 @@ async def test_redis_gateway_get_result_completed() -> None:
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_pending() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    # Outcome, then legacy result, then status
+    # Outcome, then legacy result, then status, then claim_deadline
     gateway._client.get = AsyncMock(
-        side_effect=[None, None, json.dumps({"task_id": "task-res-2", "status": "pending"})]
+        side_effect=[None, None, json.dumps({"task_id": "task-res-2", "status": "pending"}), None]
     )
 
     res = await gateway.get_result("task-res-2")

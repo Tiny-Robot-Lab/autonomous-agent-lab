@@ -11,7 +11,15 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-from agent_contracts import CompletionCommand
+from agent_contracts import (
+    CompletionCommand,
+    ResumedContinuationContext,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
+    TaskResult,
+    TerminalOutcome,
+)
 
 
 class CompletionSubmissionError(RuntimeError):
@@ -38,6 +46,7 @@ class OrchestratorClient:
         base_url: str,
         runtime_token: str,
         timeout_seconds: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         clean_base = str(base_url).strip().rstrip("/")
         if not clean_base:
@@ -50,6 +59,8 @@ class OrchestratorClient:
         self._base_url = clean_base
         self._token = clean_token
         self._timeout = float(timeout_seconds)
+        self._transport = transport
+        self._cached_contexts: dict[str, ResumedContinuationContext] = {}
 
     def _headers(self, proof: str | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._token}"}
@@ -75,7 +86,7 @@ class OrchestratorClient:
         if expected_continuation_version is not None:
             payload["expected_continuation_version"] = expected_continuation_version
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
                 response = await client.post(
                     f"{self._base_url}/api/tasks/claim",
                     json=payload,
@@ -96,7 +107,7 @@ class OrchestratorClient:
     ) -> dict[str, Any]:
         """Acknowledge assignment delivery; returns the acknowledgement body."""
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
                 response = await client.post(
                     f"{self._base_url}/api/assignments/{assignment_id}/acknowledge",
                     json={"task_id": task_id, "assignment_proof": assignment_proof},
@@ -126,7 +137,7 @@ class OrchestratorClient:
         if not clean_proof:
             raise ValueError("assignment_proof must be a non-empty string")
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
                 response = await client.post(
                     f"{self._base_url}/api/tasks/{task_id}/completion",
                     json=command.to_dict(),
@@ -137,3 +148,71 @@ class OrchestratorClient:
         if response.status_code != 200:
             raise CompletionSubmissionError(task_id, response.status_code, "completion request rejected")
         return response.json()
+
+    async def get_resumed_continuation_context(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+    ) -> ResumedContinuationContext:
+        """Fetch and cache governed continuation context for a resumed parent turn."""
+        clean_task = str(task_id).strip()
+        clean_assignment = str(assignment_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+                response = await client.get(
+                    f"{self._base_url}/api/tasks/{clean_task}/continuation-context",
+                    params={"assignment_id": clean_assignment},
+                    headers=self._headers(clean_proof),
+                )
+        except httpx.HTTPError as exc:
+            raise CompletionSubmissionError(clean_task, None, "continuation context transport failed") from exc
+        if response.status_code != 200:
+            raise CompletionSubmissionError(clean_task, response.status_code, "continuation context request rejected")
+        ctx = ResumedContinuationContext.from_dict(response.json())
+        self._cached_contexts[clean_task] = ctx
+        return ctx
+
+    async def get_task_input(self, task_id: str, version: int = 1) -> TaskInput | None:
+        clean_task = str(task_id).strip()
+        ctx = self._cached_contexts.get(clean_task)
+        if ctx is not None and ctx.parent_task_input.input_version == version:
+            return ctx.parent_task_input
+        return None
+
+    async def get_continuation(self, task_id: str, version: int = 1) -> TaskContinuation | None:
+        clean_task = str(task_id).strip()
+        ctx = self._cached_contexts.get(clean_task)
+        if ctx is not None and ctx.continuation.continuation_version == version:
+            return ctx.continuation
+        return None
+
+    async def get_stage_artifact(
+        self, producing_task_id: str, artifact_id: str, artifact_version: int = 1
+    ) -> StageArtifact | None:
+        clean_prod = str(producing_task_id).strip()
+        clean_art = str(artifact_id).strip()
+        for ctx in self._cached_contexts.values():
+            art = ctx.stage_artifact
+            if (
+                art.producing_task_id == clean_prod
+                and art.artifact_id == clean_art
+                and art.artifact_version == artifact_version
+            ):
+                return art
+        return None
+
+    async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None:
+        clean_task = str(task_id).strip()
+        for ctx in self._cached_contexts.values():
+            if ctx.child_outcome.task_id == clean_task:
+                return ctx.child_outcome
+        return None
+
+    async def get_canonical_result(self, task_id: str) -> TaskResult | None:
+        clean_task = str(task_id).strip()
+        for ctx in self._cached_contexts.values():
+            if ctx.child_result is not None and ctx.child_result.task_id == clean_task:
+                return ctx.child_result
+        return None
