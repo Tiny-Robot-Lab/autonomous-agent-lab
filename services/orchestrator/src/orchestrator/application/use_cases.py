@@ -7,14 +7,23 @@ from uuid import uuid4
 from agent_contracts import (
     ActiveClaim,
     AgentEvent,
+    ArtifactReference,
+    AssignmentYieldRecord,
     ClaimTaskResponse,
     DelegationGrant,
+    DelegationProposalRecord,
+    DelegationProposalRequest,
+    DelegationProposalResponse,
     RoutingDecision,
     RoutingProvenance,
     StageArtifact,
     TaskAssignment,
+    TaskContinuation,
+    TaskInput,
     TaskInputReference,
     TaskRequested,
+    WakeUpHint,
+    compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
 )
 
@@ -55,6 +64,7 @@ from .ports import (
     CapabilityRouter,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    DelegationReplayAuthorizationError,
     EventPublisher,
     InvalidClaimProofError,
     RoutingAdvisor,
@@ -918,3 +928,228 @@ class StageArtifactUseCase:
             expected_fencing_epoch=claim.fencing_epoch,
         )
         return artifact
+
+
+class AcceptDelegationProposal:
+    """Authenticated Research -> Analysis delegation acceptance use case.
+
+    Governed by ADR-0006 and ADR-0007:
+    - Verifies active Research turn, assignment, and detached proof;
+    - Strictly scoped to Research -> Analysis delegation;
+    - Computes proposal fingerprint for idempotent replay comparison;
+    - Invokes AuthoritativeTaskStore.accept_delegation_proposal atomically;
+    - Commits child task in 'pending' status with claim deadline;
+    - Emits initial non-secret Analysis wake-up hint;
+    - Retires active parent claim with durable yield evidence;
+    - Supports idempotent replay without duplicate hints or mutations.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+        child_claim_deadline_seconds: float = 120.0,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("AcceptDelegationProposal requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._child_claim_deadline_seconds = float(child_claim_deadline_seconds)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        parent_task_id: str,
+        proposal_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        child_intent: str,
+        artifact_reference: ArtifactReference,
+        target_capability: str = "analysis",
+        parent_input_version: int = 1,
+        control_fields: Mapping[str, Any] | None = None,
+    ) -> DelegationProposalResponse:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        if not principal.has_capability("research"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks capability 'research' required to propose delegation"
+            )
+
+        clean_parent = str(parent_task_id).strip()
+        clean_proposal_id = str(proposal_id).strip()
+        clean_assign_id = str(assignment_id).strip()
+        clean_target_cap = str(target_capability).strip()
+        clean_proof = str(assignment_proof).strip()
+
+        if not clean_parent or not clean_proposal_id or not clean_assign_id:
+            raise ValueError("parent_task_id, proposal_id, and assignment_id must be non-empty strings")
+        if not clean_proof:
+            raise ValueError("assignment_proof must be a non-empty string")
+
+        if clean_target_cap != "analysis":
+            raise ValueError(
+                f"Unsupported target_capability '{clean_target_cap}'. Strictly 'analysis' is supported."
+            )
+
+        # Validate caller proposal fields via contract
+        proposal_req = DelegationProposalRequest(
+            proposal_id=clean_proposal_id,
+            child_intent=child_intent,
+            artifact_reference=artifact_reference,
+            target_capability=clean_target_cap,
+            parent_input_version=parent_input_version,
+            control_fields=control_fields or {},
+        )
+
+        fp = compute_proposal_fingerprint(
+            parent_task_id=clean_parent,
+            proposal_id=clean_proposal_id,
+            assignment_id=clean_assign_id,
+            target_capability=clean_target_cap,
+            child_intent=proposal_req.child_intent,
+            artifact_reference=proposal_req.artifact_reference,
+            parent_input_version=proposal_req.parent_input_version,
+            control_fields=proposal_req.control_fields,
+        )
+
+        claim = await self._task_store.get_active_claim(clean_parent)
+        now_dt = self._clock()
+        now_iso = normalize_canonical_utc_timestamp(now_dt)
+
+        if claim is not None:
+            # Active claim present: first acceptance (or active replay)
+            if claim.assignment_id != clean_assign_id:
+                raise ClaimNotFoundError(
+                    f"Active claim for assignment '{clean_assign_id}' on task '{clean_parent}' not found"
+                )
+            if claim.runtime_principal_id != principal.principal_id:
+                raise ClaimNotFoundError(
+                    f"Assignment '{clean_assign_id}' is not owned by principal '{principal.principal_id}'"
+                )
+            if claim.bound_agent_id != principal.bound_agent_id:
+                raise ClaimNotFoundError(
+                    f"Assignment '{clean_assign_id}' is bound to agent '{claim.bound_agent_id}', not '{principal.bound_agent_id}'"
+                )
+            if claim.assigned_capability != "research":
+                raise CapabilityMismatchError(
+                    f"Principal '{principal.principal_id}' lacks capability '{claim.assigned_capability}'"
+                )
+            if claim.state != "acknowledged":
+                raise TaskNotClaimableError("Assignment must be acknowledged before proposing delegation")
+
+            cur_epoch = await self._task_store.get_fencing_epoch(clean_parent)
+            if claim.fencing_epoch != cur_epoch:
+                raise TaskAlreadyClaimedError(
+                    f"Fencing epoch mismatch for assignment '{clean_assign_id}': claim={claim.fencing_epoch}, current={cur_epoch}"
+                )
+
+            if not verify_assignment_proof(self._verifier_key, clean_proof, claim.proof_digest):
+                raise InvalidClaimProofError("Assignment proof verification failed")
+
+            if not claim.delegation_grant_id:
+                raise TaskNotClaimableError("Active assignment has no delegation grant")
+
+            child_task_id = f"task-analysis-{uuid4()}"
+            delegation_decision_id = f"dec-{uuid4()}"
+            deadline_dt = now_dt + timedelta(seconds=self._child_claim_deadline_seconds)
+            deadline_iso = normalize_canonical_utc_timestamp(deadline_dt)
+
+            candidate_proposal = DelegationProposalRecord(
+                parent_task_id=clean_parent,
+                proposal_id=clean_proposal_id,
+                child_task_id=child_task_id,
+                delegation_decision_id=delegation_decision_id,
+                assignment_id=clean_assign_id,
+                runtime_principal_id=principal.principal_id,
+                bound_agent_id=principal.bound_agent_id,
+                proof_digest=claim.proof_digest,
+                proposal_fingerprint=fp,
+                delegation_grant_id=claim.delegation_grant_id,
+                child_claim_deadline=deadline_iso,
+                accepted_at=now_iso,
+                target_capability="analysis",
+                continuation_version=1,
+            )
+            child_input = TaskInput(
+                task_id=child_task_id,
+                prompt=proposal_req.child_intent,
+                created_at=now_iso,
+                input_version=1,
+                artifact_references=(proposal_req.artifact_reference,),
+            )
+            continuation = TaskContinuation(
+                parent_task_id=clean_parent,
+                child_task_id=child_task_id,
+                created_at=now_iso,
+                updated_at=now_iso,
+                input_version=proposal_req.parent_input_version,
+                continuation_capability="research",
+                stage="incorporate_analysis_child",
+                control_fields=proposal_req.control_fields,
+                artifact_references=(proposal_req.artifact_reference,),
+                continuation_version=1,
+            )
+            yield_rec = AssignmentYieldRecord(
+                assignment_id=clean_assign_id,
+                parent_task_id=clean_parent,
+                principal_id=principal.principal_id,
+                proposal_id=clean_proposal_id,
+                child_task_id=child_task_id,
+                delegation_decision_id=delegation_decision_id,
+                continuation_version=1,
+                yielded_at=now_iso,
+            )
+            wake_up_hint = WakeUpHint(
+                hint_id=f"hint-{uuid4()}",
+                capability="analysis",
+                created_at=now_iso,
+                execution_kind="delegated_child",
+                task_id=child_task_id,
+            )
+
+            accepted_record, _is_replay = await self._task_store.accept_delegation_proposal(
+                parent_task_id=clean_parent,
+                proposal=candidate_proposal,
+                child_task_input=child_input,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hint=wake_up_hint,
+                expected_fencing_epoch=claim.fencing_epoch,
+                now=now_iso,
+            )
+        else:
+            # Active claim retired: read-only replay check
+            record = await self._task_store.get_delegation_proposal(clean_parent, clean_proposal_id)
+            if record is None:
+                raise DelegationReplayAuthorizationError("Delegation replay authorization failed")
+
+            # Strict replay invariant verification against authoritative accepted record
+            if (
+                record.parent_task_id != clean_parent
+                or record.proposal_id != clean_proposal_id
+                or record.assignment_id != clean_assign_id
+                or record.runtime_principal_id != principal.principal_id
+                or record.bound_agent_id != principal.bound_agent_id
+                or record.proposal_fingerprint != fp
+                or not verify_assignment_proof(self._verifier_key, clean_proof, record.proof_digest)
+            ):
+                raise DelegationReplayAuthorizationError("Delegation replay authorization failed")
+
+            accepted_record = record
+
+        return DelegationProposalResponse(
+            parent_task_id=accepted_record.parent_task_id,
+            proposal_id=accepted_record.proposal_id,
+            child_task_id=accepted_record.child_task_id,
+            delegation_decision_id=accepted_record.delegation_decision_id,
+            child_claim_deadline=accepted_record.child_claim_deadline,
+            accepted_at=accepted_record.accepted_at,
+            target_capability=accepted_record.target_capability,
+            continuation_version=accepted_record.continuation_version,
+            status="accepted",
+        )

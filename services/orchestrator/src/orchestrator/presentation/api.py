@@ -2,7 +2,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from agent_contracts import __version__
+from agent_contracts import (
+    FORBIDDEN_AUTHORITY_FIELDS,
+    ArtifactReference,
+    __version__,
+)
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,9 +17,13 @@ from orchestrator.application.ports import (
     CandidateFinder,
     CapabilityMismatchError,
     CapabilityRouter,
+    ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    DelegationConflictError,
+    DelegationReplayAuthorizationError,
     EventPublisher,
+    GrantAlreadyConsumedError,
     InvalidClaimProofError,
     ResultReader,
     RoutingRecorder,
@@ -25,6 +33,7 @@ from orchestrator.application.ports import (
     TaskNotClaimableError,
     TaskQueue,
     TelemetryStorageError,
+    WaveBudgetExceededError,
 )
 from orchestrator.application.queries import (
     FindCandidatesByCapability,
@@ -36,6 +45,7 @@ from orchestrator.application.queries import (
     GetTaskResult,
 )
 from orchestrator.application.use_cases import (
+    AcceptDelegationProposal,
     AcknowledgeAssignment,
     ClaimTask,
     StageArtifactUseCase,
@@ -53,9 +63,12 @@ from orchestrator.domain.principal import (
 )
 from orchestrator.domain.selection import CandidateSelectionPolicy
 from orchestrator.domain.task import (
+    ConflictingChildTaskRegistrationError,
+    ConflictingContinuationError,
     ConflictingStageArtifactError,
     CorruptAuthoritativeRecordError,
     NonContiguousVersionError,
+    ParentTaskNotFoundError,
 )
 from orchestrator.infrastructure.redis_adapter import RedisGateway
 
@@ -191,6 +204,18 @@ class StageArtifactInput(BaseModel):
     payload_schema_version: int = 1
 
 
+class DelegationProposalInput(BaseModel):
+    proposal_id: str = Field(min_length=1)
+    assignment_id: str = Field(min_length=1)
+    child_intent: str = Field(min_length=1, max_length=2000)
+    artifact_reference: dict[str, Any]
+    target_capability: str = "analysis"
+    parent_input_version: int = 1
+    control_fields: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
 def get_current_runtime_principal(request: Request) -> RuntimePrincipal:
     auth_header = request.headers.get("Authorization", "").strip()
     if not auth_header.startswith("Bearer "):
@@ -245,13 +270,13 @@ async def claim_task_endpoint(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except CapabilityMismatchError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except (TaskAlreadyClaimedError, ClaimDeliveryLeaseExpiredError) as exc:
+    except (TaskAlreadyClaimedError, ClaimDeliveryLeaseExpiredError, ChildClaimDeadlineExpiredError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TaskNotClaimableError as exc:
         if "not found" in str(exc).lower():
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CorruptAuthoritativeRecordError as exc:
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
@@ -286,7 +311,7 @@ async def acknowledge_assignment_endpoint(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ClaimDeliveryLeaseExpiredError, TaskAlreadyClaimedError, TaskNotClaimableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CorruptAuthoritativeRecordError as exc:
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
@@ -322,7 +347,74 @@ async def stage_artifact_endpoint(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (TaskNotClaimableError, TaskAlreadyClaimedError, ConflictingStageArtifactError, NonContiguousVersionError, ClaimDeliveryLeaseExpiredError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
+
+
+async def accept_delegation_endpoint(
+    task_id: str,
+    value: DelegationProposalInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    delegation_uc: AcceptDelegationProposal | None = request.app.state.accept_delegation
+    if delegation_uc is None:
+        raise HTTPException(status_code=503, detail="Delegation service is not enabled")
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(status_code=401, detail="Missing assignment proof in X-Assignment-Proof header")
+
+    try:
+        extra = getattr(value, "__pydantic_extra__", None)
+        if extra:
+            if "assignment_proof" in extra:
+                raise ValueError("assignment_proof must not be provided in request body; use X-Assignment-Proof header")
+            forbidden = set(extra.keys()) & FORBIDDEN_AUTHORITY_FIELDS
+            if forbidden:
+                raise ValueError(f"Forbidden authority fields supplied: {sorted(forbidden)}")
+            raise ValueError(f"Unexpected fields supplied: {sorted(extra.keys())}")
+
+        raw_ref = value.artifact_reference
+        if not isinstance(raw_ref, dict):
+            raise TypeError("artifact_reference must be an object")
+        art_ref = ArtifactReference.from_dict(raw_ref)
+
+        resp = await delegation_uc.execute(
+            principal=principal,
+            parent_task_id=task_id,
+            proposal_id=value.proposal_id,
+            assignment_id=value.assignment_id,
+            assignment_proof=header_proof,
+            child_intent=value.child_intent,
+            artifact_reference=art_ref,
+            target_capability=value.target_capability,
+            parent_input_version=value.parent_input_version,
+            control_fields=value.control_fields,
+        )
+        return resp.to_dict()
+    except DelegationReplayAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Delegation replay authorization failed") from exc
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ClaimNotFoundError, ParentTaskNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        TaskAlreadyClaimedError,
+        TaskNotClaimableError,
+        ClaimDeliveryLeaseExpiredError,
+        DelegationConflictError,
+        WaveBudgetExceededError,
+        GrantAlreadyConsumedError,
+        ConflictingContinuationError,
+        ConflictingChildTaskRegistrationError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CorruptAuthoritativeRecordError as exc:
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
@@ -423,6 +515,7 @@ def create_app(
     claim_task: ClaimTask | None = None
     acknowledge_assignment: AcknowledgeAssignment | None = None
     stage_artifact: StageArtifactUseCase | None = None
+    accept_delegation: AcceptDelegationProposal | None = None
     if resolved_settings.assignment_proof_pepper.strip():
         claim_task = ClaimTask(
             task_store=resolved_task_store,
@@ -436,6 +529,11 @@ def create_app(
         stage_artifact = StageArtifactUseCase(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
+        accept_delegation = AcceptDelegationProposal(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
         )
 
     @asynccontextmanager
@@ -458,6 +556,7 @@ def create_app(
     app.state.claim_task = claim_task
     app.state.acknowledge_assignment = acknowledge_assignment
     app.state.stage_artifact = stage_artifact
+    app.state.accept_delegation = accept_delegation
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -493,6 +592,11 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/artifacts",
         stage_artifact_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/delegations",
+        accept_delegation_endpoint,
         methods=["POST"],
     )
 

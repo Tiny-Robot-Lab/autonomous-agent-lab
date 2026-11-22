@@ -304,3 +304,35 @@ execution success or failure; execution telemetry is outside this boundary.
 authorization or audit mechanism. Consumers must compose the coordinator with
 an audit sink. Invocation authorization is not filesystem or network
 sandboxing. Discovery remains process-local as described above.
+
+## 16. Atomic Delegation Acceptance and Pending Child Claimability (Issue #221)
+
+Issue #221 establishes the atomic Research-to-Analysis delegation acceptance boundary,
+governed by ADR 0006 and ADR 0007.
+
+* **API Endpoint**: `POST /api/tasks/{task_id}/delegations` exposes delegation acceptance
+  for active Research parent tasks.
+* **Authentication and Proof Boundary**: The endpoint requires Bearer token authentication
+  mapped to an active runtime principal authorized for capability `research`. The caller
+  must supply the cryptographic assignment proof exclusively via the `X-Assignment-Proof`
+  HTTP header. Supplying assignment proof in the JSON request body is strictly rejected
+  to prevent secret persistence and leakage.
+* **Analysis-Only Target Capability**: The acceptance boundary enforces that `target_capability`
+  is strictly `"analysis"`. Arbitrary or general capability targets are rejected.
+* **Child Claim Deadline**: The child task claim window is governed by `CHILD_CLAIM_DEADLINE_SECONDS`
+  (default 120 seconds; configuration range 10 through 3600 seconds). A claim request is permitted
+  when `now <= child_claim_deadline` and rejected with HTTP 409 Conflict when `now > child_claim_deadline`.
+* **First Acceptance vs. Idempotent Replay**: First acceptance atomically transitions the parent
+  task status to `waiting_for_children`, writes the child task input and status as `pending`,
+  increments continuation history, retires the active parent claim, records the delegation
+  decision and proposal, and writes a non-secret wake-up hint to `agent.hints.analysis`.
+  Subsequent identical requests (matched by `proposal_id`, `assignment_id`, `bound_agent_id`,
+  and proposal fingerprint) are treated as idempotent replays; they return the accepted proposal
+  without mutating task status or emitting duplicate wake-up hints.
+* **Zero Child Authority Grant**: The pending child task receives no delegation grant upon
+  creation; sub-delegation by delegated children is explicitly disallowed in this phase.
+* **Future Phases**: Resumption upon child task completion and fenced continuation remain
+  deferred to Issues #222 and #223.
+* **Redis Least-Privilege ACL**: The development and Compose runtime currently operates an
+  unauthenticated Redis instance; fine-grained least-privilege ACL policies are tracked
+  for subsequent operational hardening.

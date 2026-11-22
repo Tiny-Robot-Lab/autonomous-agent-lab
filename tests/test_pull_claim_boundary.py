@@ -5,11 +5,17 @@ from typing import Any
 
 import httpx
 import pytest
-from agent_contracts import TaskContinuation, TaskRequested
+from agent_contracts import (
+    RequiredCapabilityRecord,
+    TaskContinuation,
+    TaskInput,
+    TaskRequested,
+)
 from orchestrator.config import Settings
 from orchestrator.domain.principal import (
     compute_token_digest,
 )
+from orchestrator.domain.task import TaskLineage
 from orchestrator.presentation.api import create_app
 
 from tests.test_application import FakeStateReader, FakeTaskQueue
@@ -20,6 +26,7 @@ PROOF_PEPPER = "test_assignment_proof_pepper_456"
 RESEARCH_TOKEN = "secret-token-research-1"
 WORKER_TOKEN = "secret-token-worker-1"
 ANALYSIS_TOKEN = "secret-token-analysis-1"
+ANALYSIS_MULTI_TOKEN = "secret-token-analysis-multi"
 
 PRINCIPALS_CONFIG: dict[str, dict[str, Any]] = {
     "principal-research-1": {
@@ -41,6 +48,13 @@ PRINCIPALS_CONFIG: dict[str, dict[str, Any]] = {
         "bound_agent_id": "analysis-agent-1",
         "authorized_capabilities": ["analysis"],
         "token_digest": compute_token_digest(ANALYSIS_TOKEN, PEPPER),
+        "active": True,
+    },
+    "principal-analysis-multi": {
+        "principal_id": "principal-analysis-multi",
+        "bound_agent_id": "analysis-agent-multi",
+        "authorized_capabilities": ["analysis", "research"],
+        "token_digest": compute_token_digest(ANALYSIS_MULTI_TOKEN, PEPPER),
         "active": True,
     },
     "principal-inactive-1": {
@@ -868,6 +882,113 @@ async def test_execution_kind_lifecycle_compatibility_via_api(test_settings: Set
         )
         assert res_child_on_root.status_code == 409
         assert "not a delegated child" in res_child_on_root.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_delegated_child_claim_receives_no_delegation_grant(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+
+    now = datetime.now(UTC).isoformat()
+    root_task = TaskRequested.create("Root Research Task")
+    parent_id = root_task.task_id
+    child_id = "child-analysis-1"
+
+    # 1. Setup root research task and delegated child task
+    await store.register_root_task(root_task, required_capability="research")
+    await store.update_status(parent_id, "waiting_for_children")
+
+    child_lineage = TaskLineage(
+        task_id=child_id,
+        root_task_id=parent_id,
+        parent_task_id=parent_id,
+    )
+    store.lineages[child_id] = child_lineage
+    store.statuses[child_id] = "pending"
+    store.required_capabilities[child_id] = RequiredCapabilityRecord(
+        task_id=child_id,
+        required_capability="analysis",
+        created_at=now,
+    )
+    store.inputs[(child_id, 1)] = TaskInput(
+        task_id=child_id,
+        prompt="Analyze data",
+        created_at=now,
+        input_version=1,
+    )
+    store.children.setdefault(parent_id, set()).add(child_id)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # 2. General principal attempts to claim Analysis child -> 403 Forbidden
+        res_worker = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": child_id,
+                "request_id": "req-worker-child",
+                "capability": "general",
+                "execution_kind": "delegated_child",
+            },
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+        )
+        assert res_worker.status_code == 403
+        assert "requires capability 'analysis'" in res_worker.json()["detail"]
+
+        # 3. Research principal attempts to claim Analysis child -> 403 Forbidden
+        res_research = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": child_id,
+                "request_id": "req-research-child",
+                "capability": "research",
+                "execution_kind": "delegated_child",
+            },
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}"},
+        )
+        assert res_research.status_code == 403
+        assert "requires capability 'analysis'" in res_research.json()["detail"]
+
+        # 4. Analysis principal advertising extra capability claiming child with unrelated capability -> 403
+        res_multi_wrong = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": child_id,
+                "request_id": "req-multi-wrong",
+                "capability": "research",
+                "execution_kind": "delegated_child",
+            },
+            headers={"Authorization": f"Bearer {ANALYSIS_MULTI_TOKEN}"},
+        )
+        assert res_multi_wrong.status_code == 403
+        assert "requires capability 'analysis'" in res_multi_wrong.json()["detail"]
+
+        # 5. Analysis principal claiming child with capability 'analysis' succeeds
+        res_ok = await client.post(
+            "/api/tasks/claim",
+            json={
+                "task_id": child_id,
+                "request_id": "req-analysis-ok",
+                "capability": "analysis",
+                "execution_kind": "delegated_child",
+            },
+            headers={"Authorization": f"Bearer {ANALYSIS_MULTI_TOKEN}"},
+        )
+        assert res_ok.status_code == 200
+        data = res_ok.json()
+        assert "assignment" in data
+        assert "assignment_proof" in data
+        assignment = data["assignment"]
+
+        # Strict checks on resulting TaskAssignment
+        assert assignment["execution_kind"] == "delegated_child"
+        assert assignment["assigned_capability"] == "analysis"
+        assert assignment.get("delegation_grant_id") is None  # Analysis child receives NO delegation grant
+
+        # Verify active claim in authoritative store
+        active_claim = await store.get_active_claim(child_id)
+        assert active_claim is not None
+        assert active_claim.assigned_capability == "analysis"
+        assert active_claim.execution_kind == "delegated_child"
+        assert active_claim.delegation_grant_id is None
 
 
 @pytest.mark.anyio

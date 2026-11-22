@@ -1623,6 +1623,7 @@
       const type = (agentType || '').toLowerCase();
       const id = (agentId || '').toLowerCase();
       if (type === 'research-agent' || id.includes('research')) return 'Research Agent';
+      if (type === 'analysis-agent' || id.includes('analysis')) return 'Analysis Agent';
       if (type === 'worker' || id.includes('worker')) return 'General Worker';
       return agentId || 'Agent';
     }
