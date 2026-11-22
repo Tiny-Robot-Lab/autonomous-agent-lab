@@ -384,3 +384,83 @@ continuation), governed by ADR 0006 and ADR 0007 (Decision 11).
   stay observational, and `GET /api/tasks/{task_id}/result` is outcome-driven (completed
   outcomes surface the canonical result, failed outcomes never fabricate one, legacy
   pre-boundary records remain readable).
+
+## 18. Resumed Parent Continuation, Claim Expiry/Recovery, and Turn-Aware Telemetry (Issue #223)
+
+Issue #223 implements resumed-parent pull-claim, Research continuation, claim expiry/recovery
+handling, and turn-aware inference telemetry, governed by ADR 0005, ADR 0006, and ADR 0007
+(Decisions 10, 11, 12, and 13).
+
+* **Governed Continuation-Context Boundary**: `GET /api/tasks/{task_id}/continuation-context`
+  provides an authenticated, bounded projection of parent and child context for resumed parent turns.
+  The endpoint strictly validates that the caller holds the `research` capability, the bound agent
+  matches the active claim, the detached `X-Assignment-Proof` header cryptographically validates
+  against the active claim's proof digest, the active claim is in `state="acknowledged"` with
+  `execution_kind="resumed_continuation"` and `continuation_version=1`, and the current fencing epoch
+  matches the claim's epoch. The endpoint returns strictly the canonical `ResumedContinuationContext`:
+  parent `TaskInput` v1, `TaskContinuation` v1 (`stage="incorporate_analysis_child"`), sealed parent
+  `StageArtifact`, child `TerminalOutcome`, and the canonical `TaskResult` (only when the child task
+  completed successfully). `ResumedContinuationContext` enforces that the continuation contains at least
+  one artifact reference and that the sealed stage artifact unambiguously binds to an authoritative reference
+  matching producing task, artifact ID, and artifact version. `OrchestratorClient` implements `ContinuationContextReader` through this boundary.
+* **Production Resumed Research Path**: Research Agent processes wake-up hints from `agent.hints.research`
+  (and initial tasks from `agent.tasks.research`). Resumed continuation turns pull-claim with
+  `capability="research"`, `execution_kind="resumed_continuation"`, and `expected_continuation_version=1`,
+  acknowledge assignment delivery, load the governed continuation context, and invoke
+  `ResearchProcessor.run_once`. If the child task succeeded, the agent synthesizes parent evidence and
+  child findings; if the child task failed or timed out (`claim_timed_out`), the agent produces degraded
+  synthesis explicitly noting the child failure; if primary research evidence is missing or corrupt,
+  it fails closed and submits an allowlisted `EXECUTION_FAILED` completion. Resumed turns complete
+  fenced without worker instance affinity, and second-wave delegation is forbidden. The agent bus
+  applies bounded queue fairness by alternating popping precedence between `agent.hints.research` and
+  `agent.tasks.research`, preventing hint bursts from starving ordinary task dispatch.
+* **Execution Claim Expiry and Recovery Handling**:
+  - `EXECUTION_CLAIM_TIMEOUT_SECONDS` (bounded between 60.0 and 7200.0 seconds, default 900.0 seconds)
+    governs acknowledged execution claim leases, distinct from `CLAIM_DELIVERY_LEASE_SECONDS` (which
+    governs unacknowledged delivery leases).
+  - Exact expiry equality boundary: `now <= execution_expires_at` means the claim remains valid and
+    unexpired; expiry may only materialize when `now > execution_expires_at`. At exact equality, the
+    task does not enter `recovery_required` and claims are not rejected as expired.
+  - Unacknowledged delivery expiry allows immediate re-claim by falling back to prior claimable status;
+    acknowledged execution claim expiry requires operator intervention and transitions task status to
+    `recovery_required`, recording an immutable `ClaimExpiryRecord` at `task.claim_expiry:{task_id}`.
+  - Expiry observations published to the event stream follow the repository's bounded `agent.events`
+    convention, using approximate stream trimming with `MAXLEN ~ 500`.
+  - Mutation-on-read semantics: Reading task status (`get_status`) or task result (`get_result`) evaluates
+    expiry deterministically for that single task only. If a platform transition is already due
+    (`now > child_claim_deadline` for pending children or `now > execution_expires_at` for acknowledged claims),
+    the read atomically materializes the canonical transition (`claim_timed_out` or `recovery_required`).
+    This operation is strictly task-scoped (no full-database scans), leaks no proofs or credentials, propagates
+    data corruption safely as `CorruptAuthoritativeRecordError`, and is idempotent on repeated reads.
+  - Legacy missing-expiry behavior: An acknowledged legacy `ActiveClaim` without `execution_expires_at`
+    does not invent a deadline, does not derive expiry from current configuration, and does not expire
+    automatically; targeted expiry evaluation returns diagnostic `action="none"`, `status="working"`,
+    leaving authoritative state untouched.
+  - Fencing epoch remains strictly unchanged during acknowledged claim expiry and recovery resolution;
+    only a subsequent successful pull-claim creates the next fencing epoch.
+  - Privileged recovery resolution (`POST /api/tasks/{task_id}/resolve-expired-claim`) is restricted to
+    callers with the `recovery_operator` capability and currently supports `disposition="restore_claimable"`,
+    which safely restores the prior claimable status (`pending` or `resumable`) without incrementing the fence.
+  - Child claim timeout (`claim_timed_out` terminal outcome) is materialized atomically when a pending child's
+    `child_claim_deadline` passes without an active claim (`now > child_claim_deadline`). Before or at the deadline
+    (`now <= child_claim_deadline`), expiry evaluation returns `action="none", status="pending"` with zero mutations,
+    preserving child claimability and parent `waiting_for_children` status.
+  - Full claim-timeout replay consistency: An exact `claim_timed_out` replay succeeds only when the entire canonical
+    projection remains internally consistent (child status `claim_timed_out`, canonical `TerminalOutcome` matches,
+    no `TaskResult`, no active claim, child lineage and parent children membership valid, continuation latest == 1,
+    continuation v1 matches, projection marker binds exact child, parent, outcome, and continuation version, and parent
+    status is exactly `resumable`). Any missing or corrupted projection invariant fails closed as conflict or corruption
+    with zero writes and zero hints emitted.
+  - Targeted task-specific expiry evaluation is integrated directly into atomic claim attempts and task
+    result/status access, avoiding full-database scans while preventing untrusted callers from triggering
+    privileged recovery.
+* **Resumed Continuation Execution and Failure Classification**:
+  - Resumed continuation executions preserve meaningful failure classification: exhaustion of all providers
+    via `AllInferenceProvidersFailedError` maps to `PROVIDER_UNAVAILABLE`, while missing/corrupt sealed primary
+    evidence, unsupported continuation contexts, or internal errors map to `EXECUTION_FAILED`.
+  - Raw exception details remain strictly local to the agent runtime and are never submitted to the orchestrator.
+* **Turn-Aware Telemetry**: `InferenceExecutionTelemetry` incorporates authoritative turn identity
+  fields (`assignment_id`, `turn_id`, `execution_kind`, `continuation_version`, and `attempt_index`),
+  preserving fine-grained operational observability across multi-turn task lifecycles. Task identity
+  (`task_id`) is carried by the enclosing event (`InferenceAttemptEvent`) or projected task history,
+  rather than being duplicated within the sanitized execution telemetry contract itself.

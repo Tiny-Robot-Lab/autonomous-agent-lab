@@ -5,12 +5,13 @@ from typing import Annotated, Any
 from agent_contracts import (
     FORBIDDEN_AUTHORITY_FIELDS,
     ArtifactReference,
+    RecoveryDecisionCommand,
     __version__,
 )
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from orchestrator.application.ports import (
     AuthoritativeTaskStore,
@@ -25,8 +26,11 @@ from orchestrator.application.ports import (
     DelegationConflictError,
     DelegationReplayAuthorizationError,
     EventPublisher,
+    FencingEpochRaceError,
     GrantAlreadyConsumedError,
     InvalidClaimProofError,
+    RecoveryConflictError,
+    RecoveryPreconditionFailedError,
     ResultReader,
     RoutingRecorder,
     StateReader,
@@ -52,6 +56,9 @@ from orchestrator.application.use_cases import (
     AcknowledgeAssignment,
     ClaimTask,
     CompleteTurn,
+    EvaluateExpiry,
+    GetResumedContinuationContext,
+    ResolveExpiredClaim,
     StageArtifactUseCase,
     SubmitTask,
     UnauthorizedPrincipalError,
@@ -218,6 +225,33 @@ class DelegationProposalInput(BaseModel):
     control_fields: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
+
+
+class ResolveExpiredClaimInput(BaseModel):
+    recovery_decision_id: str = Field(min_length=1, max_length=128)
+    expired_claim_id: str = Field(min_length=1, max_length=128)
+    expired_assignment_id: str = Field(min_length=1, max_length=128)
+    expired_fencing_epoch: int = Field(ge=1)
+    disposition: str = Field(min_length=1, max_length=64)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("expired_fencing_epoch", mode="before")
+    @classmethod
+    def validate_expired_fencing_epoch(cls, v: Any) -> int:
+        if type(v) is bool:
+            raise TypeError("expired_fencing_epoch must not be a boolean")
+        if not isinstance(v, int):
+            raise TypeError("expired_fencing_epoch must be an integer")
+        if v < 1:
+            raise ValueError("expired_fencing_epoch must be >= 1")
+        return v
+
+
+class EvaluateExpiryInput(BaseModel):
+    now: str | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 def get_current_runtime_principal(request: Request) -> RuntimePrincipal:
@@ -476,8 +510,123 @@ async def accept_delegation_endpoint(
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
+async def evaluate_expiry_endpoint(
+    task_id: str,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+    value: Annotated[EvaluateExpiryInput | None, Body()] = None,
+) -> dict[str, Any]:
+    eval_uc: EvaluateExpiry | None = getattr(request.app.state, "evaluate_expiry", None)
+    if eval_uc is None:
+        raise HTTPException(status_code=503, detail="Expiry evaluation service is not enabled")
+    now_str = value.now if (value and value.now) else ""
+    try:
+        res = await eval_uc.execute(principal=principal, task_id=task_id, now=now_str)
+        data: dict[str, Any] = {
+            "task_id": res.task_id,
+            "action": res.action,
+            "status": res.status,
+        }
+        if res.outcome is not None:
+            data["outcome"] = res.outcome.to_dict()
+        if res.expiry_record is not None:
+            data["expiry_record"] = res.expiry_record.to_dict()
+        return data
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ParentTaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
+
+
+async def resolve_expired_claim_endpoint(
+    task_id: str,
+    value: ResolveExpiredClaimInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    res_uc: ResolveExpiredClaim | None = getattr(request.app.state, "resolve_expired_claim", None)
+    if res_uc is None:
+        raise HTTPException(status_code=503, detail="Recovery resolution service is not enabled")
+    try:
+        command = RecoveryDecisionCommand(
+            task_id=task_id,
+            recovery_decision_id=value.recovery_decision_id,
+            expired_claim_id=value.expired_claim_id,
+            expired_assignment_id=value.expired_assignment_id,
+            expired_fencing_epoch=value.expired_fencing_epoch,
+            disposition=value.disposition,
+        )
+        record, restored_status = await res_uc.execute(principal=principal, command=command)
+        return {
+            "record": record.to_dict(),
+            "restored_status": restored_status,
+        }
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ParentTaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RecoveryConflictError, FencingEpochRaceError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (RecoveryPreconditionFailedError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
+
+
+async def continuation_context_endpoint(
+    task_id: str,
+    assignment_id: str,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    get_ctx_uc: GetResumedContinuationContext | None = getattr(
+        request.app.state, "get_resumed_continuation_context", None
+    )
+    if get_ctx_uc is None:
+        raise HTTPException(
+            status_code=503, detail="Continuation context service is not enabled"
+        )
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(
+            status_code=401, detail="Missing assignment proof in X-Assignment-Proof header"
+        )
+
+    try:
+        context = await get_ctx_uc.execute(
+            principal=principal,
+            task_id=task_id,
+            assignment_id=assignment_id,
+            assignment_proof=header_proof,
+        )
+        return context.to_dict()
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ClaimNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TaskAlreadyClaimedError, TaskNotClaimableError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(
+            status_code=500, detail="Authoritative record corruption detected"
+        ) from exc
+
+
 class NoOpResultReader:
-    async def get_result(self, task_id: str) -> dict[str, Any] | None:
+    async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None:
         return None
 
 
@@ -573,6 +722,9 @@ def create_app(
     stage_artifact: StageArtifactUseCase | None = None
     accept_delegation: AcceptDelegationProposal | None = None
     complete_turn: CompleteTurn | None = None
+    get_resumed_continuation_context: GetResumedContinuationContext | None = None
+    evaluate_expiry: EvaluateExpiry = EvaluateExpiry(task_store=resolved_task_store)
+    resolve_expired_claim: ResolveExpiredClaim = ResolveExpiredClaim(task_store=resolved_task_store)
     if resolved_settings.assignment_proof_pepper.strip():
         claim_task = ClaimTask(
             task_store=resolved_task_store,
@@ -582,6 +734,7 @@ def create_app(
         acknowledge_assignment = AcknowledgeAssignment(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            execution_claim_timeout_seconds=resolved_settings.execution_claim_timeout_seconds,
         )
         stage_artifact = StageArtifactUseCase(
             task_store=resolved_task_store,
@@ -603,6 +756,10 @@ def create_app(
                 completion_store=completion_store,
                 assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             )
+        get_resumed_continuation_context = GetResumedContinuationContext(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -626,6 +783,9 @@ def create_app(
     app.state.stage_artifact = stage_artifact
     app.state.accept_delegation = accept_delegation
     app.state.complete_turn = complete_turn
+    app.state.get_resumed_continuation_context = get_resumed_continuation_context
+    app.state.evaluate_expiry = evaluate_expiry
+    app.state.resolve_expired_claim = resolve_expired_claim
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -671,6 +831,21 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/completion",
         complete_task_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/continuation-context",
+        continuation_context_endpoint,
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/evaluate-expiry",
+        evaluate_expiry_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/resolve-expired-claim",
+        resolve_expired_claim_endpoint,
         methods=["POST"],
     )
 

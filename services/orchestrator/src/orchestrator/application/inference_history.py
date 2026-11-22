@@ -29,6 +29,10 @@ class TaskEventObservation:
     is_terminal_lifecycle: bool = False
     is_terminal_error: bool = False
     is_malformed: bool = False
+    turn_id: str | None = None
+    assignment_id: str | None = None
+    execution_kind: str | None = None
+    continuation_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -41,9 +45,10 @@ class TaskInferenceHistory:
     inference_telemetry: dict[str, Any] | None
     attempts: list[dict[str, Any]]
     fallback_transitions: list[dict[str, Any]]
+    turns: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "task_id": self.task_id,
             "history_status": self.history_status,
             "final_status": self.final_status,
@@ -51,6 +56,9 @@ class TaskInferenceHistory:
             "attempts": self.attempts,
             "fallback_transitions": self.fallback_transitions,
         }
+        if self.turns is not None:
+            data["turns"] = self.turns
+        return data
 
 
 def _are_telemetries_equivalent(
@@ -69,6 +77,10 @@ def _are_telemetries_equivalent(
         and a.input_tokens == b.input_tokens
         and a.output_tokens == b.output_tokens
         and a.total_tokens == b.total_tokens
+        and getattr(a, "turn_id", None) == getattr(b, "turn_id", None)
+        and getattr(a, "assignment_id", None) == getattr(b, "assignment_id", None)
+        and getattr(a, "execution_kind", None) == getattr(b, "execution_kind", None)
+        and getattr(a, "continuation_version", None) == getattr(b, "continuation_version", None)
     )
 
 
@@ -79,6 +91,10 @@ def _are_transitions_equivalent(a: FallbackTransition, b: FallbackTransition) ->
         and a.failed_provider == b.failed_provider
         and a.target_provider == b.target_provider
         and a.reason == b.reason
+        and getattr(a, "turn_id", None) == getattr(b, "turn_id", None)
+        and getattr(a, "assignment_id", None) == getattr(b, "assignment_id", None)
+        and getattr(a, "execution_kind", None) == getattr(b, "execution_kind", None)
+        and getattr(a, "continuation_version", None) == getattr(b, "continuation_version", None)
     )
 
 
@@ -151,6 +167,7 @@ def project_task_inference_history(
                 inference_telemetry=None,
                 attempts=[],
                 fallback_transitions=[],
+                turns=[],
             ).to_dict()
         elif task_exists_durable:
             # Zero matching events in stream.
@@ -170,67 +187,150 @@ def project_task_inference_history(
                 inference_telemetry=None,
                 attempts=[],
                 fallback_transitions=[],
+                turns=[],
             ).to_dict()
         else:
             return None
 
-    # Deduplicate and sort attempts
-    has_conflict = False
-    attempts_by_index: dict[
-        int, list[tuple[TaskEventObservation, InferenceExecutionTelemetry]]
+    # Deduplicate and sort attempts and transitions by turn
+    def _turn_key(obs: TaskEventObservation, telem_or_trans: Any) -> tuple[str | None, str | None]:
+        t_id = getattr(telem_or_trans, "turn_id", None) or obs.turn_id
+        a_id = getattr(telem_or_trans, "assignment_id", None) or obs.assignment_id
+        return (t_id, a_id)
+
+    turn_keys: list[tuple[str | None, str | None]] = []
+    attempts_by_turn: dict[
+        tuple[str | None, str | None],
+        list[tuple[TaskEventObservation, InferenceExecutionTelemetry]],
     ] = {}
     for obs, telem in raw_attempts:
-        attempts_by_index.setdefault(telem.attempt_index, []).append((obs, telem))
+        tk = _turn_key(obs, telem)
+        if tk not in attempts_by_turn:
+            turn_keys.append(tk)
+            attempts_by_turn[tk] = []
+        attempts_by_turn[tk].append((obs, telem))
 
-    deduped_attempts: list[tuple[TaskEventObservation, InferenceExecutionTelemetry]] = []
-    for records in attempts_by_index.values():
-        unique_records: list[tuple[TaskEventObservation, InferenceExecutionTelemetry]] = []
-        for obs, cand in records:
-            if not any(_are_telemetries_equivalent(cand, u[1]) for u in unique_records):
-                unique_records.append((obs, cand))
-
-        if len(unique_records) > 1:
-            has_conflict = True
-            deduped_attempts.extend(unique_records)
-        elif unique_records:
-            deduped_attempts.append(unique_records[0])
-
-    # Sort attempts primarily by attempt_index ascending, tie-breaking by stream position and order
-    deduped_attempts.sort(
-        key=lambda item: (
-            item[1].attempt_index,
-            item[0].stream_position,
-            item[0].stream_order,
-        )
-    )
-    final_attempts = [item[1] for item in deduped_attempts]
-
-    # Deduplicate and sort transitions
-    transitions_by_index: dict[int, list[tuple[TaskEventObservation, FallbackTransition]]] = {}
+    transitions_by_turn: dict[
+        tuple[str | None, str | None],
+        list[tuple[TaskEventObservation, FallbackTransition]],
+    ] = {}
     for obs, trans in raw_transitions:
-        transitions_by_index.setdefault(trans.attempt_index, []).append((obs, trans))
+        tk = _turn_key(obs, trans)
+        if tk not in attempts_by_turn and tk not in transitions_by_turn:
+            turn_keys.append(tk)
+        transitions_by_turn.setdefault(tk, []).append((obs, trans))
 
-    deduped_transitions: list[tuple[TaskEventObservation, FallbackTransition]] = []
-    for records in transitions_by_index.values():
-        unique_records: list[tuple[TaskEventObservation, FallbackTransition]] = []
-        for obs, cand in records:
-            if not any(_are_transitions_equivalent(cand, u[1]) for u in unique_records):
-                unique_records.append((obs, cand))
+    if not turn_keys:
+        turn_keys.append((None, None))
 
-        if len(unique_records) > 1:
-            has_conflict = True
-            deduped_transitions.extend(unique_records)
-        elif unique_records:
-            deduped_transitions.append(unique_records[0])
+    has_conflict = False
+    has_gap = False
+    final_attempts: list[InferenceExecutionTelemetry] = []
+    final_transitions: list[FallbackTransition] = []
+    turns_projection: list[dict[str, Any]] = []
 
-    deduped_transitions.sort(
-        key=lambda item: (
-            item[1].attempt_index,
-            item[0].stream_position,
-            item[0].stream_order,
+    for tk in turn_keys:
+        turn_raw_attempts = attempts_by_turn.get(tk, [])
+        turn_raw_trans = transitions_by_turn.get(tk, [])
+
+        turn_attempts_by_index: dict[
+            int, list[tuple[TaskEventObservation, InferenceExecutionTelemetry]]
+        ] = {}
+        for obs, telem in turn_raw_attempts:
+            turn_attempts_by_index.setdefault(telem.attempt_index, []).append((obs, telem))
+
+        turn_deduped_attempts: list[tuple[TaskEventObservation, InferenceExecutionTelemetry]] = []
+        for records in turn_attempts_by_index.values():
+            unique_records: list[tuple[TaskEventObservation, InferenceExecutionTelemetry]] = []
+            for obs, cand in records:
+                if not any(_are_telemetries_equivalent(cand, u[1]) for u in unique_records):
+                    unique_records.append((obs, cand))
+
+            if len(unique_records) > 1:
+                has_conflict = True
+                turn_deduped_attempts.extend(unique_records)
+            elif unique_records:
+                turn_deduped_attempts.append(unique_records[0])
+
+        turn_deduped_attempts.sort(
+            key=lambda item: (
+                item[1].attempt_index,
+                item[0].stream_position,
+                item[0].stream_order,
+            )
         )
-    )
-    final_transitions = [item[1] for item in deduped_transitions]
+        turn_final_attempts = [item[1] for item in turn_deduped_attempts]
+
+        turn_transitions_by_index: dict[
+            int, list[tuple[TaskEventObservation, FallbackTransition]]
+        ] = {}
+        for obs, trans in turn_raw_trans:
+            turn_transitions_by_index.setdefault(trans.attempt_index, []).append((obs, trans))
+
+        turn_deduped_transitions: list[tuple[TaskEventObservation, FallbackTransition]] = []
+        for records in turn_transitions_by_index.values():
+            unique_records: list[tuple[TaskEventObservation, FallbackTransition]] = []
+            for obs, cand in records:
+                if not any(_are_transitions_equivalent(cand, u[1]) for u in unique_records):
+                    unique_records.append((obs, cand))
+
+            if len(unique_records) > 1:
+                has_conflict = True
+                turn_deduped_transitions.extend(unique_records)
+            elif unique_records:
+                turn_deduped_transitions.append(unique_records[0])
+
+        turn_deduped_transitions.sort(
+            key=lambda item: (
+                item[1].attempt_index,
+                item[0].stream_position,
+                item[0].stream_order,
+            )
+        )
+        turn_final_transitions = [item[1] for item in turn_deduped_transitions]
+
+        # Evaluate completeness and gaps within this turn
+        if not turn_final_attempts and (turn_final_transitions or len(turn_keys) == 1):
+            has_gap = True
+        elif turn_final_attempts:
+            unique_indices = sorted({a.attempt_index for a in turn_final_attempts})
+            if unique_indices[0] != 0 or unique_indices != list(range(len(unique_indices))):
+                has_gap = True
+
+        for trans in turn_final_transitions:
+            source_attempt = next(
+                (a for a in turn_final_attempts if a.attempt_index == trans.attempt_index), None
+            )
+            target_attempt = next(
+                (a for a in turn_final_attempts if a.attempt_index == trans.attempt_index + 1), None
+            )
+
+            if source_attempt is None or source_attempt.provider_name != trans.failed_provider:
+                has_gap = True
+            if target_attempt is None or target_attempt.provider_name != trans.target_provider:
+                has_gap = True
+
+        final_attempts.extend(turn_final_attempts)
+        final_transitions.extend(turn_final_transitions)
+
+        ekind = None
+        cver = None
+        for a in turn_final_attempts:
+            if getattr(a, "execution_kind", None):
+                ekind = a.execution_kind
+            if getattr(a, "continuation_version", None) is not None:
+                cver = a.continuation_version
+
+        turns_projection.append(
+            {
+                "turn_id": tk[0],
+                "assignment_id": tk[1],
+                "execution_kind": ekind,
+                "continuation_version": cver,
+                "attempts": [a.to_dict() for a in turn_final_attempts],
+                "fallback_transitions": [t.to_dict() for t in turn_final_transitions],
+            }
+        )
 
     # Evaluate inference outcome and winning telemetry
     succeeded_attempts = [a for a in final_attempts if a.status == "succeeded"]
@@ -259,29 +359,6 @@ def project_task_inference_history(
             # Without terminal failure evidence, do not infer all_providers_failed
             final_status = None
 
-    # Evaluate sequence completeness and gaps
-    has_gap = False
-    if not final_attempts:
-        has_gap = True
-    else:
-        unique_indices = sorted({a.attempt_index for a in final_attempts})
-        if unique_indices[0] != 0 or unique_indices != list(range(len(unique_indices))):
-            has_gap = True
-
-    # Transition alignment check
-    for trans in final_transitions:
-        source_attempt = next(
-            (a for a in final_attempts if a.attempt_index == trans.attempt_index), None
-        )
-        target_attempt = next(
-            (a for a in final_attempts if a.attempt_index == trans.attempt_index + 1), None
-        )
-
-        if source_attempt is None or source_attempt.provider_name != trans.failed_provider:
-            has_gap = True
-        if target_attempt is None or target_attempt.provider_name != trans.target_provider:
-            has_gap = True
-
     # Terminal lifecycle confirmation
     if final_status == "succeeded":
         is_terminal_confirmed = has_terminal_completion and not has_terminal_failure
@@ -302,4 +379,5 @@ def project_task_inference_history(
         inference_telemetry=winning_telemetry.to_dict() if winning_telemetry else None,
         attempts=[a.to_dict() for a in final_attempts],
         fallback_transitions=[t.to_dict() for t in final_transitions],
+        turns=turns_projection,
     ).to_dict()

@@ -19,6 +19,7 @@ class Settings:
     task_delivery_mode: str = "legacy_push"
     claim_delivery_lease_seconds: float = 30.0
     child_claim_deadline_seconds: float = 120.0
+    execution_claim_timeout_seconds: float = 900.0
     runtime_credential_pepper: str = ""
     assignment_proof_pepper: str = ""
     runtime_principals: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -39,6 +40,13 @@ class Settings:
         ):
             raise ValueError(
                 f"child_claim_deadline_seconds must be a number between 10.0 and 3600.0, got {self.child_claim_deadline_seconds}"
+            )
+
+        if type(self.execution_claim_timeout_seconds) not in (int, float) or not (
+            60.0 <= float(self.execution_claim_timeout_seconds) <= 7200.0
+        ):
+            raise ValueError(
+                f"execution_claim_timeout_seconds must be a number between 60.0 and 7200.0, got {self.execution_claim_timeout_seconds}"
             )
 
         if self.task_delivery_mode == "authenticated_claim":
@@ -100,6 +108,18 @@ class Settings:
         else:
             deadline_seconds = 120.0
 
+        raw_timeout = os.getenv("EXECUTION_CLAIM_TIMEOUT_SECONDS")
+        if raw_timeout is not None:
+            clean_timeout = raw_timeout.strip()
+            try:
+                timeout_seconds = float(clean_timeout)
+            except (ValueError, TypeError):
+                raise ValueError("Invalid EXECUTION_CLAIM_TIMEOUT_SECONDS configuration") from None
+            if not (60.0 <= timeout_seconds <= 7200.0):
+                raise ValueError("Invalid EXECUTION_CLAIM_TIMEOUT_SECONDS configuration")
+        else:
+            timeout_seconds = 900.0
+
         raw_principals = os.getenv("RUNTIME_PRINCIPALS_JSON")
         principals: dict[str, dict[str, Any]] = {}
         if raw_principals is not None:
@@ -134,6 +154,7 @@ class Settings:
             task_delivery_mode=raw_mode,
             claim_delivery_lease_seconds=lease_seconds,
             child_claim_deadline_seconds=deadline_seconds,
+            execution_claim_timeout_seconds=timeout_seconds,
             runtime_credential_pepper=os.getenv("RUNTIME_CREDENTIAL_PEPPER", ""),
             assignment_proof_pepper=os.getenv("ASSIGNMENT_PROOF_PEPPER", ""),
             runtime_principals=principals,
