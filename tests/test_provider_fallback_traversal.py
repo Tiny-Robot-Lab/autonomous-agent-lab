@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 from agent_contracts import (
     AgentEvent,
     AllInferenceProvidersFailedError,
+    CompletionCommand,
     FallbackEligibleInferenceError,
     FallbackTransition,
     InferenceError,
@@ -31,6 +33,7 @@ from research_agent.application.fallback import (
 from research_agent.application.processor import (
     ResearchProcessor,
 )
+from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from research_agent.domain.models import ResearchResult, SynthesisResult
 from worker.application.fallback import (
     FallbackInferenceProvider,
@@ -921,6 +924,26 @@ class MockMessageBus:
         raise NotImplementedError
 
 
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
+
+    def __init__(self) -> None:
+        self.submitted: list[CompletionCommand] = []
+
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.submitted.append(command)
+        return {"outcome": {}, "replayed": False}
+
+
+ASSIGNMENT_ID = "assign-traversal-1"
+ASSIGNMENT_PROOF = "proof-traversal-1"
+
+
 class MockResearchExecutor:
     def __init__(self, output: str = "Research ground evidence") -> None:
         self.output = output
@@ -930,7 +953,21 @@ class MockResearchExecutor:
             task_id=task.task_id,
             output=self.output,
             acknowledged=True,
-            sources=["https://example.com/ref1"],
+            sources=(
+                EvaluatedEvidence(
+                    url="https://example.com/ref1",
+                    title="Reference 1",
+                    content="Supporting excerpt",
+                    domain="example.com",
+                    authority_tier=AuthorityTier.NEUTRAL,
+                    source_type=SourceType.UNKNOWN,
+                    quality_signals=(),
+                    relevance_signal="high",
+                    recency_indicator="unknown",
+                    rank_score=0.5,
+                    retained=True,
+                ),
+            ),
         )
 
 
@@ -1275,14 +1312,15 @@ async def test_worker_task_processor_end_to_end_fallback_lifecycle() -> None:
         preferences=["p1", "p2"],
         providers={"p1": p1, "p2": p2},
     )
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         agent_id="worker-1",
         bus=bus,
-        result_store=bus,
+        completion_client=completion_client,
         fallback_coordinator=coordinator,
     )
     task = TaskRequested.create("End to end prompt")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Event sequence: task working -> telemetry p1 -> fallback -> telemetry p2 -> idle
     assert len(bus.published) == 5
@@ -1313,8 +1351,10 @@ async def test_worker_task_processor_end_to_end_fallback_lifecycle() -> None:
     assert ev_idle.state == "idle"
     assert ev_idle.task_id == task.task_id
 
-    assert task.task_id in bus.saved_results
-    assert bus.saved_results[task.task_id].output == "final answer"
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.output == "final answer"
 
 
 @pytest.mark.anyio
@@ -1337,16 +1377,17 @@ async def test_worker_task_processor_end_to_end_exhaustion_lifecycle() -> None:
         preferences=["p1", "p2"],
         providers={"p1": p1, "p2": p2},
     )
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         agent_id="worker-1",
         bus=bus,
-        result_store=bus,
+        completion_client=completion_client,
         fallback_coordinator=coordinator,
     )
     task = TaskRequested.create("Exhaustion prompt")
 
     with pytest.raises(TaskExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert isinstance(exc_info.value.original_error, AllInferenceProvidersFailedError)
     assert exc_info.value.task_id == task.task_id
@@ -1466,15 +1507,16 @@ async def test_research_processor_end_to_end_fallback_lifecycle() -> None:
         providers={"p1": p1, "p2": p2},
     )
     executor = MockResearchExecutor(output="Ground evidence")
+    completion_client = FakeCompletionClient()
     processor = ResearchProcessor(
         agent_id="research-1",
         bus=bus,
         executor=executor,
-        result_store=bus,
+        completion_client=completion_client,
         fallback_coordinator=coordinator,
     )
     task = TaskRequested.create("Grounded query")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Lifecycle: task working -> telemetry p1 -> fallback -> telemetry p2 -> idle
     assert len(bus.published) == 5
@@ -1504,10 +1546,12 @@ async def test_research_processor_end_to_end_fallback_lifecycle() -> None:
     assert ev_idle.state == "idle"
     assert ev_idle.task_id == task.task_id
 
-    assert task.task_id in bus.saved_results
-    saved = bus.saved_results[task.task_id]
+    assert len(completion_client.submitted) == 1
+    saved = completion_client.submitted[0].completed_result
+    assert saved is not None
     assert saved.output == "Synthesized research findings"
-    assert saved.sources == ("https://example.com/ref1",)
+    assert isinstance(saved.sources, list)
+    assert saved.sources[0]["url"] == "https://example.com/ref1"
 
 
 # ==============================================================================
@@ -1915,17 +1959,18 @@ async def test_worker_coordinator_and_task_processor_runtime_compatibility() -> 
         preferences=["p1", "p2"],
         providers={"p1": p1, "p2": p2},
     )
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         agent_id="worker-compat",
         bus=bus,
-        result_store=bus,
+        completion_client=completion_client,
         fallback_coordinator=coordinator,
     )
     task = TaskRequested.create("Runtime compat task")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in bus.saved_results
-    saved = bus.saved_results[task.task_id]
+    assert len(completion_client.submitted) == 1
+    saved = completion_client.submitted[0].completed_result
     assert isinstance(saved, TaskResult)
     assert type(saved.output) is str
     assert saved.output == "End-to-end preserved plain string"

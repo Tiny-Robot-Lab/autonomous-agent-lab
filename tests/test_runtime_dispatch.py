@@ -157,6 +157,7 @@ def test_agent_candidate_rejects_empty_dispatch_target() -> None:
 async def test_worker_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-worker-queue")
 
@@ -179,6 +180,7 @@ async def test_worker_registers_configured_dispatch_target(
 
 @pytest.mark.anyio
 async def test_worker_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -201,6 +203,7 @@ async def test_worker_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -
 async def test_research_agent_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "research-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-research-queue")
 
@@ -225,6 +228,7 @@ async def test_research_agent_registers_configured_dispatch_target(
 
 @pytest.mark.anyio
 async def test_research_agent_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "research-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 

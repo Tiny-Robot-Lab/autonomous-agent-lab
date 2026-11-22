@@ -20,6 +20,8 @@ from orchestrator.application.ports import (
     ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    CompletionConflictError,
+    CompletionReplayAuthorizationError,
     DelegationConflictError,
     DelegationReplayAuthorizationError,
     EventPublisher,
@@ -33,6 +35,7 @@ from orchestrator.application.ports import (
     TaskNotClaimableError,
     TaskQueue,
     TelemetryStorageError,
+    TurnCompletionStore,
     WaveBudgetExceededError,
 )
 from orchestrator.application.queries import (
@@ -48,6 +51,7 @@ from orchestrator.application.use_cases import (
     AcceptDelegationProposal,
     AcknowledgeAssignment,
     ClaimTask,
+    CompleteTurn,
     StageArtifactUseCase,
     SubmitTask,
     UnauthorizedPrincipalError,
@@ -353,6 +357,58 @@ async def stage_artifact_endpoint(
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
+async def complete_task_endpoint(
+    task_id: str,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    complete_turn_uc: CompleteTurn | None = request.app.state.complete_turn
+    if complete_turn_uc is None:
+        raise HTTPException(status_code=503, detail="Turn completion service is not enabled")
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(status_code=401, detail="Missing assignment proof in X-Assignment-Proof header")
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    try:
+        response = await complete_turn_uc.execute(
+            principal=principal,
+            task_id=task_id,
+            command_payload=payload,
+            assignment_proof=header_proof,
+        )
+        data: dict[str, Any] = {
+            "outcome": response.outcome.to_dict(),
+            "replayed": response.replayed,
+        }
+        if response.result is not None:
+            data["result"] = response.result.to_dict()
+        return data
+    except CompletionReplayAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Completion replay authorization failed") from exc
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ClaimNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TaskAlreadyClaimedError, TaskNotClaimableError, CompletionConflictError) as exc:
+        if isinstance(exc, TaskNotClaimableError) and "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
+
+
 async def accept_delegation_endpoint(
     task_id: str,
     value: DelegationProposalInput,
@@ -516,6 +572,7 @@ def create_app(
     acknowledge_assignment: AcknowledgeAssignment | None = None
     stage_artifact: StageArtifactUseCase | None = None
     accept_delegation: AcceptDelegationProposal | None = None
+    complete_turn: CompleteTurn | None = None
     if resolved_settings.assignment_proof_pepper.strip():
         claim_task = ClaimTask(
             task_store=resolved_task_store,
@@ -535,6 +592,17 @@ def create_app(
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
         )
+        completion_store: TurnCompletionStore | None = (
+            resolved_task_store
+            if isinstance(resolved_task_store, TurnCompletionStore)
+            else None
+        )
+        if completion_store is not None:
+            complete_turn = CompleteTurn(
+                task_store=resolved_task_store,
+                completion_store=completion_store,
+                assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -557,6 +625,7 @@ def create_app(
     app.state.acknowledge_assignment = acknowledge_assignment
     app.state.stage_artifact = stage_artifact
     app.state.accept_delegation = accept_delegation
+    app.state.complete_turn = complete_turn
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -597,6 +666,11 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/delegations",
         accept_delegation_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/completion",
+        complete_task_endpoint,
         methods=["POST"],
     )
 

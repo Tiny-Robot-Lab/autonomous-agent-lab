@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from typing import Any
 
 import redis.asyncio as redis
 from agent_contracts import (
@@ -11,8 +10,6 @@ from agent_contracts import (
     AgentHeartbeat,
     TaskRequested,
 )
-
-from research_agent.domain.models import ResearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -110,22 +107,6 @@ class RedisBus:
         async def _write():
             await self.client.sadd("agent.ids", heartbeat.agent_id)
             await self.client.hset(f"agent.state:{heartbeat.agent_id}", mapping=mapping)
-
-        await retry_with_backoff(_write)
-
-    async def save(self, result: ResearchResult) -> None:
-        data: dict[str, Any] = {
-            "task_id": result.task_id,
-            "status": "completed",
-            "output": result.output,
-            "acknowledged": result.acknowledged,
-            "truncated": result.truncated,
-        }
-        if result.sources:
-            data["sources"] = [s.to_dict() for s in result.sources]
-
-        async def _write():
-            await self.client.set(f"task.result:{result.task_id}", json.dumps(data))
 
         await retry_with_backoff(_write)
 

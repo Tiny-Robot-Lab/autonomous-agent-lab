@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from agent_contracts import (
@@ -11,7 +12,10 @@ from agent_contracts import (
     AgentCandidate,
     AgentExecutionState,
     ArtifactReference,
+    AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    CompletionCommand,
+    CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
     RequiredCapabilityRecord,
@@ -20,7 +24,11 @@ from agent_contracts import (
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    TaskResult,
+    TerminalOutcome,
     WakeUpHint,
+    build_completion_audit,
+    build_terminal_outcome,
     compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
 )
@@ -31,9 +39,11 @@ from orchestrator.application.ports import (
     ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    CompletionConflictError,
     DelegationConflictError,
     FencingEpochRaceError,
     GrantAlreadyConsumedError,
+    InvalidClaimProofError,
     TaskAlreadyClaimedError,
     TaskDispatcher,
     TaskNotClaimableError,
@@ -86,6 +96,11 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.claim_deadlines: dict[str, str] = {}
         self.hints: list[WakeUpHint] = []
         self.delegation_decisions: dict[str, set[str]] = {}
+        self.completion_records: dict[tuple[str, str], CompletionRecord] = {}
+        self.terminal_outcomes: dict[str, TerminalOutcome] = {}
+        self.canonical_results: dict[str, TaskResult] = {}
+        self.assignment_completions: dict[tuple[str, str], AssignmentCompletionRecord] = {}
+        self.child_markers: dict[str, dict[str, str]] = {}
         self.fail_next_registration: bool = False
         self.root_registrations: list[tuple[TaskRequested, str]] = []
         self.child_registrations: list[tuple[TaskRequested, str]] = []
@@ -803,6 +818,281 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.hints.append(wake_up_hint)
 
         return (proposal, False)
+
+    async def complete_turn(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        proof_digest: str,
+        fencing_epoch: int,
+        parent_task_id: str | None,
+        root_task_id: str,
+        completed_at: str,
+        runtime_principal_id: str,
+        bound_agent_id: str,
+    ) -> tuple[TerminalOutcome, TaskResult | None, bool]:
+        clean_task = str(task_id).strip()
+        clean_root = str(root_task_id).strip()
+        if not clean_task or not clean_root:
+            raise ValueError("task_id and root_task_id must be non-empty strings")
+        clean_principal = str(runtime_principal_id).strip()
+        clean_agent = str(bound_agent_id).strip()
+        clean_digest = str(proof_digest).strip()
+        if not clean_principal or not clean_agent or not clean_digest:
+            raise ValueError("runtime_principal_id, bound_agent_id, and proof_digest must be non-empty strings")
+
+        now_iso = (
+            normalize_canonical_utc_timestamp(completed_at)
+            if (completed_at and str(completed_at).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+
+        is_child = command.execution_kind == "delegated_child"
+        clean_parent = str(parent_task_id).strip() if parent_task_id else ""
+        if is_child and not clean_parent:
+            raise ValueError("parent_task_id is required for delegated_child completion")
+
+        if command.completed_result is not None:
+            if command.completed_result.task_id != clean_task:
+                raise ValueError(
+                    f"Completed TaskResult task_id '{command.completed_result.task_id}' "
+                    f"does not match completion task '{clean_task}'"
+                )
+            if command.completed_result.status != "completed":
+                raise ValueError(
+                    f"Completed TaskResult status must be 'completed' for task '{clean_task}'"
+                )
+
+        # Phase 1: Replay check (first store-level operation, zero writes)
+        record_key = (clean_task, command.completion_command_id.strip())
+        existing_record = self.completion_records.get(record_key)
+        if existing_record is not None:
+            matches = (
+                existing_record.task_id == clean_task
+                and existing_record.assignment_id == command.assignment_id
+                and existing_record.runtime_principal_id == clean_principal
+                and existing_record.bound_agent_id == clean_agent
+                and existing_record.execution_kind == command.execution_kind
+                and existing_record.semantic_fingerprint == command.semantic_fingerprint()
+                and existing_record.continuation_version == command.continuation_version
+            )
+            if matches:
+                stored_outcome = self.terminal_outcomes.get(clean_task)
+                if stored_outcome is None or stored_outcome.outcome_id != existing_record.outcome_id:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Canonical terminal outcome missing for replayed task '{clean_task}'"
+                    )
+                if stored_outcome.task_id != clean_task:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Canonical terminal outcome task mismatch for replayed task '{clean_task}'"
+                    )
+                stored_result = self.canonical_results.get(clean_task)
+                if stored_outcome.terminal_status == "completed":
+                    if stored_result is None:
+                        raise CorruptAuthoritativeRecordError(
+                            f"Canonical result missing for completed replayed task '{clean_task}'; "
+                            "refusing to fabricate output"
+                        )
+                    if stored_result.task_id != clean_task or stored_result.status != "completed":
+                        raise CorruptAuthoritativeRecordError(
+                            f"Canonical result inconsistent for replayed task '{clean_task}'"
+                        )
+                elif stored_result is not None:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Unexpected canonical result for failed replayed task '{clean_task}'"
+                    )
+                return (stored_outcome, stored_result, True)
+            raise CompletionConflictError(
+                f"Completion command '{command.completion_command_id}' on task '{clean_task}' "
+                "conflicts with the already-accepted semantic payload"
+            )
+
+        # Phase 1 (cont.): strictly read-only validations
+        cur_status = self.statuses.get(clean_task)
+        if cur_status is None:
+            raise TaskNotClaimableError(f"Task '{clean_task}' not found")
+        if cur_status != "working":
+            if cur_status in ("completed", "failed"):
+                raise CompletionConflictError(
+                    f"Task '{clean_task}' already reached canonical terminal status '{cur_status}'"
+                )
+            raise TaskNotClaimableError(
+                f"Task '{clean_task}' is not in an eligible working turn (status '{cur_status}')"
+            )
+
+        claim = self.claims.get(clean_task)
+        if claim is None:
+            raise ClaimNotFoundError(
+                f"Active acknowledged claim for assignment '{command.assignment_id}' "
+                f"on task '{clean_task}' not found: CLAIM_NOT_FOUND"
+            )
+        if claim.assignment_id != command.assignment_id:
+            raise ClaimNotFoundError("Active claim assignment mismatch: ASSIGNMENT_MISMATCH")
+        if claim.task_id != clean_task:
+            raise ClaimNotFoundError("Active claim task mismatch: TASK_MISMATCH")
+        if claim.runtime_principal_id != clean_principal:
+            raise ClaimNotFoundError("Active claim principal mismatch: PRINCIPAL_MISMATCH")
+        if claim.bound_agent_id != clean_agent:
+            raise ClaimNotFoundError("Active claim bound agent mismatch: BOUND_AGENT_MISMATCH")
+        if claim.execution_kind != command.execution_kind:
+            raise TaskNotClaimableError("Claimed execution kind mismatch: EXECUTION_KIND_MISMATCH")
+        if claim.continuation_version != command.continuation_version:
+            raise TaskNotClaimableError("Claimed continuation version mismatch: CONTINUATION_VERSION_MISMATCH")
+        if claim.state != "acknowledged":
+            raise ClaimNotFoundError("Assignment must be acknowledged: CLAIM_NOT_ACKNOWLEDGED")
+        if claim.proof_digest != clean_digest:
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        cur_fence = self.fences.get(clean_task)
+        if cur_fence is None or cur_fence != fencing_epoch or claim.fencing_epoch != fencing_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{command.assignment_id}' on task '{clean_task}'"
+            )
+
+        lineage = self.lineages.get(clean_task)
+        if (
+            lineage is None
+            or lineage.task_id != clean_task
+            or lineage.root_task_id != clean_root
+        ):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative lineage missing or inconsistent for task '{clean_task}'"
+            )
+        if is_child:
+            if lineage.parent_task_id != clean_parent:
+                raise TaskNotClaimableError("Child lineage parent mismatch: CHILD_LINEAGE_MISMATCH")
+        elif lineage.parent_task_id is not None:
+            raise TaskNotClaimableError("Non-child completion on child lineage: LINEAGE_KIND_MISMATCH")
+
+        if clean_task in self.terminal_outcomes:
+            raise CompletionConflictError(
+                f"Conflicting canonical outcome already exists for task '{clean_task}': OUTCOME_CONFLICT"
+            )
+        if clean_task in self.canonical_results:
+            raise CompletionConflictError(
+                f"Conflicting canonical result already exists for task '{clean_task}': RESULT_CONFLICT"
+            )
+        if (clean_task, command.assignment_id) in self.assignment_completions:
+            raise CompletionConflictError(
+                f"Conflicting assignment completion already exists for task '{clean_task}': AUDIT_CONFLICT"
+            )
+
+        parent_children: set[str] = set()
+        if is_child:
+            parent_status = self.statuses.get(clean_parent)
+            if parent_status is None:
+                raise TaskNotClaimableError("Parent task status missing: PARENT_STATUS_NOT_FOUND")
+            parent_lineage = self.lineages.get(clean_parent)
+            if parent_lineage is None:
+                raise TaskNotClaimableError("Parent lineage missing: PARENT_LINEAGE_NOT_FOUND")
+            if (
+                parent_lineage.task_id != clean_parent
+                or parent_lineage.root_task_id != clean_root
+                or parent_lineage.parent_task_id is not None
+            ):
+                raise CorruptAuthoritativeRecordError(
+                    f"Authoritative parent lineage inconsistent for '{clean_parent}'"
+                )
+            if parent_status != "waiting_for_children":
+                raise TaskNotClaimableError(
+                    f"Parent task '{clean_parent}' is not waiting for children: PARENT_NOT_WAITING"
+                )
+            parent_children = self.children.get(clean_parent, set())
+            if clean_task not in parent_children:
+                raise TaskNotClaimableError("Child not member of parent: CHILD_NOT_MEMBER")
+            continuation = self.continuations.get((clean_parent, 1))
+            if continuation is None:
+                raise TaskNotClaimableError("Parent continuation missing: MISSING_CONTINUATION")
+            if continuation.stage != "incorporate_analysis_child":
+                raise TaskNotClaimableError("Continuation stage mismatch: CONTINUATION_STAGE_MISMATCH")
+            if continuation.child_task_id != clean_task:
+                raise TaskNotClaimableError("Continuation child mismatch: CONTINUATION_CHILD_MISMATCH")
+            if continuation.continuation_version != 1:
+                raise TaskNotClaimableError("Continuation version mismatch: CONTINUATION_VERSION_MISMATCH")
+            if self.latest_continuation.get(clean_parent) != 1:
+                raise TaskNotClaimableError("Continuation latest mismatch: CONTINUATION_LATEST_MISMATCH")
+            if clean_task in self.child_markers:
+                raise CompletionConflictError(
+                    f"Child completion already projected for '{clean_task}': MARKER_CONFLICT"
+                )
+
+        outcome, result = build_terminal_outcome(
+            command=command,
+            task_id=clean_task,
+            runtime_principal_id=clean_principal,
+            bound_agent_id=clean_agent,
+            completed_at=now_iso,
+        )
+        audit = build_completion_audit(outcome=outcome, fencing_epoch=fencing_epoch)
+        record = CompletionRecord(
+            completion_command_id=command.completion_command_id,
+            task_id=clean_task,
+            assignment_id=command.assignment_id,
+            runtime_principal_id=clean_principal,
+            bound_agent_id=clean_agent,
+            execution_kind=command.execution_kind,
+            semantic_fingerprint=outcome.semantic_fingerprint,
+            proof_digest=clean_digest,
+            outcome_id=outcome.outcome_id,
+            continuation_version=command.continuation_version,
+        )
+
+        # Phase 2: mechanically non-failing commit
+        self.completion_records[record_key] = record
+        self.terminal_outcomes[clean_task] = outcome
+        if result is not None:
+            self.canonical_results[clean_task] = result
+        self.assignment_completions[(clean_task, command.assignment_id)] = audit
+        self.statuses[clean_task] = outcome.terminal_status
+        del self.claims[clean_task]
+        if is_child:
+            self.child_markers[clean_task] = {
+                "child_task_id": clean_task,
+                "completion_command_id": command.completion_command_id,
+                "completed_at": now_iso,
+                "outcome_id": outcome.outcome_id,
+            }
+            self.statuses[clean_parent] = "resumable"
+            self.hints.append(
+                WakeUpHint(
+                    hint_id=f"hint-{uuid4()}",
+                    capability="research",
+                    created_at=now_iso,
+                    execution_kind="resumed_continuation",
+                    task_id=clean_parent,
+                    expected_continuation_version=1,
+                )
+            )
+
+        return (outcome, result, False)
+
+    async def get_completion_record(
+        self,
+        task_id: str,
+        completion_command_id: str,
+    ) -> CompletionRecord | None:
+        return self.completion_records.get((str(task_id).strip(), str(completion_command_id).strip()))
+
+    async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None:
+        return self.terminal_outcomes.get(str(task_id).strip())
+
+    async def get_canonical_result(self, task_id: str) -> TaskResult | None:
+        clean_task = str(task_id).strip()
+        result = self.canonical_results.get(clean_task)
+        if result is not None and (
+            result.task_id != clean_task or result.status != "completed"
+        ):
+            raise CorruptAuthoritativeRecordError(
+                f"Canonical result is not bound to a completed turn of task '{clean_task}'"
+            )
+        return result
+
+    async def get_assignment_completion(
+        self,
+        task_id: str,
+        assignment_id: str,
+    ) -> AssignmentCompletionRecord | None:
+        return self.assignment_completions.get((str(task_id).strip(), str(assignment_id).strip()))
 
     async def get_delegation_proposal(
         self,

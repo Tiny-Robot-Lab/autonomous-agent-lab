@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from uuid import uuid4
 
 from agent_contracts import (
     AgentCapabilityMetadata,
@@ -10,6 +11,7 @@ from agent_contracts import (
     parse_health_probe_timeout,
     parse_heartbeat_interval,
 )
+from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
 from agent_policy import parse_provider_priority
 
 from research_agent.application.fallback import ResearchFallbackCoordinator
@@ -36,6 +38,13 @@ async def run_research_agent(
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.research")
     executor_name = os.getenv("RESEARCH_EXECUTOR", "stub")
     inference_provider_name = os.getenv("INFERENCE_PROVIDER", "stub")
+    orchestrator_base_url = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8080")
+    runtime_token = os.getenv("RUNTIME_TOKEN", "")
+    if not runtime_token.strip():
+        raise RuntimeError(
+            "RUNTIME_TOKEN must be set: the research agent claims and completes turns "
+            "only through the authenticated Orchestrator completion boundary"
+        )
     interval = (
         heartbeat_interval
         if heartbeat_interval is not None
@@ -54,6 +63,7 @@ async def run_research_agent(
     }
 
     bus = RedisBus(redis_url, queue_name=task_queue)
+    orchestrator = OrchestratorClient(orchestrator_base_url, runtime_token)
     fallback_coordinator = ResearchFallbackCoordinator(
         agent_id=agent_id,
         bus=bus,
@@ -65,7 +75,7 @@ async def run_research_agent(
         agent_id,
         bus,
         executor,
-        result_store=bus,
+        completion_client=orchestrator,
         inference_provider=providers[preferences[0]],
         fallback_coordinator=fallback_coordinator,
     )
@@ -108,7 +118,25 @@ async def run_research_agent(
             task = await bus.next_task()
             logger.info("Dispatching task %s to research processor", task.task_id)
             try:
-                await processor.run_once(task)
+                request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
+                assignment, proof = await orchestrator.claim_task(
+                    task.task_id, request_id, "research", "initial"
+                )
+                await orchestrator.acknowledge_assignment(
+                    task.task_id, assignment["assignment_id"], proof
+                )
+                await processor.run_once(
+                    task,
+                    assignment_id=assignment["assignment_id"],
+                    assignment_proof=proof,
+                    execution_kind="initial",
+                )
+            except CompletionSubmissionError as exc:
+                logger.warning(
+                    "Research task %s claim/acknowledge failed with error: %s; ready for next task",
+                    task.task_id,
+                    exc,
+                )
             except ResearchExecutionError as exc:
                 logger.warning(
                     "Research task %s processing failed with error: %s; ready for next task",

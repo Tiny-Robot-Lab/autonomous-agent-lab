@@ -8,7 +8,10 @@ import redis.asyncio as redis
 from agent_contracts import (
     ActiveClaim,
     AgentEvent,
+    AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    CompletionCommand,
+    CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
     FallbackTransition,
@@ -20,7 +23,11 @@ from agent_contracts import (
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    TaskResult,
+    TerminalOutcome,
     WakeUpHint,
+    build_completion_audit,
+    build_terminal_outcome,
     canonical_json_dumps,
     normalize_canonical_utc_timestamp,
 )
@@ -34,9 +41,11 @@ from orchestrator.application.ports import (
     ChildClaimDeadlineExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    CompletionConflictError,
     DelegationConflictError,
     FencingEpochRaceError,
     GrantAlreadyConsumedError,
+    InvalidClaimProofError,
     TaskAlreadyClaimedError,
     TaskNotClaimableError,
     TelemetryStorageError,
@@ -1094,6 +1103,316 @@ redis.call('SADD', decisions_key, delegation_decision_id)
 redis.call('RPUSH', hint_queue_key, pre_serialized_hint_json)
 
 return {'OK', pre_serialized_proposal_json}
+"""
+
+COMPLETE_TURN_LUA = """
+local completion_key = KEYS[1]
+local status_key = KEYS[2]
+local claim_key = KEYS[3]
+local fence_key = KEYS[4]
+local outcome_key = KEYS[5]
+local result_key = KEYS[6]
+local audit_key = KEYS[7]
+local lineage_key = KEYS[8]
+local parent_status_key = KEYS[9]
+local parent_children_key = KEYS[10]
+local continuation_key = KEYS[11]
+local continuation_latest_key = KEYS[12]
+local child_marker_key = KEYS[13]
+local hint_queue_key = KEYS[14]
+
+local task_id = ARGV[1]
+local assignment_id = ARGV[2]
+local principal_id = ARGV[3]
+local bound_agent_id = ARGV[4]
+local execution_kind = ARGV[5]
+local cont_ver_raw = ARGV[6]
+local epoch_raw = ARGV[7]
+local completion_command_id = ARGV[8]
+local semantic_fingerprint = ARGV[9]
+local proof_digest = ARGV[10]
+local terminal_status = ARGV[11]
+local failure_code = ARGV[12]
+local outcome_json = ARGV[13]
+local result_json = ARGV[14]
+local audit_json = ARGV[15]
+local parent_task_id = ARGV[16]
+local root_task_id = ARGV[17]
+local binding_json = ARGV[18]
+local hint_json = ARGV[19]
+local marker_json = ARGV[20]
+local status_json = ARGV[21]
+local parent_status_json = ARGV[22]
+
+local is_child = (execution_kind == 'delegated_child')
+
+local function key_type(key)
+    local t = redis.call('TYPE', key)
+    if type(t) == 'table' then return t['ok'] end
+    return tostring(t)
+end
+
+local function decode_object(raw)
+    local ok, tbl = pcall(cjson.decode, raw)
+    if not ok or type(tbl) ~= 'table' then return nil end
+    return tbl
+end
+
+local function has_cont_ver(stored_cv)
+    return stored_cv ~= nil and stored_cv ~= cjson.null
+end
+
+-- =============================================================================
+-- PHASE 1: Completion-Command Replay Check (FIRST STORE-LEVEL OPERATION)
+-- =============================================================================
+if redis.call('EXISTS', completion_key) == 1 then
+    if key_type(completion_key) ~= 'string' then return {'WRONG_KEY_TYPE_COMPLETION'} end
+    local stored = decode_object(redis.call('GET', completion_key))
+    if not stored then return {'CORRUPT_COMPLETION'} end
+    local stored_cv = stored['continuation_version']
+    local stored_has_cv = has_cont_ver(stored_cv)
+    local arg_has_cv = (cont_ver_raw ~= '')
+    local matches = (
+        stored['completion_command_id'] == completion_command_id and
+        stored['task_id'] == task_id and
+        stored['assignment_id'] == assignment_id and
+        stored['runtime_principal_id'] == principal_id and
+        stored['bound_agent_id'] == bound_agent_id and
+        stored['execution_kind'] == execution_kind and
+        stored['semantic_fingerprint'] == semantic_fingerprint and
+        stored_has_cv == arg_has_cv and
+        (not arg_has_cv or tonumber(stored_cv) == tonumber(cont_ver_raw))
+    )
+    if matches then
+        if key_type(outcome_key) ~= 'string' then return {'CORRUPT_OUTCOME'} end
+        local stored_outcome = decode_object(redis.call('GET', outcome_key))
+        if not stored_outcome then return {'CORRUPT_OUTCOME'} end
+        if stored_outcome['task_id'] ~= task_id then return {'CORRUPT_OUTCOME'} end
+        local stored_status = stored_outcome['terminal_status']
+        if stored_status ~= 'completed' and stored_status ~= 'failed' then
+            return {'CORRUPT_OUTCOME'}
+        end
+        local result_exists = (redis.call('EXISTS', result_key) == 1)
+        if stored_status == 'completed' and not result_exists then
+            return {'CORRUPT_RESULT'}
+        end
+        if stored_status == 'failed' and result_exists then
+            return {'CORRUPT_RESULT'}
+        end
+        local stored_result_raw = ''
+        if result_exists then
+            if key_type(result_key) ~= 'string' then return {'CORRUPT_RESULT'} end
+            stored_result_raw = redis.call('GET', result_key)
+            local stored_result_tbl = decode_object(stored_result_raw)
+            if not stored_result_tbl then return {'CORRUPT_RESULT'} end
+            if stored_result_tbl['task_id'] ~= task_id or stored_result_tbl['status'] ~= 'completed' then
+                return {'CORRUPT_RESULT'}
+            end
+        end
+        return {'IDEMPOTENT', redis.call('GET', outcome_key), stored_result_raw}
+    end
+    return {'COMMAND_CONFLICT'}
+end
+
+-- =============================================================================
+-- PHASE 1 (cont.): Strictly Read-Only Validations (Zero Mutations)
+-- =============================================================================
+
+-- Candidate input well-formedness: numerics, status/result consistency, JSON payloads
+local exp_epoch = tonumber(epoch_raw)
+if not exp_epoch or exp_epoch < 1 or math.floor(exp_epoch) ~= exp_epoch then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+local arg_cv = nil
+if cont_ver_raw ~= '' then
+    arg_cv = tonumber(cont_ver_raw)
+    if not arg_cv or arg_cv < 1 or math.floor(arg_cv) ~= arg_cv then
+        return {'CORRUPT_COMPLETION_INPUT'}
+    end
+end
+local has_result = (result_json ~= '')
+if has_result and terminal_status ~= 'completed' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if (not has_result) and terminal_status ~= 'failed' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if not decode_object(outcome_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(audit_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(binding_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(status_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if has_result then
+    local result_tbl = decode_object(result_json)
+    if not result_tbl then return {'CORRUPT_COMPLETION_INPUT'} end
+    if result_tbl['task_id'] ~= task_id then return {'RESULT_TASK_MISMATCH'} end
+    if result_tbl['status'] ~= 'completed' then return {'RESULT_STATUS_MISMATCH'} end
+end
+if is_child then
+    if not decode_object(hint_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+    if not decode_object(marker_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+    if not decode_object(parent_status_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+end
+
+-- Live task status must exist and be an eligible nonterminal working turn
+if redis.call('EXISTS', status_key) == 0 then
+    return {'TASK_NOT_FOUND'}
+end
+if key_type(status_key) ~= 'string' then return {'WRONG_KEY_TYPE_STATUS'} end
+local status_tbl = decode_object(redis.call('GET', status_key))
+if not status_tbl then return {'CORRUPT_STATUS'} end
+local cur_status = status_tbl['status']
+if type(cur_status) ~= 'string' or cur_status == '' then
+    return {'CORRUPT_STATUS'}
+end
+if status_tbl['task_id'] ~= task_id then
+    return {'CORRUPT_STATUS'}
+end
+if cur_status ~= 'working' then
+    return {'NOT_WORKING', cur_status}
+end
+
+-- Active claim must exist, be acknowledged, and bind every turn identity field
+if redis.call('EXISTS', claim_key) == 0 then
+    return {'CLAIM_NOT_FOUND'}
+end
+if key_type(claim_key) ~= 'string' then return {'WRONG_KEY_TYPE_CLAIM'} end
+local claim = decode_object(redis.call('GET', claim_key))
+if not claim then return {'CORRUPT_CLAIM'} end
+if claim['assignment_id'] ~= assignment_id then return {'ASSIGNMENT_MISMATCH'} end
+if claim['task_id'] ~= task_id then return {'TASK_MISMATCH'} end
+if claim['runtime_principal_id'] ~= principal_id then return {'PRINCIPAL_MISMATCH'} end
+if claim['bound_agent_id'] ~= bound_agent_id then return {'BOUND_AGENT_MISMATCH'} end
+if claim['execution_kind'] ~= execution_kind then return {'EXECUTION_KIND_MISMATCH'} end
+local claim_cv = claim['continuation_version']
+local claim_has_cv = has_cont_ver(claim_cv)
+if claim_has_cv ~= (arg_cv ~= nil) then return {'CONTINUATION_VERSION_MISMATCH'} end
+if arg_cv and tonumber(claim_cv) ~= arg_cv then return {'CONTINUATION_VERSION_MISMATCH'} end
+if claim['state'] ~= 'acknowledged' then return {'CLAIM_NOT_ACKNOWLEDGED'} end
+if claim['proof_digest'] ~= proof_digest then return {'PROOF_MISMATCH'} end
+
+-- Current fencing epoch must equal the claimed epoch and the presented epoch
+if redis.call('EXISTS', fence_key) == 0 then
+    return {'FENCE_NOT_FOUND'}
+end
+if key_type(fence_key) ~= 'string' then return {'WRONG_KEY_TYPE_FENCE'} end
+local cur_fence = tonumber(redis.call('GET', fence_key))
+if not cur_fence or cur_fence ~= exp_epoch then
+    return {'FENCE_MISMATCH', tostring(cur_fence)}
+end
+if tonumber(claim['fencing_epoch']) ~= exp_epoch then
+    return {'FENCE_MISMATCH', tostring(claim['fencing_epoch'])}
+end
+
+-- Authoritative lineage must bind the completing task (and its parent for children)
+if redis.call('EXISTS', lineage_key) == 0 then
+    return {'LINEAGE_NOT_FOUND'}
+end
+if key_type(lineage_key) ~= 'string' then return {'WRONG_KEY_TYPE_LINEAGE'} end
+local lineage = decode_object(redis.call('GET', lineage_key))
+if not lineage then return {'CORRUPT_LINEAGE'} end
+if lineage['task_id'] ~= task_id or lineage['root_task_id'] ~= root_task_id then
+    return {'CORRUPT_LINEAGE'}
+end
+local lineage_parent = lineage['parent_task_id']
+if is_child then
+    if lineage_parent ~= parent_task_id then return {'CHILD_LINEAGE_MISMATCH'} end
+else
+    if lineage_parent ~= cjson.null then return {'LINEAGE_KIND_MISMATCH'} end
+end
+
+-- No conflicting canonical outcome, result, or audit may already exist
+if redis.call('EXISTS', outcome_key) == 1 then
+    return {'OUTCOME_CONFLICT'}
+end
+if redis.call('EXISTS', result_key) == 1 then
+    return {'RESULT_CONFLICT'}
+end
+if redis.call('EXISTS', audit_key) == 1 then
+    return {'AUDIT_CONFLICT'}
+end
+
+-- Delegated-child parent projection preconditions
+if is_child then
+    if redis.call('EXISTS', parent_status_key) == 0 then
+        return {'PARENT_STATUS_NOT_FOUND'}
+    end
+    if key_type(parent_status_key) ~= 'string' then return {'WRONG_KEY_TYPE_PARENT_STATUS'} end
+    local parent_status = decode_object(redis.call('GET', parent_status_key))
+    if not parent_status then return {'CORRUPT_PARENT_STATUS'} end
+    if parent_status['task_id'] ~= parent_task_id then
+        return {'CORRUPT_PARENT_STATUS'}
+    end
+    if parent_status['status'] ~= 'waiting_for_children' then
+        return {'PARENT_NOT_WAITING', parent_status['status']}
+    end
+
+    if redis.call('EXISTS', parent_children_key) == 0 then
+        return {'CHILD_NOT_MEMBER'}
+    end
+    if key_type(parent_children_key) ~= 'set' then return {'WRONG_KEY_TYPE_CHILDREN'} end
+    if redis.call('SISMEMBER', parent_children_key, task_id) == 0 then
+        return {'CHILD_NOT_MEMBER'}
+    end
+
+    if redis.call('EXISTS', continuation_key) == 0 then
+        return {'MISSING_CONTINUATION'}
+    end
+    if key_type(continuation_key) ~= 'string' then return {'WRONG_KEY_TYPE_CONTINUATION'} end
+    local continuation = decode_object(redis.call('GET', continuation_key))
+    if not continuation then return {'CORRUPT_CONTINUATION'} end
+    if continuation['stage'] ~= 'incorporate_analysis_child' then
+        return {'CONTINUATION_STAGE_MISMATCH'}
+    end
+    if continuation['child_task_id'] ~= task_id then
+        return {'CONTINUATION_CHILD_MISMATCH'}
+    end
+    if tonumber(continuation['continuation_version']) ~= 1 then
+        return {'CONTINUATION_VERSION_MISMATCH'}
+    end
+    if redis.call('EXISTS', continuation_latest_key) == 0 then
+        return {'CONTINUATION_LATEST_MISMATCH'}
+    end
+    if key_type(continuation_latest_key) ~= 'string' then return {'WRONG_KEY_TYPE_CONTINUATION_LATEST'} end
+    if redis.call('GET', continuation_latest_key) ~= '1' then
+        return {'CONTINUATION_LATEST_MISMATCH'}
+    end
+
+    if redis.call('EXISTS', child_marker_key) == 1 then
+        return {'MARKER_CONFLICT'}
+    end
+
+    if redis.call('EXISTS', hint_queue_key) == 1 then
+        if key_type(hint_queue_key) ~= 'list' then return {'WRONG_KEY_TYPE_HINT_QUEUE'} end
+    end
+end
+
+-- =============================================================================
+-- PHASE 2: Write Commit (Prevalidated Writes Only)
+--
+-- Every value stored below was validated in read-only Phase 1, so this section
+-- performs only plain SET/DEL/RPUSH commands with pre-serialized values and no
+-- decoding, numeric conversion, or fallible branches. Redis executes the script
+-- atomically with respect to other clients, so concurrent completions observe
+-- either none or all of these writes. No claim is made about rollback after an
+-- unexpected command error, host failure, out-of-memory condition, or
+-- persistence failure: safety against THOSE hazards comes from keeping every
+-- expected validation rejection inside Phase 1, where zero mutation occurs.
+-- =============================================================================
+redis.call('SET', completion_key, binding_json)
+redis.call('SET', outcome_key, outcome_json)
+if has_result then
+    redis.call('SET', result_key, result_json)
+end
+redis.call('SET', audit_key, audit_json)
+redis.call('SET', status_key, status_json)
+redis.call('DEL', claim_key)
+if is_child then
+    redis.call('SET', child_marker_key, marker_json)
+    redis.call('SET', parent_status_key, parent_status_json)
+    redis.call('RPUSH', hint_queue_key, hint_json)
+end
+
+return {'OK', outcome_json, result_json}
 """
 
 ACKNOWLEDGE_CLAIM_LUA = """
@@ -2272,6 +2591,380 @@ class RedisGateway:
 
         raise RuntimeError(f"Unexpected accept_delegation_proposal result code: {code}")
 
+    async def complete_turn(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        proof_digest: str,
+        fencing_epoch: int,
+        parent_task_id: str | None,
+        root_task_id: str,
+        completed_at: str,
+        runtime_principal_id: str,
+        bound_agent_id: str,
+    ) -> tuple[TerminalOutcome, TaskResult | None, bool]:
+        """Commit a fenced turn completion via COMPLETE_TURN_LUA.
+
+        Builds the canonical outcome, result, audit, replay-record, status,
+        hint, and marker payloads from the validated command, then commits
+        them in one single-node Lua script. All expected type, decode,
+        authorization, fencing, conflict, lifecycle, and policy failures are
+        rejected in read-only Phase 1 with zero mutation; Phase 2 performs
+        only prevalidated Redis writes. Redis serializes script execution
+        atomically with respect to other clients. No rollback is claimed for
+        unexpected command errors, host failures, out-of-memory conditions,
+        or persistence failures. For non-child turns the
+        parent/projection KEYS alias the completing task's own keys and are
+        never read or written by the non-child script path.
+        """
+        clean_task = str(task_id).strip()
+        clean_root = str(root_task_id).strip()
+        if not clean_task or not clean_root:
+            raise ValueError("task_id and root_task_id must be non-empty strings")
+        if type(fencing_epoch) is bool or not isinstance(fencing_epoch, int):
+            raise TypeError("fencing_epoch must be an int")
+        clean_principal = str(runtime_principal_id).strip()
+        clean_agent = str(bound_agent_id).strip()
+        clean_digest = str(proof_digest).strip()
+        if not clean_principal or not clean_agent or not clean_digest:
+            raise ValueError("runtime_principal_id, bound_agent_id, and proof_digest must be non-empty strings")
+
+        now_iso = (
+            normalize_canonical_utc_timestamp(completed_at)
+            if (completed_at and str(completed_at).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+
+        if command.completed_result is not None:
+            if command.completed_result.task_id != clean_task:
+                raise ValueError(
+                    f"Completed TaskResult task_id '{command.completed_result.task_id}' "
+                    f"does not match completion task '{clean_task}'"
+                )
+            if command.completed_result.status != "completed":
+                raise ValueError(
+                    f"Completed TaskResult status must be 'completed' for task '{clean_task}'"
+                )
+
+        outcome, result = build_terminal_outcome(
+            command=command,
+            task_id=clean_task,
+            runtime_principal_id=clean_principal,
+            bound_agent_id=clean_agent,
+            completed_at=now_iso,
+        )
+        audit = build_completion_audit(outcome=outcome, fencing_epoch=fencing_epoch)
+        record = CompletionRecord(
+            completion_command_id=command.completion_command_id,
+            task_id=clean_task,
+            assignment_id=command.assignment_id,
+            runtime_principal_id=clean_principal,
+            bound_agent_id=clean_agent,
+            execution_kind=command.execution_kind,
+            semantic_fingerprint=outcome.semantic_fingerprint,
+            proof_digest=clean_digest,
+            outcome_id=outcome.outcome_id,
+            continuation_version=command.continuation_version,
+        )
+
+        is_child = command.execution_kind == "delegated_child"
+        clean_parent = str(parent_task_id).strip() if parent_task_id else ""
+        if is_child and not clean_parent:
+            raise ValueError("parent_task_id is required for delegated_child completion")
+
+        status_json = canonical_json_dumps({
+            "status": outcome.terminal_status,
+            "task_id": clean_task,
+        })
+
+        if is_child:
+            parent_status_key = f"task.status:{clean_parent}"
+            parent_children_key = f"task.children:{clean_parent}"
+            continuation_key = f"task.continuation:{clean_parent}:1"
+            continuation_latest_key = f"task.continuation_latest:{clean_parent}"
+            child_marker_key = f"task.child_completion:{clean_task}"
+            hint_queue_key = "agent.hints.research"
+            hint = WakeUpHint(
+                hint_id=f"hint-{uuid4()}",
+                capability="research",
+                created_at=now_iso,
+                execution_kind="resumed_continuation",
+                task_id=clean_parent,
+                expected_continuation_version=1,
+            )
+            hint_json = hint.to_json()
+            marker_json = canonical_json_dumps({
+                "child_task_id": clean_task,
+                "completion_command_id": command.completion_command_id,
+                "completed_at": now_iso,
+                "outcome_id": outcome.outcome_id,
+            })
+            parent_status_json = canonical_json_dumps({
+                "status": "resumable",
+                "task_id": clean_parent,
+                "updated_at": now_iso,
+            })
+        else:
+            parent_status_key = f"task.status:{clean_task}"
+            parent_children_key = f"task.children:{clean_task}"
+            continuation_key = f"task.continuation:{clean_task}:1"
+            continuation_latest_key = f"task.continuation_latest:{clean_task}"
+            child_marker_key = f"task.child_completion:{clean_task}"
+            hint_queue_key = "agent.hints.research"
+            hint_json = ""
+            marker_json = ""
+            parent_status_json = ""
+
+        keys = [
+            f"task.completion:{clean_task}:{command.completion_command_id}",
+            f"task.status:{clean_task}",
+            f"task.claim:{clean_task}",
+            f"task.fence:{clean_task}",
+            f"task.outcome:{clean_task}",
+            f"task.result:{clean_task}",
+            f"task.assignment_completion:{clean_task}:{command.assignment_id}",
+            f"task.lineage:{clean_task}",
+            parent_status_key,
+            parent_children_key,
+            continuation_key,
+            continuation_latest_key,
+            child_marker_key,
+            hint_queue_key,
+        ]
+
+        argv = [
+            clean_task,
+            command.assignment_id,
+            clean_principal,
+            clean_agent,
+            command.execution_kind,
+            "" if command.continuation_version is None else str(command.continuation_version),
+            str(fencing_epoch),
+            command.completion_command_id,
+            outcome.semantic_fingerprint,
+            clean_digest,
+            outcome.terminal_status,
+            "" if outcome.failure_code is None else outcome.failure_code,
+            outcome.to_json(),
+            "" if result is None else result.to_json(),
+            audit.to_json(),
+            clean_parent,
+            clean_root,
+            record.to_json(),
+            hint_json,
+            marker_json,
+            status_json,
+            parent_status_json,
+        ]
+
+        raw_res = await self._client.eval(COMPLETE_TURN_LUA, len(keys), *keys, *argv)
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis complete_turn response: {raw_res}")
+
+        def _s(val: object) -> str:
+            return val if isinstance(val, str) else val.decode("utf-8")  # type: ignore[union-attr]
+
+        code = _s(raw_res[0])
+
+        if code in ("OK", "IDEMPOTENT"):
+            outcome_raw = _s(raw_res[1]) if len(raw_res) > 1 else ""
+            result_raw = _s(raw_res[2]) if len(raw_res) > 2 else ""
+            try:
+                stored_outcome = TerminalOutcome.from_json(outcome_raw)
+                stored_result = TaskResult.from_json(result_raw) if result_raw else None
+            except (ValueError, TypeError) as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt canonical completion payload for task '{clean_task}': {code}"
+                ) from exc
+            if stored_outcome.task_id != clean_task:
+                raise CorruptAuthoritativeRecordError(
+                    f"Canonical outcome task mismatch for task '{clean_task}': {code}"
+                )
+            if stored_outcome.terminal_status == "completed":
+                if stored_result is None:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Canonical result missing for completed task '{clean_task}': {code}"
+                    )
+                if stored_result.task_id != clean_task or stored_result.status != "completed":
+                    raise CorruptAuthoritativeRecordError(
+                        f"Canonical result inconsistent for task '{clean_task}': {code}"
+                    )
+            elif stored_result is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Unexpected canonical result for failed task '{clean_task}': {code}"
+                )
+            return (stored_outcome, stored_result, code == "IDEMPOTENT")
+
+        if code == "COMMAND_CONFLICT":
+            raise CompletionConflictError(
+                f"Completion command '{command.completion_command_id}' on task '{clean_task}' "
+                "conflicts with the already-accepted semantic payload"
+            )
+
+        if code in ("OUTCOME_CONFLICT", "RESULT_CONFLICT", "AUDIT_CONFLICT", "MARKER_CONFLICT"):
+            raise CompletionConflictError(
+                f"Conflicting canonical completion state already exists for task '{clean_task}': {code}"
+            )
+
+        if code in ("RESULT_TASK_MISMATCH", "RESULT_STATUS_MISMATCH"):
+            raise ValueError(
+                f"Completed TaskResult is not bound to task '{clean_task}': {code}"
+            )
+
+        if code == "NOT_WORKING":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            if cur_s in ("completed", "failed"):
+                raise CompletionConflictError(
+                    f"Task '{clean_task}' already reached canonical terminal status '{cur_s}'"
+                )
+            raise TaskNotClaimableError(
+                f"Task '{clean_task}' is not in an eligible working turn (status '{cur_s}')"
+            )
+
+        if code == "TASK_NOT_FOUND":
+            raise TaskNotClaimableError(f"Task '{clean_task}' not found")
+
+        if code in (
+            "CLAIM_NOT_FOUND",
+            "ASSIGNMENT_MISMATCH",
+            "PRINCIPAL_MISMATCH",
+            "BOUND_AGENT_MISMATCH",
+            "TASK_MISMATCH",
+            "CLAIM_NOT_ACKNOWLEDGED",
+        ):
+            raise ClaimNotFoundError(
+                f"Active acknowledged claim for assignment '{command.assignment_id}' "
+                f"on task '{clean_task}' not found: {code}"
+            )
+
+        if code == "PROOF_MISMATCH":
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        if code in ("FENCE_NOT_FOUND", "FENCE_MISMATCH"):
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{command.assignment_id}' on task '{clean_task}': {code}"
+            )
+
+        if code in (
+            "EXECUTION_KIND_MISMATCH",
+            "CONTINUATION_VERSION_MISMATCH",
+            "CONTINUATION_LATEST_MISMATCH",
+            "CONTINUATION_STAGE_MISMATCH",
+            "CONTINUATION_CHILD_MISMATCH",
+            "LINEAGE_KIND_MISMATCH",
+            "CHILD_LINEAGE_MISMATCH",
+            "CHILD_NOT_MEMBER",
+            "MISSING_CONTINUATION",
+            "PARENT_STATUS_NOT_FOUND",
+            "PARENT_NOT_WAITING",
+            "LINEAGE_NOT_FOUND",
+            "PARENT_LINEAGE_NOT_FOUND",
+        ):
+            raise TaskNotClaimableError(
+                f"Completion preconditions not satisfied for task '{clean_task}': {code}"
+            )
+
+        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_")):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative record corruption detected on task '{clean_task}': {code}"
+            )
+
+        raise RuntimeError(f"Unexpected complete_turn result code: {code}")
+
+    async def get_completion_record(
+        self,
+        task_id: str,
+        completion_command_id: str,
+    ) -> CompletionRecord | None:
+        clean_task = str(task_id).strip()
+        clean_cmd = str(completion_command_id).strip()
+        if not clean_task or not clean_cmd:
+            return None
+        try:
+            raw = await self._client.get(f"task.completion:{clean_task}:{clean_cmd}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt completion record at task.completion:{clean_task}:{clean_cmd}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            return CompletionRecord.from_json(raw)
+        except (ValueError, TypeError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt completion record at task.completion:{clean_task}:{clean_cmd}"
+            ) from exc
+
+    async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None:
+        clean_task = str(task_id).strip()
+        if not clean_task:
+            return None
+        try:
+            raw = await self._client.get(f"task.outcome:{clean_task}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt terminal outcome at task.outcome:{clean_task}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            return TerminalOutcome.from_json(raw)
+        except (ValueError, TypeError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt terminal outcome at task.outcome:{clean_task}"
+            ) from exc
+
+    async def get_canonical_result(self, task_id: str) -> TaskResult | None:
+        clean_task = str(task_id).strip()
+        if not clean_task:
+            return None
+        try:
+            raw = await self._client.get(f"task.result:{clean_task}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt canonical result at task.result:{clean_task}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            result = TaskResult.from_json(raw)
+        except (ValueError, TypeError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt canonical result at task.result:{clean_task}"
+            ) from exc
+        if result.task_id != clean_task or result.status != "completed":
+            raise CorruptAuthoritativeRecordError(
+                f"Canonical result at task.result:{clean_task} is not bound to a "
+                "completed turn of the requested task"
+            )
+        return result
+
+    async def get_assignment_completion(
+        self,
+        task_id: str,
+        assignment_id: str,
+    ) -> AssignmentCompletionRecord | None:
+        clean_task = str(task_id).strip()
+        clean_assign = str(assignment_id).strip()
+        if not clean_task or not clean_assign:
+            return None
+        try:
+            raw = await self._client.get(
+                f"task.assignment_completion:{clean_task}:{clean_assign}"
+            )
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt assignment completion at task.assignment_completion:{clean_task}:{clean_assign}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            return AssignmentCompletionRecord.from_json(raw)
+        except (ValueError, TypeError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt assignment completion at task.assignment_completion:{clean_task}:{clean_assign}"
+            ) from exc
+
     async def get_delegation_proposal(
         self,
         parent_task_id: str,
@@ -2380,27 +3073,111 @@ class RedisGateway:
         await self.dispatch(task, queue_name)
 
     async def get_result(self, task_id: str) -> dict[str, Any] | None:
-        raw_result = await self._client.get(f"task.result:{task_id}")
-        if raw_result is not None:
-            return json.loads(raw_result)
+        """Read task completion state with the canonical outcome as authority.
 
-        raw_status = await self._client.get(f"task.status:{task_id}")
-        if raw_status is not None:
-            status_data = json.loads(raw_status)
+        Governed by Issue #222:
+        - A canonical TerminalOutcome controls completed/failed state, and its
+          task identity is validated against the requested task;
+        - completed outcomes require the canonical TaskResult to exist, be a
+          string key holding valid JSON, satisfy the TaskResult contract, and
+          bind to the requested task with completed status — any violation
+          fails closed instead of fabricating output;
+        - failed outcomes require no canonical TaskResult; an unexpected result
+          key fails closed;
+        - agent.events are observational only and are never a canonical fallback;
+        - legacy task.result records written before the completion boundary
+          remain readable with task-ID binding validation.
+        """
+        clean_task_id = str(task_id).strip()
+        if not clean_task_id:
+            return None
+
+        try:
+            raw_outcome = await self._client.get(f"task.outcome:{clean_task_id}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt terminal outcome at task.outcome:{clean_task_id}"
+            ) from exc
+        if raw_outcome is not None:
+            try:
+                outcome = TerminalOutcome.from_json(raw_outcome)
+            except (ValueError, TypeError) as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt terminal outcome at task.outcome:{clean_task_id}"
+                ) from exc
+            if outcome.task_id != clean_task_id:
+                raise CorruptAuthoritativeRecordError(
+                    f"Terminal outcome at task.outcome:{clean_task_id} "
+                    "is not bound to the requested task"
+                )
+            if outcome.terminal_status == "completed":
+                result = await self.get_canonical_result(clean_task_id)
+                if result is None:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Canonical result missing for completed task '{clean_task_id}'; "
+                        "refusing to fabricate output"
+                    )
+                return result.to_dict()
+            try:
+                unexpected = await self._client.get(f"task.result:{clean_task_id}")
+            except redis.exceptions.ResponseError as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt canonical result at task.result:{clean_task_id}"
+                ) from exc
+            if unexpected is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Unexpected canonical result for failed task '{clean_task_id}'"
+                )
             return {
-                "task_id": task_id,
-                "status": status_data.get("status", "pending"),
+                "task_id": clean_task_id,
+                "status": "failed",
                 "output": None,
             }
 
-        events = await self.events(limit=100)
-        matching = [e for e in events if e.get("task_id") == task_id and e.get("state") is not None]
-        if matching:
-            latest = matching[0]
-            state = latest.get("state", "pending")
+        try:
+            raw_result = await self._client.get(f"task.result:{clean_task_id}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt legacy result at task.result:{clean_task_id}"
+            ) from exc
+        if raw_result is not None:
+            try:
+                legacy_data = json.loads(raw_result)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt legacy result at task.result:{clean_task_id}"
+                ) from exc
+            if (
+                not isinstance(legacy_data, dict)
+                or not isinstance(legacy_data.get("task_id"), str)
+                or legacy_data.get("task_id") != clean_task_id
+            ):
+                raise CorruptAuthoritativeRecordError(
+                    f"Legacy result at task.result:{clean_task_id} "
+                    "is not bound to the requested task"
+                )
+            return legacy_data
+
+        try:
+            raw_status = await self._client.get(f"task.status:{clean_task_id}")
+        except redis.exceptions.ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt task status at task.status:{clean_task_id}"
+            ) from exc
+        if raw_status is not None:
+            try:
+                status_data = json.loads(raw_status)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt task status at task.status:{clean_task_id}"
+                ) from exc
+            if not isinstance(status_data, dict):
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt task status at task.status:{clean_task_id}"
+                )
             return {
-                "task_id": task_id,
-                "status": "pending" if state == "working" else state,
+                "task_id": clean_task_id,
+                "status": status_data.get("status", "pending"),
                 "output": None,
             }
 

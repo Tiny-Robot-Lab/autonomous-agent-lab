@@ -3,7 +3,7 @@ from .ports import (
     MessageBus,
     ResearchExecutor,
     ResearchSynthesizer,
-    ResultStore,
+    TurnCompletionClient,
 )
 from .processor import ResearchExecutionError, ResearchProcessor
 
@@ -14,5 +14,5 @@ __all__ = [
     "ResearchExecutor",
     "ResearchProcessor",
     "ResearchSynthesizer",
-    "ResultStore",
+    "TurnCompletionClient",
 ]

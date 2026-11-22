@@ -81,6 +81,10 @@ class TaskResult:
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "TaskResult":
+        allowed = {"task_id", "output", "status", "acknowledged", "sources"}
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise ValueError(f"Unexpected fields in TaskResult: {sorted(unexpected)}")
         raw_sources = data.get("sources")
         sources_list: list[dict[str, object]] | None = None
         if isinstance(raw_sources, list):

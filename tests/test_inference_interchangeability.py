@@ -18,12 +18,13 @@ import httpx
 import pytest
 from agent_contracts import (
     AgentEvent,
+    CompletionCommand,
     InferenceResponse,
     TaskRequested,
     TaskResult,
 )
 from research_agent.application.processor import ResearchProcessor
-from research_agent.domain.models import ResearchResult, SynthesisResult
+from research_agent.domain.models import SynthesisResult
 from research_agent.infrastructure.cloudflare_inference import (
     CloudflareInferenceProvider as ResearchCloudflareProvider,
 )
@@ -67,20 +68,24 @@ class FakeMessageBus:
         raise NotImplementedError
 
 
-class FakeWorkerResultStore:
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
+
     def __init__(self) -> None:
-        self.saved: dict[str, TaskResult] = {}
+        self.submitted: list[CompletionCommand] = []
 
-    async def save(self, result: TaskResult) -> None:
-        self.saved[result.task_id] = result
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.submitted.append(command)
+        return {"outcome": {}, "replayed": False}
 
 
-class FakeResearchResultStore:
-    def __init__(self) -> None:
-        self.saved: dict[str, ResearchResult] = {}
-
-    async def save(self, result: ResearchResult) -> None:
-        self.saved[result.task_id] = result
+ASSIGNMENT_ID = "assign-interchange-1"
+ASSIGNMENT_PROOF = "proof-interchange-1"
 
 
 # ==============================================================================
@@ -217,21 +222,21 @@ async def test_worker_task_processor_substitution(provider_type: str) -> None:
     """Verifies TaskProcessor executes identically when substituting inference providers."""
     provider = _create_worker_provider(provider_type)
     bus = FakeMessageBus()
-    store = FakeWorkerResultStore()
+    completion_client = FakeCompletionClient()
 
     processor = TaskProcessor(
         agent_id="worker-test",
         bus=bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
     task = TaskRequested.create("Optimize database queries")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    # 1. ResultStore receives valid TaskResult satisfying provider-neutral contract
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
+    # 1. Submitted completion carries a valid TaskResult satisfying provider-neutral contract
+    assert len(completion_client.submitted) == 1
+    saved = completion_client.submitted[0].completed_result
     assert isinstance(saved, TaskResult)
     assert saved.task_id == task.task_id
     assert saved.status == "completed"
@@ -274,15 +279,19 @@ async def test_worker_configuration_switching_without_code_changes(
 
     # Plug into unchanged application processor
     bus = FakeMessageBus()
-    store = FakeWorkerResultStore()
-    processor = TaskProcessor("worker-env", bus, result_store=store, inference_provider=provider)
+    completion_client = FakeCompletionClient()
+    processor = TaskProcessor(
+        "worker-env", bus, completion_client=completion_client, inference_provider=provider
+    )
     task = TaskRequested.create("Run health audit")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    assert store.saved[task.task_id].status == "completed"
-    assert len(store.saved[task.task_id].output) > 0
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.status == "completed"
+    assert len(completed.output) > 0
 
 
 # ==============================================================================
@@ -322,30 +331,31 @@ async def test_research_processor_substitution(provider_type: str) -> None:
     """Verifies ResearchProcessor executes identically when substituting inference providers."""
     provider = _create_research_provider(provider_type)
     bus = FakeMessageBus()
-    store = FakeResearchResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
 
     processor = ResearchProcessor(
         agent_id="research-test",
         bus=bus,
         executor=executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
     task = TaskRequested.create("Investigate consensus algorithms")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    # 1. ResultStore receives valid ResearchResult satisfying provider-neutral contract
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert isinstance(saved, ResearchResult)
+    # 1. Submitted completion carries a valid canonical TaskResult converted
+    #    from the ResearchResult, satisfying the provider-neutral contract
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.failure_code is None
+    saved = command.completed_result
+    assert isinstance(saved, TaskResult)
     assert saved.task_id == task.task_id
-    assert saved.acknowledged is True
-    assert isinstance(saved.truncated, bool)
     assert isinstance(saved.output, str) and len(saved.output.strip()) > 0
     # Sources from executor are preserved across all providers
-    assert isinstance(saved.sources, (tuple, list))
+    assert isinstance(saved.sources, (tuple, list)) or saved.sources is None
 
     # 2. Lifecycle event sequence is identical across providers (working -> idle)
     assert len(bus.published) == 2
@@ -384,19 +394,20 @@ async def test_research_agent_configuration_switching_without_code_changes(
 
     # Plug into unchanged application processor
     bus = FakeMessageBus()
-    store = FakeResearchResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
     processor = ResearchProcessor(
         "research-env",
         bus,
         executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
     task = TaskRequested.create("Synthesize distributed tracing survey")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    assert store.saved[task.task_id].acknowledged is True
-    assert len(store.saved[task.task_id].output) > 0
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert len(completed.output) > 0

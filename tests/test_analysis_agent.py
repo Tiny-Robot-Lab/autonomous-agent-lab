@@ -1,5 +1,7 @@
+from typing import Any
+
 import pytest
-from agent_contracts import AgentEvent, TaskRequested, TaskResult
+from agent_contracts import AgentEvent, CompletionCommand, TaskRequested, TaskResult
 from analysis_agent.application.processor import AnalysisExecutionError, AnalysisProcessor
 from analysis_agent.domain.analysis import AnalysisReport, analyze_material
 from analysis_agent.infrastructure.deterministic_analyzer import (
@@ -15,12 +17,26 @@ class FakeMessageBus:
         self.published.append(event)
 
 
-class FakeResultStore:
-    def __init__(self) -> None:
-        self.saved: list[TaskResult] = []
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
 
-    async def save(self, result: TaskResult) -> None:
-        self.saved.append(result)
+    def __init__(self) -> None:
+        self.submitted: list[CompletionCommand] = []
+        self.proofs: list[str] = []
+
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.submitted.append(command)
+        self.proofs.append(assignment_proof)
+        return {"outcome": {}, "replayed": False}
+
+
+ASSIGNMENT_ID = "assign-analysis-1"
+ASSIGNMENT_PROOF = "proof-analysis-1"
 
 
 def test_analyze_material_reports_structure_terms_and_questions() -> None:
@@ -94,52 +110,61 @@ def test_analyze_material_rejects_non_string_material() -> None:
 
 
 @pytest.mark.anyio
-async def test_analysis_processor_persists_result_between_working_and_idle() -> None:
+async def test_analysis_processor_submits_delegated_child_completion() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     task = TaskRequested.create("The rover maps caves. The rover records samples?")
     processor = AnalysisProcessor(
         "analysis-agent-1",
         bus,
         DeterministicMaterialAnalyzer(),
-        store,
+        completion_client=completion_client,
     )
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert [event.state for event in bus.published] == ["working", "idle"]
     assert [event.task_id for event in bus.published] == [task.task_id, task.task_id]
-    assert store.saved == [
-        TaskResult(
-            task_id=task.task_id,
-            output=(
-                "Analysis report\n"
-                "Paragraphs: 1\n"
-                "Sentences: 2\n"
-                "Words: 8\n"
-                "Repeated terms: rover (2)\n"
-                "Question sentences:\n"
-                "- The rover records samples?\n"
-                "Scope: Only supplied material was analyzed; no retrieval was performed."
-            ),
-        )
-    ]
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.execution_kind == "delegated_child"
+    assert command.failure_code is None
+    assert command.completed_result == TaskResult(
+        task_id=task.task_id,
+        output=(
+            "Analysis report\n"
+            "Paragraphs: 1\n"
+            "Sentences: 2\n"
+            "Words: 8\n"
+            "Repeated terms: rover (2)\n"
+            "Question sentences:\n"
+            "- The rover records samples?\n"
+            "Scope: Only supplied material was analyzed; no retrieval was performed."
+        ),
+    )
+    assert completion_client.proofs == [ASSIGNMENT_PROOF]
 
 
 @pytest.mark.anyio
-async def test_analysis_processor_failure_emits_error_without_idle_or_result() -> None:
+async def test_analysis_processor_failure_emits_error_and_safe_failure_code() -> None:
     class FailingAnalyzer:
         def analyze(self, material: str) -> AnalysisReport:
             raise RuntimeError("analysis failed")
 
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     task = TaskRequested.create("Material that cannot be analyzed.")
-    processor = AnalysisProcessor("analysis-agent-1", bus, FailingAnalyzer(), store)
+    processor = AnalysisProcessor(
+        "analysis-agent-1", bus, FailingAnalyzer(), completion_client=completion_client
+    )
 
     with pytest.raises(AnalysisExecutionError, match=task.task_id):
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert [event.state for event in bus.published] == ["working", "error"]
     assert [event.task_id for event in bus.published] == [task.task_id, task.task_id]
-    assert store.saved == []
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.failure_code == "EXECUTION_FAILED"
+    assert command.completed_result is None
+    assert "analysis failed" not in command.to_json()

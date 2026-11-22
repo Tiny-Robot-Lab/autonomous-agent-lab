@@ -6,8 +6,10 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 import redis.asyncio as redis
+import uvicorn
 from agent_contracts import (
     ActiveClaim,
     AgentCapabilityMetadata,
@@ -27,6 +29,7 @@ from agent_contracts import (
     compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
 )
+from agent_infrastructure import OrchestratorClient
 from analysis_agent.application.processor import AnalysisProcessor
 from analysis_agent.infrastructure.deterministic_analyzer import (
     DeterministicMaterialAnalyzer,
@@ -44,6 +47,8 @@ from orchestrator.application.ports import (
     TaskNotClaimableError,
     WaveBudgetExceededError,
 )
+from orchestrator.config import Settings
+from orchestrator.domain.principal import compute_token_digest
 from orchestrator.domain.task import (
     ConflictingAuthorityGrantError,
     ConflictingChildTaskRegistrationError,
@@ -57,9 +62,8 @@ from orchestrator.domain.task import (
     TaskLineage,
 )
 from orchestrator.infrastructure.redis_adapter import CLAIM_TASK_LUA, RedisGateway
+from orchestrator.presentation.api import create_app
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
-from research_agent.domain.models import ResearchResult
-from research_agent.infrastructure.redis_bus import RedisBus as ResearchRedisBus
 from worker.infrastructure.redis_bus import RedisBus as WorkerRedisBus
 
 pytestmark = [pytest.mark.anyio, pytest.mark.redis]
@@ -189,9 +193,71 @@ async def test_redis_task_dispatch_and_consumption_round_trip(clean_redis: str) 
         await bus.aclose()
 
 
+RUNTIME_CREDENTIAL_PEPPER = "test_redis_runtime_pepper_secret_1234567890"
+REDIS_PROOF_PEPPER = "test_redis_proof_pepper_4567890123456789"
+RESEARCH_RUNTIME_TOKEN = "secret-research-token-redis-1"
+ANALYSIS_RUNTIME_TOKEN = "secret-analysis-token-redis-1"
+
+ANALYSIS_MATERIAL = "The rover maps caves. The rover records samples. Does the map show water?"
+EXPECTED_ANALYSIS_REPORT = (
+    "Analysis report\n"
+    "Paragraphs: 1\n"
+    "Sentences: 3\n"
+    "Words: 13\n"
+    "Repeated terms: rover (2)\n"
+    "Question sentences:\n"
+    "- Does the map show water?\n"
+    "Scope: Only supplied material was analyzed; no retrieval was performed."
+)
+
+
+def _redis_principals_config() -> dict[str, dict[str, object]]:
+    return {
+        "principal-research-1": {
+            "principal_id": "principal-research-1",
+            "bound_agent_id": "research-agent-1",
+            "authorized_capabilities": ["research"],
+            "token_digest": compute_token_digest(RESEARCH_RUNTIME_TOKEN, RUNTIME_CREDENTIAL_PEPPER),
+            "active": True,
+        },
+        "principal-analysis-1": {
+            "principal_id": "principal-analysis-1",
+            "bound_agent_id": "analysis-agent-1",
+            "authorized_capabilities": ["analysis"],
+            "token_digest": compute_token_digest(ANALYSIS_RUNTIME_TOKEN, RUNTIME_CREDENTIAL_PEPPER),
+            "active": True,
+        },
+    }
+
+
+async def _serve_orchestrator(app: object) -> tuple[str, uvicorn.Server, asyncio.Task[None]]:
+    """Serve the production Orchestrator app over loopback HTTP for the real client."""
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    server = uvicorn.Server(config)
+    serve_task = asyncio.create_task(server.serve())
+    async with asyncio.timeout(15):
+        while not server.started:
+            await asyncio.sleep(0.01)
+    sockets = server.servers[0].sockets if server.servers else []
+    assert sockets, "test Orchestrator server failed to bind"
+    port = sockets[0].getsockname()[1]
+    return f"http://127.0.0.1:{port}", server, serve_task
+
+
 async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
     clean_redis: str,
 ) -> None:
+    """Complete authenticated Analysis runtime lifecycle on real Redis.
+
+    Exercises the production path end to end: authoritative record setup,
+    research pull-claim/acknowledge, artifact staging, delegation acceptance,
+    legacy-push child delivery, Analysis pull-claim/acknowledge, processor
+    execution, and fenced completion through the live HTTP Orchestrator
+    boundary. Asserts the canonical TerminalOutcome, TaskResult, terminal
+    status, assignment-completion audit, active-claim retirement, exactly-once
+    parent projection with a single Research hint, and that agent events stay
+    observational.
+    """
     gateway = RedisGateway(clean_redis)
     bus = AnalysisRedisBus(clean_redis)
     agent_id = f"analysis-agent-{uuid.uuid4().hex[:8]}"
@@ -202,23 +268,129 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
         providers={"analysis_engine": "deterministic"},
         dispatch_target="agent.tasks.analysis",
     )
-    task = TaskRequested.create(
-        "The rover maps caves. The rover records samples. Does the map show water?"
+    parent_id = f"task-redis-parent-{uuid.uuid4().hex[:8]}"
+
+    settings = Settings(
+        redis_url=clean_redis,
+        app_env="test",
+        claim_delivery_lease_seconds=30.0,
+        child_claim_deadline_seconds=120.0,
+        runtime_credential_pepper=RUNTIME_CREDENTIAL_PEPPER,
+        assignment_proof_pepper=REDIS_PROOF_PEPPER,
+        runtime_principals=_redis_principals_config(),
     )
+    app = create_app(settings, gateway=gateway, task_store=gateway, dispatcher=gateway)
+    server: uvicorn.Server | None = None
+    serve_task: asyncio.Task[None] | None = None
+    base_url, server, serve_task = await _serve_orchestrator(app)
+    research_client = OrchestratorClient(base_url, RESEARCH_RUNTIME_TOKEN)
+    analysis_client = OrchestratorClient(base_url, ANALYSIS_RUNTIME_TOKEN)
     processor = AnalysisProcessor(
         agent_id,
         bus,
         DeterministicMaterialAnalyzer(),
-        bus,
+        completion_client=analysis_client,
     )
 
     try:
+        # 1. Authoritative parent records required for claim.
+        now = datetime.now(UTC).isoformat()
+        parent_task = TaskRequested(
+            task_id=parent_id,
+            root_task_id=parent_id,
+            parent_task_id=None,
+            prompt="Redis research question",
+            created_at=now,
+            version=2,
+        )
+        await gateway.register_root_task(parent_task, required_capability="research")
+        await gateway.update_status(parent_id, "pending")
+
+        # 2-3. Research pull-claim and acknowledge through the Orchestrator boundary.
+        parent_assignment, parent_proof = await research_client.claim_task(
+            parent_id, f"req-{parent_id}-research", "research", "initial"
+        )
+        await research_client.acknowledge_assignment(
+            parent_id, parent_assignment["assignment_id"], parent_proof
+        )
+
+        # 4. Stage the sealed research artifact through the production endpoint.
+        async with httpx.AsyncClient() as http:
+            stage_res = await http.post(
+                f"{base_url}/api/tasks/{parent_id}/artifacts",
+                json={
+                    "assignment_id": parent_assignment["assignment_id"],
+                    "assignment_proof": parent_proof,
+                    "artifact_id": f"art-{parent_id}",
+                    "artifact_type": "research_material",
+                    "content": {"material": ANALYSIS_MATERIAL},
+                    "artifact_version": 1,
+                    "payload_schema_version": 1,
+                },
+                headers={"Authorization": f"Bearer {RESEARCH_RUNTIME_TOKEN}"},
+            )
+            assert stage_res.status_code == 200, stage_res.text
+            artifact_id = stage_res.json()["artifact"]["artifact_id"]
+
+            # 5. Accept the research -> analysis delegation through the boundary.
+            delegation_res = await http.post(
+                f"{base_url}/api/tasks/{parent_id}/delegations",
+                json={
+                    "proposal_id": f"prop-{parent_id}",
+                    "assignment_id": parent_assignment["assignment_id"],
+                    "child_intent": "Analyze the staged findings",
+                    "artifact_reference": {
+                        "producing_task_id": parent_id,
+                        "artifact_id": artifact_id,
+                        "artifact_version": 1,
+                    },
+                    "target_capability": "analysis",
+                },
+                headers={
+                    "Authorization": f"Bearer {RESEARCH_RUNTIME_TOKEN}",
+                    "X-Assignment-Proof": parent_proof,
+                },
+            )
+            assert delegation_res.status_code == 200, delegation_res.text
+        child_id = delegation_res.json()["child_task_id"]
+
+        # 6. Seed queue delivery for the delegated child. This rpush stands in for
+        # production dispatch so the test isolates the #222 runtime completion
+        # lifecycle (pull-claim -> acknowledge -> execute -> fenced completion);
+        # complete executable orchestration owns the delivery path (#224).
+        child_requested = TaskRequested(
+            task_id=child_id,
+            root_task_id=parent_id,
+            parent_task_id=parent_id,
+            prompt=ANALYSIS_MATERIAL,
+            created_at=datetime.now(UTC).isoformat(),
+            version=2,
+        )
+        await gateway._client.rpush("agent.tasks.analysis", child_requested.to_json())
+
+        # 7. Real bus registration, idle publication, and queue consumption.
         await bus.register(metadata)
         await bus.publish(AgentEvent.create(agent_id, "idle", "Waiting for work"))
-        await gateway.dispatch(task, target="agent.tasks.analysis")
-
         consumed = await asyncio.wait_for(bus.next_task(), timeout=2.0)
-        await processor.run_once(consumed)
+        assert consumed.task_id == child_id
+        assert await gateway._client.llen("agent.tasks.analysis") == 0
+
+        # 8-9. Analysis pull-claim and acknowledge; no grant on a delegated-child turn.
+        child_assignment, child_proof = await analysis_client.claim_task(
+            child_id, f"req-{child_id}-analysis", "analysis", "delegated_child"
+        )
+        assert child_assignment.get("delegation_grant_id") is None
+        await analysis_client.acknowledge_assignment(
+            child_id, child_assignment["assignment_id"], child_proof
+        )
+
+        # 10. Execute and complete through the production TurnCompletionClient.
+        await processor.run_once(
+            consumed,
+            assignment_id=child_assignment["assignment_id"],
+            assignment_proof=child_proof,
+            execution_kind="delegated_child",
+        )
 
         registered = await gateway.agents()
         agent = next(agent for agent in registered if agent["agent_id"] == agent_id)
@@ -226,56 +398,95 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
         assert agent["capabilities"] == ["analysis"]
         assert agent["dispatch_target"] == "agent.tasks.analysis"
 
-        result = await gateway.get_result(task.task_id)
+        # 11. Canonical completion records are authoritative.
+        outcome = await gateway.get_terminal_outcome(child_id)
+        assert outcome is not None
+        assert outcome.terminal_status == "completed"
+        assert outcome.task_id == child_id
+        assert outcome.assignment_id == child_assignment["assignment_id"]
+        assert outcome.runtime_principal_id == "principal-analysis-1"
+        assert outcome.bound_agent_id == "analysis-agent-1"
+        assert outcome.execution_kind == "delegated_child"
+        assert outcome.outcome_id.startswith("outcome-")
+        result = await gateway.get_canonical_result(child_id)
         assert result is not None
-        assert result["status"] == "completed"
-        assert result["output"] == (
-            "Analysis report\n"
-            "Paragraphs: 1\n"
-            "Sentences: 3\n"
-            "Words: 13\n"
-            "Repeated terms: rover (2)\n"
-            "Question sentences:\n"
-            "- Does the map show water?\n"
-            "Scope: Only supplied material was analyzed; no retrieval was performed."
-        )
+        assert result.output == EXPECTED_ANALYSIS_REPORT
+        assert await gateway.get_status(child_id) == "completed"
+        audit = await gateway.get_assignment_completion(child_id, child_assignment["assignment_id"])
+        assert audit is not None
+        assert audit.outcome_id == outcome.outcome_id
+        assert audit.fencing_epoch == 1
+        assert await gateway.get_active_claim(child_id) is None
+        record = await gateway.get_completion_record(child_id, audit.completion_command_id)
+        assert record is not None
+        assert record.outcome_id == outcome.outcome_id
+        assert record.semantic_fingerprint == outcome.semantic_fingerprint
+        record_json = record.to_json()
+        assert "assignment_proof" not in record_json
+        assert child_proof not in record_json
+        assert "proof_digest" in record_json
 
+        # 12. Exactly-once parent projection with a single Research hint.
+        assert await gateway.get_status(parent_id) == "resumable"
+        continuation = await gateway.get_continuation(parent_id, 1)
+        assert continuation is not None
+        assert continuation.child_task_id == child_id
+        assert continuation.continuation_version == 1
+        research_hints = await gateway._client.lrange("agent.hints.research", 0, -1)
+        parent_hints = [h for h in research_hints if f'"{parent_id}"' in h]
+        assert len(parent_hints) == 1
+        assert '"expected_continuation_version":1' in parent_hints[0]
+        assert "assignment_proof" not in parent_hints[0]
+        assert await gateway._client.llen("agent.hints.analysis") == 1
+
+        # 13. Agent events stay observational: fixed lifecycle states only.
         events = await gateway.events(limit=10)
         task_states = [
             event["state"]
             for event in events
-            if event.get("task_id") == task.task_id
+            if event.get("task_id") == child_id
         ]
         assert task_states == ["idle", "working"]
+        for event in events:
+            if event.get("task_id") == child_id:
+                assert EXPECTED_ANALYSIS_REPORT not in event.get("detail", "")
+                assert child_proof not in event.get("detail", "")
+
+        # 14. Canonical reads do not depend on the event stream at all.
+        await gateway._client.delete("agent.events")
+        reread = await gateway.get_result(child_id)
+        assert reread is not None
+        assert reread["status"] == "completed"
+        assert reread["output"] == EXPECTED_ANALYSIS_REPORT
     finally:
+        if server is not None:
+            server.should_exit = True
+        if serve_task is not None:
+            await serve_task
         await gateway.aclose()
         await bus.aclose()
 
 
-async def test_redis_result_persistence_and_retrieval_round_trip(clean_redis: str) -> None:
+async def test_redis_completion_persistence_and_canonical_retrieval_round_trip(
+    clean_redis: str,
+) -> None:
+    """Canonical completion commits through COMPLETE_TURN_LUA and reads back via get_result.
+
+    No runtime writes task.result directly: every turn completes through the
+    fenced completion boundary, and get_result is outcome-driven.
+    """
+    from agent_contracts import CompletionCommand
+    from orchestrator.application.use_cases import AcknowledgeAssignment, ClaimTask
+    from orchestrator.domain.principal import RuntimePrincipal
+
     gateway = RedisGateway(clean_redis)
-    worker_bus = WorkerRedisBus(clean_redis)
-    research_bus = ResearchRedisBus(clean_redis)
+    proof_pepper = "test_completion_redis_proof_pepper_4567890123456789"
+    claim_uc = ClaimTask(task_store=gateway, assignment_proof_pepper=proof_pepper, delivery_lease_seconds=30.0)
+    ack_uc = AcknowledgeAssignment(task_store=gateway, assignment_proof_pepper=proof_pepper)
 
     try:
-        # 1. Worker TaskResult round trip
+        # 1. Worker completed turn with sources round trip
         worker_task_id = f"task_worker_{uuid.uuid4().hex[:8]}"
-        worker_result = TaskResult(
-            task_id=worker_task_id,
-            status="completed",
-            output="General worker finished successfully",
-            acknowledged=True,
-        )
-        await worker_bus.save(worker_result)
-
-        retrieved_worker = await gateway.get_result(worker_task_id)
-        assert retrieved_worker is not None
-        assert retrieved_worker["task_id"] == worker_task_id
-        assert retrieved_worker["status"] == "completed"
-        assert retrieved_worker["output"] == "General worker finished successfully"
-        assert retrieved_worker["acknowledged"] is True
-
-        # 2. ResearchResult with sources round trip
         evidence = EvaluatedEvidence(
             url="https://example.org/spec",
             title="Specification Doc",
@@ -289,50 +500,142 @@ async def test_redis_result_persistence_and_retrieval_round_trip(clean_redis: st
             rank_score=0.95,
             retained=True,
         )
-        research_task_id_with_sources = f"task_research_src_{uuid.uuid4().hex[:8]}"
-        research_result_with_sources = ResearchResult(
-            task_id=research_task_id_with_sources,
-            output="Detailed synthesis output",
-            acknowledged=True,
-            truncated=False,
-            sources=(evidence,),
+        now = datetime.now(UTC).isoformat()
+        worker_task = TaskRequested(
+            task_id=worker_task_id,
+            root_task_id=worker_task_id,
+            parent_task_id=None,
+            prompt="Redis completion worker task",
+            created_at=now,
+            version=2,
         )
-        await research_bus.save(research_result_with_sources)
-
-        retrieved_research_1 = await gateway.get_result(research_task_id_with_sources)
-        assert retrieved_research_1 is not None
-        assert retrieved_research_1["task_id"] == research_task_id_with_sources
-        assert retrieved_research_1["status"] == "completed"
-        assert retrieved_research_1["output"] == "Detailed synthesis output"
-        assert retrieved_research_1["acknowledged"] is True
-        assert retrieved_research_1["truncated"] is False
-        assert "sources" in retrieved_research_1
-        assert len(retrieved_research_1["sources"]) == 1
-        assert retrieved_research_1["sources"][0]["url"] == "https://example.org/spec"
-        assert retrieved_research_1["sources"][0]["domain"] == "example.org"
-
-        # 3. ResearchResult without sources (conditional source omission)
-        research_task_id_no_sources = f"task_research_nosrc_{uuid.uuid4().hex[:8]}"
-        research_result_no_sources = ResearchResult(
-            task_id=research_task_id_no_sources,
-            output="Synthesis without sources",
-            acknowledged=True,
-            truncated=False,
-            sources=(),
+        await gateway.register_root_task(worker_task, required_capability="general")
+        await gateway.update_status(worker_task_id, "pending")
+        worker_principal = RuntimePrincipal(
+            principal_id="principal-worker-1",
+            bound_agent_id="worker-1",
+            authorized_capabilities=("general",),
+            active=True,
         )
-        await research_bus.save(research_result_no_sources)
+        worker_claim = await claim_uc.execute(
+            principal=worker_principal,
+            task_id=worker_task_id,
+            request_id=f"req-{worker_task_id}",
+            capability="general",
+        )
+        await ack_uc.execute(
+            principal=worker_principal,
+            task_id=worker_task_id,
+            assignment_id=worker_claim.assignment.assignment_id,
+            assignment_proof=worker_claim.assignment_proof or "",
+        )
+        active = await gateway.get_active_claim(worker_task_id)
+        assert active is not None
+        worker_command = CompletionCommand(
+            completion_command_id=f"cmd-{worker_task_id}",
+            assignment_id=active.assignment_id,
+            execution_kind="initial",
+            completed_result=TaskResult(
+                task_id=worker_task_id,
+                output="General worker finished successfully",
+                sources=[evidence.to_dict()],
+            ),
+        )
+        await gateway.complete_turn(
+            task_id=worker_task_id,
+            command=worker_command,
+            proof_digest=active.proof_digest,
+            fencing_epoch=active.fencing_epoch,
+            parent_task_id=None,
+            root_task_id=worker_task_id,
+            completed_at=datetime.now(UTC).isoformat(),
+            runtime_principal_id=active.runtime_principal_id,
+            bound_agent_id=active.bound_agent_id,
+        )
 
-        retrieved_research_2 = await gateway.get_result(research_task_id_no_sources)
-        assert retrieved_research_2 is not None
-        assert retrieved_research_2["task_id"] == research_task_id_no_sources
-        assert retrieved_research_2["status"] == "completed"
-        assert retrieved_research_2["output"] == "Synthesis without sources"
-        assert retrieved_research_2["acknowledged"] is True
-        assert "sources" not in retrieved_research_2
+        retrieved_worker = await gateway.get_result(worker_task_id)
+        assert retrieved_worker is not None
+        assert retrieved_worker["task_id"] == worker_task_id
+        assert retrieved_worker["status"] == "completed"
+        assert retrieved_worker["output"] == "General worker finished successfully"
+        assert retrieved_worker["acknowledged"] is True
+        assert len(retrieved_worker["sources"]) == 1
+        assert retrieved_worker["sources"][0]["url"] == "https://example.org/spec"
+        assert retrieved_worker["sources"][0]["domain"] == "example.org"
+
+        # 2. Failed turn persists the outcome but never fabricates a TaskResult
+        failed_task_id = f"task_failed_{uuid.uuid4().hex[:8]}"
+        failed_task = TaskRequested(
+            task_id=failed_task_id,
+            root_task_id=failed_task_id,
+            parent_task_id=None,
+            prompt="Redis completion failing task",
+            created_at=datetime.now(UTC).isoformat(),
+            version=2,
+        )
+        await gateway.register_root_task(failed_task, required_capability="general")
+        await gateway.update_status(failed_task_id, "pending")
+        failed_claim = await claim_uc.execute(
+            principal=worker_principal,
+            task_id=failed_task_id,
+            request_id=f"req-{failed_task_id}",
+            capability="general",
+        )
+        await ack_uc.execute(
+            principal=worker_principal,
+            task_id=failed_task_id,
+            assignment_id=failed_claim.assignment.assignment_id,
+            assignment_proof=failed_claim.assignment_proof or "",
+        )
+        failed_active = await gateway.get_active_claim(failed_task_id)
+        assert failed_active is not None
+        await gateway.complete_turn(
+            task_id=failed_task_id,
+            command=CompletionCommand(
+                completion_command_id=f"cmd-{failed_task_id}",
+                assignment_id=failed_active.assignment_id,
+                execution_kind="initial",
+                failure_code="PROVIDER_UNAVAILABLE",
+            ),
+            proof_digest=failed_active.proof_digest,
+            fencing_epoch=failed_active.fencing_epoch,
+            parent_task_id=None,
+            root_task_id=failed_task_id,
+            completed_at=datetime.now(UTC).isoformat(),
+            runtime_principal_id=failed_active.runtime_principal_id,
+            bound_agent_id=failed_active.bound_agent_id,
+        )
+        retrieved_failed = await gateway.get_result(failed_task_id)
+        assert retrieved_failed == {
+            "task_id": failed_task_id,
+            "status": "failed",
+            "output": None,
+        }
+
+        # 3. Legacy pre-boundary task.result records remain readable
+        legacy_task_id = f"task_legacy_{uuid.uuid4().hex[:8]}"
+        await gateway._client.set(
+            f"task.result:{legacy_task_id}",
+            json.dumps(
+                {
+                    "task_id": legacy_task_id,
+                    "status": "completed",
+                    "output": "Legacy direct-write output",
+                    "acknowledged": True,
+                }
+            ),
+        )
+        assert await gateway.get_result(legacy_task_id) == {
+            "task_id": legacy_task_id,
+            "status": "completed",
+            "output": "Legacy direct-write output",
+            "acknowledged": True,
+        }
+
+        # 4. Unknown tasks resolve to None; agent events are never consulted
+        assert await gateway.get_result(f"task_unknown_{uuid.uuid4().hex[:8]}") is None
     finally:
         await gateway.aclose()
-        await worker_bus.aclose()
-        await research_bus.aclose()
 
 
 async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:

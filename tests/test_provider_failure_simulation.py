@@ -18,7 +18,9 @@ from typing import Any
 import httpx
 import pytest
 from agent_contracts import (
+    ALLOWED_COMPLETION_FAILURE_CODES,
     AgentEvent,
+    CompletionCommand,
     FallbackEligibleInferenceError,
     InferenceError,
     NonFallbackInferenceError,
@@ -28,7 +30,6 @@ from agent_contracts import (
 from agent_infrastructure import CloudflareHealthProbe, GeminiHealthProbe
 from agent_policy import DeterministicProviderSelector
 from research_agent.application.processor import ResearchExecutionError, ResearchProcessor
-from research_agent.domain.models import ResearchResult
 from research_agent.infrastructure.cloudflare_inference import (
     CloudflareInferenceProvider as ResearchCloudflareProvider,
 )
@@ -66,20 +67,24 @@ class FakeMessageBus:
         raise NotImplementedError
 
 
-class FakeWorkerResultStore:
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
+
     def __init__(self) -> None:
-        self.saved: dict[str, TaskResult] = {}
+        self.submitted: list[CompletionCommand] = []
 
-    async def save(self, result: TaskResult) -> None:
-        self.saved[result.task_id] = result
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.submitted.append(command)
+        return {"outcome": {}, "replayed": False}
 
 
-class FakeResearchResultStore:
-    def __init__(self) -> None:
-        self.saved: dict[str, ResearchResult] = {}
-
-    async def save(self, result: ResearchResult) -> None:
-        self.saved[result.task_id] = result
+ASSIGNMENT_ID = "assign-fault-1"
+ASSIGNMENT_PROOF = "proof-fault-1"
 
 
 # ==============================================================================
@@ -669,26 +674,30 @@ async def test_worker_task_processor_fault_containment_and_recovery(
     )
     provider = _create_worker_faulty_provider(provider_type, client)
     bus = FakeMessageBus()
-    store = FakeWorkerResultStore()
+    completion_client = FakeCompletionClient()
 
     processor = TaskProcessor(
         agent_id="worker-failure-test",
         bus=bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
 
     # 1. Dispatch failing task
     task_failing = TaskRequested.create("Execute database index optimization")
     with pytest.raises(TaskExecutionError) as exc_info:
-        await processor.run_once(task_failing)
+        await processor.run_once(task_failing, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Assertion A: TaskExecutionError correlates to the task
     assert exc_info.value.task_id == task_failing.task_id
 
-    # Assertion B: No result is persisted (state is not corrupted)
-    assert task_failing.task_id not in store.saved
-    assert len(store.saved) == 0
+    # Assertion B: A failed turn submits only the allowlisted safe failure code
+    # (never a fabricated TaskResult, raw exception, or secret)
+    assert len(completion_client.submitted) == 1
+    failed_command = completion_client.submitted[0]
+    assert failed_command.failure_code in ALLOWED_COMPLETION_FAILURE_CODES
+    assert failed_command.completed_result is None
+    assert secret_token not in failed_command.to_json()
 
     # Assertion C: Lifecycle telemetry records working -> error -> idle
     assert len(bus.published) == 3
@@ -708,10 +717,10 @@ async def test_worker_task_processor_fault_containment_and_recovery(
 
     # Assertion E: Worker recovers and successfully processes a subsequent valid task
     task_recovery = TaskRequested.create("Analyze connection pool metrics")
-    await processor.run_once(task_recovery)
+    await processor.run_once(task_recovery, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task_recovery.task_id in store.saved
-    saved_result = store.saved[task_recovery.task_id]
+    assert len(completion_client.submitted) == 2
+    saved_result = completion_client.submitted[1].completed_result
     assert isinstance(saved_result, TaskResult)
     assert saved_result.task_id == task_recovery.task_id
     assert saved_result.status == "completed"
@@ -750,28 +759,32 @@ async def test_research_processor_fault_containment_and_recovery(
     )
     provider = _create_research_faulty_provider(provider_type, client)
     bus = FakeMessageBus()
-    store = FakeResearchResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
 
     processor = ResearchProcessor(
         agent_id="research-failure-test",
         bus=bus,
         executor=executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
 
     # 1. Dispatch failing task
     task_failing = TaskRequested.create("Investigate distributed deadlock resolution")
     with pytest.raises(ResearchExecutionError) as exc_info:
-        await processor.run_once(task_failing)
+        await processor.run_once(task_failing, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Assertion A: ResearchExecutionError correlates to the task
     assert exc_info.value.task_id == task_failing.task_id
 
-    # Assertion B: No result is persisted (state is not corrupted)
-    assert task_failing.task_id not in store.saved
-    assert len(store.saved) == 0
+    # Assertion B: A failed turn submits only the allowlisted safe failure code
+    # (never a fabricated TaskResult, raw exception, or secret)
+    assert len(completion_client.submitted) == 1
+    failed_command = completion_client.submitted[0]
+    assert failed_command.failure_code in ALLOWED_COMPLETION_FAILURE_CODES
+    assert failed_command.completed_result is None
+    assert secret_token not in failed_command.to_json()
 
     # Assertion C: Lifecycle telemetry records the architecture's existing failure state behavior (working -> error)
     assert len(bus.published) == 2
@@ -788,13 +801,12 @@ async def test_research_processor_fault_containment_and_recovery(
 
     # Assertion E: Research Agent recovers and successfully processes a subsequent valid task
     task_recovery = TaskRequested.create("Investigate state machine replication")
-    await processor.run_once(task_recovery)
+    await processor.run_once(task_recovery, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task_recovery.task_id in store.saved
-    saved_result = store.saved[task_recovery.task_id]
-    assert isinstance(saved_result, ResearchResult)
+    assert len(completion_client.submitted) == 2
+    saved_result = completion_client.submitted[1].completed_result
+    assert isinstance(saved_result, TaskResult)
     assert saved_result.task_id == task_recovery.task_id
-    assert saved_result.acknowledged is True
     assert "Recovered research synthesis" in saved_result.output
 
     # Verify event stream for recovered task (working -> idle)
@@ -818,44 +830,50 @@ async def test_stub_provider_failure_containment_and_recovery() -> None:
     # 1. Worker with Stub failure trigger
     worker_stub = WorkerStubProvider(provider_name="stub", failure_trigger=trigger)
     worker_bus = FakeMessageBus()
-    worker_store = FakeWorkerResultStore()
-    worker_proc = TaskProcessor("worker-stub", worker_bus, result_store=worker_store, inference_provider=worker_stub)
+    worker_client = FakeCompletionClient()
+    worker_proc = TaskProcessor(
+        "worker-stub", worker_bus, completion_client=worker_client, inference_provider=worker_stub
+    )
 
     failing_worker_task = TaskRequested.create(f"Task with {trigger}")
     with pytest.raises(TaskExecutionError):
-        await worker_proc.run_once(failing_worker_task)
+        await worker_proc.run_once(failing_worker_task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert len(worker_store.saved) == 0
+    assert len(worker_client.submitted) == 1
+    assert worker_client.submitted[0].completed_result is None
     assert [e.state for e in worker_bus.published] == ["working", "error", "idle"]
 
     # Recovery
     valid_worker_task = TaskRequested.create("Normal worker task")
-    await worker_proc.run_once(valid_worker_task)
-    assert valid_worker_task.task_id in worker_store.saved
+    await worker_proc.run_once(valid_worker_task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
+    assert len(worker_client.submitted) == 2
+    assert worker_client.submitted[1].completed_result is not None
 
     # 2. Research Agent with Stub failure trigger
     research_stub = ResearchStubProvider(provider_name="stub", failure_trigger=trigger)
     research_bus = FakeMessageBus()
-    research_store = FakeResearchResultStore()
+    research_client = FakeCompletionClient()
     research_proc = ResearchProcessor(
         "research-stub",
         research_bus,
         StubResearchExecutor(),
-        result_store=research_store,
+        completion_client=research_client,
         inference_provider=research_stub,
     )
 
     failing_research_task = TaskRequested.create(f"Question with {trigger}")
     with pytest.raises(ResearchExecutionError):
-        await research_proc.run_once(failing_research_task)
+        await research_proc.run_once(failing_research_task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert len(research_store.saved) == 0
+    assert len(research_client.submitted) == 1
+    assert research_client.submitted[0].completed_result is None
     assert [e.state for e in research_bus.published] == ["working", "error"]
 
     # Recovery
     valid_research_task = TaskRequested.create("Normal research question")
-    await research_proc.run_once(valid_research_task)
-    assert valid_research_task.task_id in research_store.saved
+    await research_proc.run_once(valid_research_task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
+    assert len(research_client.submitted) == 2
+    assert research_client.submitted[1].completed_result is not None
 
 
 # ==============================================================================

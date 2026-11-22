@@ -9,7 +9,6 @@ from agent_contracts import (
     AgentEvent,
     AgentHeartbeat,
     TaskRequested,
-    TaskResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,19 +107,6 @@ class RedisBus:
         async def _write():
             await self.client.sadd("agent.ids", heartbeat.agent_id)
             await self.client.hset(f"agent.state:{heartbeat.agent_id}", mapping=mapping)
-
-        await retry_with_backoff(_write)
-
-    async def save(self, result: TaskResult) -> None:
-        data = {
-            "task_id": result.task_id,
-            "status": result.status,
-            "output": result.output,
-            "acknowledged": result.acknowledged,
-        }
-
-        async def _write():
-            await self.client.set(f"task.result:{result.task_id}", json.dumps(data))
 
         await retry_with_backoff(_write)
 
