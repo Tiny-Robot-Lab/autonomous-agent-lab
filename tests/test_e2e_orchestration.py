@@ -336,11 +336,9 @@ async def test_telemetry_event_is_queryable_without_mutating_current_state(
     assert "state" not in stored
     assert json.loads(stored["tool_execution_telemetry"]) == telemetry.to_dict()
 
-    assert await gateway.get_result("task-telemetry-1") == {
-        "task_id": "task-telemetry-1",
-        "status": "pending",
-        "output": None,
-    }
+    # Agent events are observational only: with no canonical outcome, legacy
+    # result, or lifecycle status, they never constitute a task result (#222).
+    assert await gateway.get_result("task-telemetry-1") is None
 
 
 # ==============================================================================

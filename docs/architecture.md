@@ -50,7 +50,7 @@ The codebase strictly enforces Clean Architecture concentric layering with inwar
 1. **Domain Layer (Center Ring)**: Pure business logic and domain invariants. Encapsulates intent routing rules (`DeterministicCapabilityRouter`), capability classifications (`AgentCapability`), candidate selection policies (`DeterministicSelectionPolicy`), and deterministic structural analysis of supplied text. Contains zero dependencies on infrastructure, databases, or frameworks.
 2. **Application Layer (Use Cases & Ports)**: Orchestrates business flows (`SubmitTask`, `GetRoutingDecision`, `FindCandidatesByCapability`, and Analysis Agent task processing). Declares abstract Ports (Protocols) such as `TaskDispatcher`, `TaskQueue`, `StateReader`, `RoutingRecorder`, `ResultReader`, `EventPublisher`, and `MaterialAnalyzer`. Does not know about Redis, HTTP, or external cloud providers.
 3. **Infrastructure Layer (Adapters)**: Implements application ports with concrete technologies. `RedisGateway` connects the orchestrator to Redis data structures; service-local `RedisBus` adapters connect agents to dispatch queues; `TavilySearchExecutor` and `CloudflareInferenceProvider` adapt external APIs.
-4. **Presentation Layer (Outer Ring)**: Exposes FastAPI REST endpoints (`/api/tasks`, `/api/tasks/{id}/routing`, `/api/tasks/{id}/result`, `/api/agents`, `/api/events`) and serves the Prototype Console single-page web application. Interacts exclusively with Application use cases and queries.
+4. **Presentation Layer (Outer Ring)**: Exposes FastAPI REST endpoints (`/api/tasks`, `/api/tasks/{id}/routing`, `/api/tasks/{id}/result`, `/api/tasks/{id}/delegations`, `/api/tasks/{id}/completion`, `/api/agents`, `/api/events`) and serves the Prototype Console single-page web application. Interacts exclusively with Application use cases and queries.
 5. **Shared Contracts (`agent_contracts`)**: Cross-boundary data primitives (`TaskRequested`, `TaskResult`, `RoutingDecision`, `CandidateEvaluation`, `AgentHeartbeat`, `AgentEvent`, `AgentCandidate`, `AgentAvailability`, `LivenessPolicy`). Technology-neutral dataclasses with strict versioning and automated credential sanitization.
 
 ### Layer Definitions & Invariants
@@ -104,7 +104,7 @@ The Analysis Agent advertises `analysis` and `agent.tasks.analysis`, but it is n
      c. **LLM Synthesis**: Calls `CloudflareInferenceProvider` (`@cf/mistralai/mistral-small-3.1-24b-instruct`) with strict instructions to generate structured findings and concise source citations.
      d. **Truncation Detection**: Checks completion metadata and response boundaries to prevent silent mid-sentence truncation.
    - **Analysis Agent (`analysis-agent-1`)**: Deterministically counts paragraphs, sentences, and words; reports up to five repeated normalized content terms and question sentences; and states that it analyzed only the supplied material without retrieval. It does not claim factual verification or semantic understanding.
-4. **Result Storage**: The agent constructs a `TaskResult` (`status="completed"`, `output=...`) and persists it to `task.result:{task_id}`.
+4. **Fenced Turn Completion**: The agent never writes canonical result or outcome keys directly. It submits a `CompletionCommand` (exactly one of a completed `TaskResult` or an allowlisted safe failure code) to `POST /api/tasks/{task_id}/completion` with the detached assignment proof in the `X-Assignment-Proof` header. The Orchestrator commits the canonical `TerminalOutcome` (deterministic `outcome_id`), the completion-command replay record, the assignment-completion audit, terminal lifecycle status, and active-claim retirement in one single-node Lua script — plus, for delegated children, the parent transition to `resumable` with exactly one non-secret Research wake-up hint. All expected validation rejections occur read-only with zero mutation; Redis serializes script execution atomically with respect to other clients, with no rollback claimed for unexpected command errors, host failures, out-of-memory conditions, or persistence failures. Identical retries return the recorded outcome with zero writes; agents publish only observational lifecycle events.
 5. **State Reset**: The agent transitions its state back to `idle` (`Waiting for work`) and publishes an `idle` event to `agent.events`.
 
 ### Flow 3: Observability & Console Presentation
@@ -121,7 +121,7 @@ The Analysis Agent advertises `analysis` and `agent.tasks.analysis`, but it is n
 ### Network Boundaries
 1. Deployable services (`services/orchestrator`, `services/worker`, `services/research_agent`, `services/analysis_agent`) are isolated containers on Docker network `agent_net`.
 2. Direct Python imports across service boundaries are strictly forbidden. One service must never import from another service's internal code tree.
-3. Inter-service communication occurs exclusively through explicit asynchronous message passing and key-value state over Redis.
+3. Redis remains the authoritative substrate for task state, queues, wake-up hints, claims, fencing epochs, and atomic Lua projection. Assignment-backed runtime claim, acknowledgement, artifact staging, delegation, and completion additionally use authenticated HTTP boundaries exposed by the Orchestrator (`POST /api/tasks/claim`, `/api/assignments/{id}/acknowledge`, `/api/tasks/{id}/artifacts`, `/api/tasks/{id}/delegations`, `/api/tasks/{id}/completion`); in particular, runtime-to-Orchestrator turn completion travels over HTTP with the detached proof in the `X-Assignment-Proof` header, never over Redis pub/sub. Agent events remain observational only. Redis ACL separation is tracked by #229, not by this architecture.
 
 ### Shared Contract Purity
 * Shared contracts reside in `packages/contracts/src/agent_contracts`.
@@ -150,8 +150,11 @@ The Analysis Agent advertises `analysis` and `agent.tasks.analysis`, but it is n
 | `agent.registry:{agent_id}` | Redis String / Hash | Static agent registration, capabilities, and target queue. |
 | `agent.heartbeat:{agent_id}` | Redis String / JSON | Periodic liveness pulse, execution state, and ISO timestamp. |
 | `task.routing:{task_id}` | Redis String / JSON | Structured `RoutingDecision` record (candidates, target, rationale). |
-| `task.result:{task_id}` | Redis String / JSON | Durable `TaskResult` record (status, synthesized output, completion time). |
-| `agent.events` | Redis Stream (`XADD`) | Chronological operational audit log (maxlen=500). |
+| `task.result:{task_id}` | Redis String / JSON | Canonical `TaskResult` for completed turns, written only by the platform completion projection (pre-boundary legacy records remain readable). |
+| `task.outcome:{task_id}` | Redis String / JSON | Canonical `TerminalOutcome` controlling completed/failed state. |
+| `task.completion:{task_id}:{completion_command_id}` | Redis String / JSON | Completion-command replay record binding transport identity to the semantic fingerprint and stored proof digest. |
+| `task.assignment_completion:{task_id}:{assignment_id}` | Redis String / JSON | Versioned audit explaining why the active claim retired. |
+| `agent.events` | Redis Stream (`XADD`) | Chronological operational audit log (maxlen=500). Observational only; never canonical completion evidence. |
 
 ---
 
@@ -336,3 +339,48 @@ governed by ADR 0006 and ADR 0007.
 * **Redis Least-Privilege ACL**: The development and Compose runtime currently operates an
   unauthenticated Redis instance; fine-grained least-privilege ACL policies are tracked
   for subsequent operational hardening.
+
+## 17. Universal Fenced Completion Boundary (Issue #222)
+
+Issue #222 establishes the universal fenced completion boundary and canonical terminal
+outcomes for every assignment-backed execution turn (initial, delegated child, and resumed
+continuation), governed by ADR 0006 and ADR 0007 (Decision 11).
+
+* **API Endpoint**: `POST /api/tasks/{task_id}/completion` exposes first completion and
+  transport-neutral deterministic replay for active and retired turns.
+* **Authentication and Proof Boundary**: The endpoint requires Bearer token authentication
+  mapped to an active runtime principal, plus the cryptographic assignment proof exclusively
+  via the `X-Assignment-Proof` HTTP header. Supplying `assignment_proof` (or any
+  caller-asserted authority field, raw failure text, or secret-shaped key) in the JSON body
+  is strictly rejected, and the plaintext proof is never persisted or logged.
+* **Completion Contracts**: The provider-neutral, immutable, versioned `CompletionCommand`
+  carries caller-generated transport identity (`completion_command_id`, bounded to 256
+  characters), the assignment binding, the live execution kind (continuation versions only
+  for `resumed_continuation`), and exactly one semantic branch: a completed `TaskResult`
+  (canonical serialized size bounded to 65,536 UTF-8 bytes) or one allowlisted safe failure
+  code (`EXECUTION_FAILED`, `PROVIDER_UNAVAILABLE`, `TOOL_DENIED`, `INVALID_INPUT`).
+  `TerminalOutcome` carries the deterministic `outcome_id` derived from the canonical
+  semantic fingerprint under the `tiny-agent-lab:terminal-outcome:v1:` domain separator, so
+  identical semantic replays resolve to the same outcome.
+* **First Completion vs. Retired Replay**: First completion requires the current active
+  acknowledged claim, the current nonterminal task state, and no conflicting canonical
+  records. Replay after claim retirement authorizes read-only against the persisted
+  completion record, outcome, identities, semantic fingerprint, and stored proof digest;
+  every failed retired-replay authorization normalizes to one generic HTTP 403 that reveals
+  no result, outcome, command, task-state, or existence information.
+* **Single-Script Projection**: One single-node Lua script (`COMPLETE_TURN_LUA`) checks the
+  replay record first (identical retries return the stored outcome with zero writes; changed
+  payloads fail closed), validates every type, decode, epoch, lineage, continuation, and
+  conflict precondition read-only with zero mutation, then commits only prevalidated writes
+  (canonical records, terminal status, claim retirement — plus, for delegated children,
+  parent projection to `resumable` with exactly one non-secret Research wake-up hint).
+  Redis serializes script execution atomically with respect to other clients; no rollback
+  is claimed for unexpected command errors, host failures, out-of-memory conditions, or
+  persistence failures. Failed turns persist no
+  `TaskResult`.
+* **Runtime Migration**: The General Worker, Research Agent, and Analysis Agent complete
+  exclusively through this boundary; none writes canonical result or outcome keys directly,
+  failures submit only allowlisted codes, and raw exceptions remain local. `agent.events`
+  stay observational, and `GET /api/tasks/{task_id}/result` is outcome-driven (completed
+  outcomes surface the canonical result, failed outcomes never fabricate one, legacy
+  pre-boundary records remain readable).

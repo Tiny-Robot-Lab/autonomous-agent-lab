@@ -471,15 +471,21 @@ async def test_research_processor_with_mcp_tavily_executor() -> None:
     executor.execute = AsyncMock(return_value=expected_result)
 
     bus = AsyncMock()
+    completion_client = AsyncMock()
+    completion_client.submit_completion.return_value = {"outcome": {}, "replayed": False}
     processor = ResearchProcessor(
         agent_id="research-1",
         bus=bus,
         executor=executor,
-        result_store=bus,
+        completion_client=completion_client,
     )
 
     task = TaskRequested.create("test seamless processor")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id="assign-mcp-1", assignment_proof="proof-mcp-1")
 
     executor.execute.assert_called_once_with(task)
-    bus.save.assert_called_once_with(expected_result)
+    completion_client.submit_completion.assert_awaited_once()
+    submitted_command = completion_client.submit_completion.await_args.kwargs["command"]
+    assert submitted_command.completed_result is not None
+    assert submitted_command.completed_result.task_id == expected_result.task_id
+    assert submitted_command.completed_result.output == expected_result.output

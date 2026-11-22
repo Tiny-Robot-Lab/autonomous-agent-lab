@@ -13,7 +13,7 @@ import json
 from typing import Any
 
 import pytest
-from agent_contracts import AgentEvent, TaskRequested, TaskResult
+from agent_contracts import AgentEvent, CompletionCommand, TaskRequested, TaskResult
 from research_agent.application.processor import (
     ResearchExecutionError,
     ResearchProcessor,
@@ -33,17 +33,39 @@ class MemoryBus:
         self.published.append(event)
 
 
-class MemoryResultStore:
-    def __init__(self) -> None:
-        self.saved: dict[str, Any] = {}
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
 
-    async def save(self, result: Any) -> None:
-        self.saved[result.task_id] = result
+    def __init__(self) -> None:
+        self.submitted: list[CompletionCommand] = []
+
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.submitted.append(command)
+        return {"outcome": {}, "replayed": False}
+
+
+ASSIGNMENT_ID = "assign-sanitization-1"
+ASSIGNMENT_PROOF = "proof-sanitization-1"
 
 
 class FakeFailingWorkerProcessor(TaskProcessor):
-    def __init__(self, agent_id: str, bus: MemoryBus, exc: Exception) -> None:
-        super().__init__(agent_id=agent_id, bus=bus)  # type: ignore[arg-type]
+    def __init__(
+        self,
+        agent_id: str,
+        bus: MemoryBus,
+        exc: Exception,
+        completion_client: FakeCompletionClient | None = None,
+    ) -> None:
+        super().__init__(
+            agent_id=agent_id,
+            bus=bus,
+            completion_client=completion_client or FakeCompletionClient(),
+        )
         self._exc = exc
 
     async def process(self, task: TaskRequested) -> TaskResult:
@@ -69,18 +91,19 @@ class FailingResearchExecutor:
 @pytest.mark.anyio
 async def test_worker_task_processor_sanitizes_lifecycle_events_on_success() -> None:
     bus = MemoryBus()
-    store = MemoryResultStore()
-    processor = TaskProcessor("worker-security-1", bus)  # type: ignore[arg-type]
-    processor.result_store = store  # type: ignore[assignment]
+    completion_client = FakeCompletionClient()
+    processor = TaskProcessor("worker-security-1", bus, completion_client=completion_client)
 
     prompt_secret = "RAW-PROMPT-SECRET-WORKER-99-API-KEY-ABCDEF123456"
     task = TaskRequested.create(prompt_secret)
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    # 1. Result store preserves genuine execution result
-    assert task.task_id in store.saved
-    assert prompt_secret in store.saved[task.task_id].output
+    # 1. Submitted completion preserves genuine execution result
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert prompt_secret in completed.output
 
     # 2. Exactly 2 lifecycle events published: working -> idle
     assert len(bus.published) == 2
@@ -110,25 +133,33 @@ async def test_worker_task_processor_sanitizes_lifecycle_events_on_success() -> 
 @pytest.mark.anyio
 async def test_worker_task_processor_sanitizes_lifecycle_events_on_failure() -> None:
     bus = MemoryBus()
-    store = MemoryResultStore()
+    completion_client = FakeCompletionClient()
     raw_error_message = (
         "FATAL-DATABASE-EXCEPTION-WORKER-77: Connection to postgres://user:SECRET_PASS_99@internal:5432 failed"
     )
-    processor = FakeFailingWorkerProcessor("worker-security-1", bus, RuntimeError(raw_error_message))
-    processor.result_store = store  # type: ignore[assignment]
+    processor = FakeFailingWorkerProcessor(
+        "worker-security-1", bus, RuntimeError(raw_error_message), completion_client=completion_client
+    )
 
     prompt_secret = "WORKER-FAILING-TASK-PROMPT-CONFIDENTIAL-01"
     task = TaskRequested.create(prompt_secret)
 
     with pytest.raises(TaskExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # 1. Original exception is preserved internally in TaskExecutionError
     assert exc_info.value.task_id == task.task_id
     assert raw_error_message in str(exc_info.value.original_error)
 
-    # 2. Result store is empty on failure
-    assert len(store.saved) == 0
+    # 2. Submitted failure completion carries only the allowlisted safe code:
+    #    no raw exception text, credentials, or prompt leak into canonical data
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.failure_code == "EXECUTION_FAILED"
+    assert command.completed_result is None
+    assert "FATAL-DATABASE-EXCEPTION" not in command.to_json()
+    assert "SECRET_PASS_99" not in command.to_json()
+    assert prompt_secret not in command.to_json()
 
     # 3. Exactly 3 lifecycle events published: working -> error -> idle (availability restored)
     assert len(bus.published) == 3
@@ -161,24 +192,27 @@ async def test_worker_task_processor_sanitizes_lifecycle_events_on_failure() -> 
 @pytest.mark.anyio
 async def test_research_processor_sanitizes_lifecycle_events_on_success() -> None:
     bus = MemoryBus()
-    store = MemoryResultStore()
+    completion_client = FakeCompletionClient()
     synthesis_secret = "SYNTHESIS-SECRET-RESEARCH-44: Proprietary algorithm analysis"
     evidence_secret = "EVIDENCE-RAW-EXCERPT-55: Private document snippet text"
     executor = CustomOutputResearchExecutor(
         output=f"{synthesis_secret}\n{evidence_secret}"
     )
-    processor = ResearchProcessor("research-security-1", bus, executor)  # type: ignore[arg-type]
-    processor.result_store = store  # type: ignore[assignment]
+    processor = ResearchProcessor(
+        "research-security-1", bus, executor, completion_client=completion_client
+    )
 
     prompt_secret = "CONFIDENTIAL-RESEARCH-PROMPT-TOPIC-77"
     task = TaskRequested.create(prompt_secret)
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    # 1. Result store preserves genuine execution result
-    assert task.task_id in store.saved
-    assert synthesis_secret in store.saved[task.task_id].output
-    assert evidence_secret in store.saved[task.task_id].output
+    # 1. Submitted completion preserves genuine execution result
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert synthesis_secret in completed.output
+    assert evidence_secret in completed.output
 
     # 2. Exactly 2 lifecycle events published: working -> idle
     assert len(bus.published) == 2
@@ -213,26 +247,34 @@ async def test_research_processor_sanitizes_lifecycle_events_on_success() -> Non
 @pytest.mark.anyio
 async def test_research_processor_sanitizes_lifecycle_events_on_failure() -> None:
     bus = MemoryBus()
-    store = MemoryResultStore()
+    completion_client = FakeCompletionClient()
     raw_error_message = (
         "RESEARCH-API-FAILURE-33: HTTP 403 Forbidden with Bearer token eyJhbGciOi...SECRET_BEARER_TOKEN"
     )
     executor = FailingResearchExecutor(RuntimeError(raw_error_message))
-    processor = ResearchProcessor("research-security-1", bus, executor)  # type: ignore[arg-type]
-    processor.result_store = store  # type: ignore[assignment]
+    processor = ResearchProcessor(
+        "research-security-1", bus, executor, completion_client=completion_client
+    )
 
     prompt_secret = "CONFIDENTIAL-FAILING-RESEARCH-TASK-PROMPT-88"
     task = TaskRequested.create(prompt_secret)
 
     with pytest.raises(ResearchExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # 1. Original exception is preserved internally in ResearchExecutionError
     assert exc_info.value.task_id == task.task_id
     assert raw_error_message in str(exc_info.value.original_error)
 
-    # 2. Result store is empty on failure
-    assert len(store.saved) == 0
+    # 2. Submitted failure completion carries only the allowlisted safe code:
+    #    no raw exception text, credentials, or prompt leak into canonical data
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.failure_code == "EXECUTION_FAILED"
+    assert command.completed_result is None
+    assert "RESEARCH-API-FAILURE" not in command.to_json()
+    assert "SECRET_BEARER_TOKEN" not in command.to_json()
+    assert prompt_secret not in command.to_json()
 
     # 3. Exactly 2 lifecycle events published: working -> error (ResearchAgent maintains error state)
     assert len(bus.published) == 2

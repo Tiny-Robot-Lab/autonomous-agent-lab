@@ -4,7 +4,10 @@ from agent_contracts import (
     ActiveClaim,
     AgentCandidate,
     AgentEvent,
+    AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    CompletionCommand,
+    CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
     RequiredCapabilityRecord,
@@ -14,6 +17,8 @@ from agent_contracts import (
     TaskContinuation,
     TaskInput,
     TaskRequested,
+    TaskResult,
+    TerminalOutcome,
     WakeUpHint,
 )
 
@@ -69,6 +74,23 @@ class GrantAlreadyConsumedError(Exception):
 
 class DelegationReplayAuthorizationError(Exception):
     """Raised when retired delegation proposal replay authorization fails."""
+
+
+class CompletionConflictError(Exception):
+    """Raised when a completion conflicts with canonical terminal state.
+
+    Covers a changed semantic payload under an already-accepted completion
+    command ID, a different command after canonical terminal state, and a
+    pre-existing conflicting canonical result, outcome, or audit record.
+    """
+
+
+class CompletionReplayAuthorizationError(Exception):
+    """Raised when retired completion replay authorization fails.
+
+    Always surfaced to callers as one generic authorization failure that
+    reveals no result, outcome, command, task-state, or existence information.
+    """
 
 
 @runtime_checkable
@@ -231,6 +253,69 @@ class AuthoritativeTaskStore(Protocol):
         proposal_id: str,
     ) -> DelegationProposalRecord | None:
         """Retrieve an accepted delegation proposal record by parent_task_id and proposal_id."""
+        ...
+
+
+@runtime_checkable
+class TurnCompletionStore(Protocol):
+    """Authoritative platform port for universal fenced turn completion.
+
+    Governed by ADR-0007 (Decision 11) and Issue #222:
+    - One single-node Lua script commits canonical TerminalOutcome,
+      completion-command replay record, assignment-completion audit, terminal
+      lifecycle status, active-claim retirement, and (for delegated children)
+      parent projection with a single non-secret Research wake-up hint. All
+      expected validation rejections happen in read-only Phase 1 with zero
+      mutation; Phase 2 holds only prevalidated writes. Redis serializes
+      script execution atomically with respect to other clients; no rollback
+      is claimed for unexpected command errors, host failures,
+      out-of-memory conditions, or persistence failures;
+    - Failed turns persist no TaskResult;
+    - Identical retries return the recorded outcome with zero writes.
+    """
+
+    async def complete_turn(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        proof_digest: str,
+        fencing_epoch: int,
+        parent_task_id: str | None,
+        root_task_id: str,
+        completed_at: str,
+    ) -> tuple[TerminalOutcome, TaskResult | None, bool]:
+        """Atomically commit a fenced turn completion.
+
+        Returns (outcome, result_or_None, is_replay). Raises
+        CompletionConflictError on conflicting terminal state, ClaimNotFoundError
+        when the active claim is absent or mismatched, TaskAlreadyClaimedError on
+        fencing epoch mismatch, and TaskNotClaimableError on lifecycle or
+        lineage violations.
+        """
+        ...
+
+    async def get_completion_record(
+        self,
+        task_id: str,
+        completion_command_id: str,
+    ) -> CompletionRecord | None:
+        """Retrieve a completion-command replay record without mutating state."""
+        ...
+
+    async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None:
+        """Retrieve the canonical terminal outcome for a task, if any."""
+        ...
+
+    async def get_canonical_result(self, task_id: str) -> TaskResult | None:
+        """Retrieve the canonical TaskResult for a completed task, if any."""
+        ...
+
+    async def get_assignment_completion(
+        self,
+        task_id: str,
+        assignment_id: str,
+    ) -> AssignmentCompletionRecord | None:
+        """Retrieve the assignment-completion audit record, if any."""
         ...
 
 

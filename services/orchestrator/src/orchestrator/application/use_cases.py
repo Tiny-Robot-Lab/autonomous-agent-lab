@@ -10,6 +10,8 @@ from agent_contracts import (
     ArtifactReference,
     AssignmentYieldRecord,
     ClaimTaskResponse,
+    CompletionCommand,
+    CompletionResponse,
     DelegationGrant,
     DelegationProposalRecord,
     DelegationProposalRequest,
@@ -22,6 +24,7 @@ from agent_contracts import (
     TaskInput,
     TaskInputReference,
     TaskRequested,
+    TaskResult,
     WakeUpHint,
     compute_proposal_fingerprint,
     normalize_canonical_utc_timestamp,
@@ -64,6 +67,7 @@ from .ports import (
     CapabilityRouter,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    CompletionReplayAuthorizationError,
     DelegationReplayAuthorizationError,
     EventPublisher,
     InvalidClaimProofError,
@@ -73,6 +77,7 @@ from .ports import (
     TaskDispatcher,
     TaskNotClaimableError,
     TaskQueue,
+    TurnCompletionStore,
 )
 
 
@@ -1153,3 +1158,217 @@ class AcceptDelegationProposal:
             continuation_version=accepted_record.continuation_version,
             status="accepted",
         )
+
+
+class CompleteTurn:
+    """Authenticated universal fenced turn-completion use case.
+
+    Governed by ADR-0006, ADR-0007 (Decision 11), and Issue #222:
+    - Always requires a Bearer-authenticated active RuntimePrincipal and a
+      detached X-Assignment-Proof binding the live claim's proof digest;
+    - First completion requires the current active acknowledged claim, the
+      current nonterminal task state, and no conflicting canonical records;
+    - Replay after claim retirement authorizes read-only against the persisted
+      completion record, outcome, and stored proof digest, and normalizes every
+      failure to one generic authorization error that reveals nothing;
+    - Commits through the single-node TurnCompletionStore Lua boundary (all
+      expected validation rejections occur read-only with zero mutation; no
+      rollback is claimed for unexpected command errors, host failures,
+      out-of-memory conditions, or persistence failures); never writes
+      canonical result or outcome keys directly and never persists or logs the
+      plaintext proof.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        completion_store: TurnCompletionStore,
+        assignment_proof_pepper: str,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("CompleteTurn requires an AuthoritativeTaskStore")
+        if completion_store is None:
+            raise TypeError("CompleteTurn requires a TurnCompletionStore")
+        if not isinstance(completion_store, TurnCompletionStore):
+            raise TypeError(
+                "completion_store must implement TurnCompletionStore, "
+                f"got {type(completion_store).__name__}"
+            )
+        self._task_store = task_store
+        self._completion_store = completion_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        command_payload: dict[str, Any],
+        assignment_proof: str,
+    ) -> CompletionResponse:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        clean_task = str(task_id).strip()
+        if not clean_task:
+            raise ValueError("task_id must be a non-empty string")
+
+        clean_proof = str(assignment_proof).strip()
+        if not clean_proof:
+            raise ValueError("assignment_proof must be a non-empty string")
+
+        command = CompletionCommand.from_dict(command_payload)
+
+        if command.completed_result is not None:
+            if command.completed_result.task_id != clean_task:
+                raise ValueError(
+                    f"Completed TaskResult task_id '{command.completed_result.task_id}' "
+                    f"does not match route task '{clean_task}'"
+                )
+            if command.completed_result.status != "completed":
+                raise ValueError(
+                    "Completed TaskResult status must be 'completed' "
+                    f"for route task '{clean_task}'"
+                )
+
+        claim = await self._task_store.get_active_claim(clean_task)
+
+        if claim is not None and claim.assignment_id == command.assignment_id:
+            return await self._execute_first_completion(
+                principal=principal,
+                task_id=clean_task,
+                command=command,
+                proof=clean_proof,
+                claim=claim,
+            )
+        return await self._execute_retired_replay(
+            principal=principal,
+            task_id=clean_task,
+            command=command,
+            proof=clean_proof,
+        )
+
+    async def _execute_first_completion(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        command: CompletionCommand,
+        proof: str,
+        claim: ActiveClaim,
+    ) -> CompletionResponse:
+        if claim.runtime_principal_id != principal.principal_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{command.assignment_id}' is not owned by principal '{principal.principal_id}'"
+            )
+        if claim.bound_agent_id != principal.bound_agent_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{command.assignment_id}' is bound to agent '{claim.bound_agent_id}', "
+                f"not '{principal.bound_agent_id}'"
+            )
+        if not principal.has_capability(claim.assigned_capability):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks capability '{claim.assigned_capability}'"
+            )
+        if command.execution_kind != claim.execution_kind:
+            raise CapabilityMismatchError(
+                f"Completion execution_kind '{command.execution_kind}' does not match "
+                f"claimed execution_kind '{claim.execution_kind}'"
+            )
+        if command.continuation_version != claim.continuation_version:
+            raise TaskNotClaimableError(
+                f"Completion continuation version '{command.continuation_version}' does not match "
+                f"claimed continuation version '{claim.continuation_version}'"
+            )
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Assignment must be acknowledged before completing the turn")
+
+        cur_epoch = await self._task_store.get_fencing_epoch(task_id)
+        if claim.fencing_epoch != cur_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{command.assignment_id}': "
+                f"claim={claim.fencing_epoch}, current={cur_epoch}"
+            )
+
+        if not verify_assignment_proof(self._verifier_key, proof, claim.proof_digest):
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        lineage = await self._task_store.get_lineage(task_id)
+        if lineage is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Active claim exists for task '{task_id}' with no authoritative lineage"
+            )
+
+        now_iso = normalize_canonical_utc_timestamp(self._clock())
+        outcome, result, replayed = await self._completion_store.complete_turn(
+            task_id=task_id,
+            command=command,
+            proof_digest=claim.proof_digest,
+            fencing_epoch=claim.fencing_epoch,
+            parent_task_id=lineage.parent_task_id,
+            root_task_id=lineage.root_task_id,
+            completed_at=now_iso,
+            runtime_principal_id=claim.runtime_principal_id,
+            bound_agent_id=claim.bound_agent_id,
+        )
+        return CompletionResponse(outcome=outcome, replayed=replayed, result=result)
+
+    async def _execute_retired_replay(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        command: CompletionCommand,
+        proof: str,
+    ) -> CompletionResponse:
+        record = await self._completion_store.get_completion_record(
+            task_id, command.completion_command_id
+        )
+        if record is None:
+            # Uniform failure: a missing record is indistinguishable from a
+            # failed authorization so retired replays reveal no existence,
+            # task-state, or command information.
+            raise CompletionReplayAuthorizationError("Completion replay authorization failed")
+
+        authorized = (
+            record.task_id == task_id
+            and record.assignment_id == command.assignment_id
+            and record.runtime_principal_id == principal.principal_id
+            and record.bound_agent_id == principal.bound_agent_id
+            and record.execution_kind == command.execution_kind
+            and record.continuation_version == command.continuation_version
+            and record.semantic_fingerprint == command.semantic_fingerprint()
+            and verify_assignment_proof(self._verifier_key, proof, record.proof_digest)
+        )
+        if not authorized:
+            raise CompletionReplayAuthorizationError("Completion replay authorization failed")
+
+        outcome = await self._completion_store.get_terminal_outcome(task_id)
+        if outcome is None or outcome.outcome_id != record.outcome_id:
+            raise CorruptAuthoritativeRecordError(
+                f"Canonical terminal outcome missing or inconsistent for replayed task '{task_id}'"
+            )
+        if outcome.task_id != task_id:
+            raise CorruptAuthoritativeRecordError(
+                f"Canonical terminal outcome task mismatch for replayed task '{task_id}'"
+            )
+
+        result: TaskResult | None = None
+        if outcome.terminal_status == "completed":
+            result = await self._completion_store.get_canonical_result(task_id)
+            if result is None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Canonical result missing for completed replayed task '{task_id}'"
+                )
+            if result.task_id != task_id or result.status != "completed":
+                raise CorruptAuthoritativeRecordError(
+                    f"Canonical result inconsistent for completed replayed task '{task_id}'"
+                )
+        else:
+            unexpected = await self._completion_store.get_canonical_result(task_id)
+            if unexpected is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Unexpected canonical result for failed replayed task '{task_id}'"
+                )
+
+        return CompletionResponse(outcome=outcome, replayed=True, result=result)

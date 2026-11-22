@@ -9,6 +9,7 @@ import redis.asyncio as redis
 from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
+    CompletionCommand,
     FallbackEligibleInferenceError,
     FallbackTransition,
     InferenceHealthStatus,
@@ -17,7 +18,6 @@ from agent_contracts import (
     TaskResult,
 )
 from agent_policy import RankedProviderCandidate
-from orchestrator.infrastructure.redis_adapter import RedisGateway
 from worker.application.fallback import (
     FallbackInferenceProvider,
     WorkerFallbackCoordinator,
@@ -33,32 +33,50 @@ from worker.infrastructure.redis_bus import RedisBus, retry_with_backoff
 from worker.infrastructure.stub_inference import StubInferenceProvider
 
 
-class FakeResultStore:
-    def __init__(self) -> None:
-        self.saved: dict[str, TaskResult] = {}
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
 
-    async def save(self, result: TaskResult) -> None:
-        self.saved[result.task_id] = result
+    def __init__(self) -> None:
+        self.submitted: list[CompletionCommand] = []
+        self.proofs: list[str] = []
+        self.task_ids: list[str] = []
+
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.task_ids.append(task_id)
+        self.submitted.append(command)
+        self.proofs.append(assignment_proof)
+        return {"outcome": {}, "replayed": False}
 
 
 class FakeMessageBus:
     def __init__(self) -> None:
         self.published: list[AgentEvent] = []
-        self.saved: dict[str, TaskResult] = {}
 
     async def publish(self, event: AgentEvent) -> None:
         self.published.append(event)
-
-    async def save(self, result: TaskResult) -> None:
-        self.saved[result.task_id] = result
 
     async def next_task(self) -> TaskRequested:
         raise NotImplementedError
 
 
+ASSIGNMENT_ID = "assign-test-1"
+ASSIGNMENT_PROOF = "proof-test-1"
+
+
 class FailingTaskProcessor(TaskProcessor):
-    def __init__(self, agent_id: str, bus: FakeMessageBus, error_to_raise: Exception) -> None:
-        super().__init__(agent_id, bus)
+    def __init__(
+        self,
+        agent_id: str,
+        bus: FakeMessageBus,
+        error_to_raise: Exception,
+        completion_client: FakeCompletionClient | None = None,
+    ) -> None:
+        super().__init__(agent_id, bus, completion_client=completion_client or FakeCompletionClient())
         self.error_to_raise = error_to_raise
 
     async def process(self, task: TaskRequested) -> NoReturn:
@@ -66,6 +84,14 @@ class FailingTaskProcessor(TaskProcessor):
 
 
 class FastTaskProcessor(TaskProcessor):
+    def __init__(
+        self,
+        agent_id: str,
+        bus: FakeMessageBus,
+        completion_client: FakeCompletionClient | None = None,
+    ) -> None:
+        super().__init__(agent_id, bus, completion_client=completion_client or FakeCompletionClient())
+
     async def process(self, task: TaskRequested) -> None:
         # Fast no-op for tests
         return None
@@ -74,11 +100,15 @@ class FastTaskProcessor(TaskProcessor):
 @pytest.mark.anyio
 async def test_successful_task_processing_transitions() -> None:
     bus = FakeMessageBus()
-    processor = FastTaskProcessor("worker-1", bus)
+    completion_client = FakeCompletionClient()
+    processor = FastTaskProcessor("worker-1", bus, completion_client=completion_client)
     task = TaskRequested.create("test prompt")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
+    assert len(completion_client.submitted) == 1
+    assert completion_client.proofs == [ASSIGNMENT_PROOF]
+    assert completion_client.task_ids == [task.task_id]
     assert len(bus.published) == 2
     working_event, idle_event = bus.published
 
@@ -93,12 +123,16 @@ async def test_successful_task_processing_transitions() -> None:
 @pytest.mark.anyio
 async def test_failed_task_processing_transitions_and_restores_idle() -> None:
     bus = FakeMessageBus()
+    completion_client = FakeCompletionClient()
     error = ValueError("Invalid prompt parameters")
-    processor = FailingTaskProcessor("worker-1", bus, error)
+    processor = FailingTaskProcessor("worker-1", bus, error, completion_client=completion_client)
     task = TaskRequested.create("broken prompt")
 
     with pytest.raises(TaskExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
+
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].failure_code == "EXECUTION_FAILED"
 
     assert exc_info.value.original_error == error
     assert exc_info.value.task_id == task.task_id
@@ -200,6 +234,7 @@ async def test_worker_redis_bus_register() -> None:
 
 @pytest.mark.anyio
 async def test_run_worker_registers_capability_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-1")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -230,20 +265,23 @@ async def test_run_worker_registers_capability_metadata(monkeypatch: pytest.Monk
 
 
 @pytest.mark.anyio
-async def test_task_processor_stores_result_on_success() -> None:
+async def test_task_processor_submits_completed_command_on_success() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
-    processor = FastTaskProcessor("worker-1", bus, result_store=store)
+    completion_client = FakeCompletionClient()
+    processor = FastTaskProcessor("worker-1", bus, completion_client=completion_client)
     task = TaskRequested.create("Build docker image")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert saved.task_id == task.task_id
-    assert saved.status == "completed"
-    assert saved.output == f"Completed: {task.prompt}"
-    assert saved.acknowledged is True
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.assignment_id == ASSIGNMENT_ID
+    assert command.execution_kind == "initial"
+    assert command.failure_code is None
+    assert command.completed_result is not None
+    assert command.completed_result.task_id == task.task_id
+    assert command.completed_result.status == "completed"
+    assert command.completed_result.output == f"Completed: {task.prompt}"
 
     # Working and idle events preserved
     assert len(bus.published) == 2
@@ -257,19 +295,21 @@ async def test_task_processor_stores_result_on_success() -> None:
 
 
 @pytest.mark.anyio
-async def test_task_processor_error_does_not_store_result() -> None:
+async def test_task_processor_error_submits_safe_failure_code() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     error = RuntimeError("Execution crashed")
-    processor = FailingTaskProcessor("worker-1", bus, error)
+    processor = FailingTaskProcessor("worker-1", bus, error, completion_client=completion_client)
     task = TaskRequested.create("Failing general task")
 
-    processor.result_store = store
-
     with pytest.raises(TaskExecutionError):
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert len(store.saved) == 0
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.failure_code == "EXECUTION_FAILED"
+    assert command.completed_result is None
+    assert "Execution crashed" not in command.to_json()
 
     # Lifecycle events: working -> error -> idle
     assert len(bus.published) == 3
@@ -285,58 +325,33 @@ async def test_task_processor_with_custom_output() -> None:
             return f"Calculated metrics for: {task.prompt}"
 
     bus = FakeMessageBus()
-    store = FakeResultStore()
-    processor = CustomOutputProcessor("worker-1", bus, result_store=store)
+    completion_client = FakeCompletionClient()
+    processor = CustomOutputProcessor("worker-1", bus, completion_client=completion_client)
     task = TaskRequested.create("Aggregate stats")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    assert store.saved[task.task_id].output == f"Calculated metrics for: {task.prompt}"
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].completed_result is not None
+    assert completion_client.submitted[0].completed_result.output == f"Calculated metrics for: {task.prompt}"
 
 
 @pytest.mark.anyio
-async def test_task_processor_saves_via_bus_if_result_store_omitted() -> None:
+async def test_task_processor_requires_completion_client() -> None:
     bus = FakeMessageBus()
-    processor = FastTaskProcessor("worker-1", bus)
-    task = TaskRequested.create("Auto save task")
-
-    await processor.run_once(task)
-
-    assert task.task_id in bus.saved
-    assert bus.saved[task.task_id].status == "completed"
-
-
-# --- Infrastructure RedisBus Save Tests ---
+    with pytest.raises(TypeError, match="TurnCompletionClient"):
+        TaskProcessor("worker-1", bus)
 
 
 @pytest.mark.anyio
-async def test_worker_redis_bus_save() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
-    bus.client.set = AsyncMock()  # type: ignore[method-assign]
-
-    result = TaskResult(task_id="task-work-99", output="Rendered artifact")
-    await bus.save(result)
-
-    bus.client.set.assert_awaited_once()
-    key, val = bus.client.set.await_args[0]
-    assert key == "task.result:task-work-99"
-    data = json.loads(val)
-    assert data == {
-        "task_id": "task-work-99",
-        "status": "completed",
-        "output": "Rendered artifact",
-        "acknowledged": True,
-    }
-
-
-@pytest.mark.anyio
-async def test_run_worker_wires_result_store(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_worker_wires_completion_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_ID", "worker-1")
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
 
     with (
         patch("worker.main.RedisBus") as mock_bus_cls,
         patch("worker.main.TaskProcessor") as mock_processor_cls,
+        patch("worker.main.OrchestratorClient") as mock_client_cls,
     ):
         mock_bus = AsyncMock()
         mock_bus_cls.return_value = mock_bus
@@ -349,7 +364,7 @@ async def test_run_worker_wires_result_store(monkeypatch: pytest.MonkeyPatch) ->
 
         mock_processor_cls.assert_called_once()
         _, kwargs = mock_processor_cls.call_args
-        assert kwargs.get("result_store") == mock_bus
+        assert kwargs.get("completion_client") is mock_client_cls.return_value
         assert isinstance(kwargs.get("inference_provider"), StubInferenceProvider)
 
 
@@ -406,40 +421,42 @@ async def test_task_processor_uses_inference_provider_output() -> None:
             return f"Custom inference: {prompt}"
 
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         "worker-1",
         bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=CustomInferenceProvider(),
     )
     task = TaskRequested.create("Optimize database queries")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    assert store.saved[task.task_id].output == f"Custom inference: {task.prompt}"
-    assert store.saved[task.task_id].status == "completed"
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].completed_result is not None
+    assert completion_client.submitted[0].completed_result.output == f"Custom inference: {task.prompt}"
+    assert completion_client.submitted[0].completed_result.status == "completed"
 
 
 @pytest.mark.anyio
-async def test_task_processor_persists_generated_output_to_result_store() -> None:
+async def test_task_processor_submits_generated_output_as_completed() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         "worker-1",
         bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=StubInferenceProvider(),
     )
     task = TaskRequested.create("Analyze queue throughput")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert saved.output == f"Generated response for: {task.prompt}"
-    assert saved.status == "completed"
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.output == f"Generated response for: {task.prompt}"
+    assert completed.status == "completed"
 
 
 @pytest.mark.anyio
@@ -449,20 +466,21 @@ async def test_task_processor_inference_failure_lifecycle_and_no_persistence() -
             raise RuntimeError("Inference engine offline")
 
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     processor = TaskProcessor(
         "worker-1",
         bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=FailingInferenceProvider(),
     )
     task = TaskRequested.create("Failing inference task")
 
     with pytest.raises(TaskExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert "Inference engine offline" in str(exc_info.value.original_error)
-    assert len(store.saved) == 0
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].failure_code == "EXECUTION_FAILED"
 
     # Lifecycle: working -> error -> idle
     assert len(bus.published) == 3
@@ -734,6 +752,7 @@ async def test_cloudflare_provider_malformed_json_raises() -> None:
 async def test_run_worker_registers_custom_inference_provider_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-cf")
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-cf")
@@ -758,6 +777,7 @@ async def test_run_worker_registers_custom_inference_provider_metadata(
 async def test_run_worker_unsupported_inference_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "unknown-provider")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -773,6 +793,7 @@ async def test_run_worker_unsupported_inference_provider_fails_startup(
 async def test_run_worker_multi_provider_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-multi")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-multi")
@@ -797,6 +818,7 @@ async def test_run_worker_multi_provider_startup(
 async def test_run_worker_health_probe_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     # 1. Default when unset is 3.0
     monkeypatch.delenv("HEALTH_PROBE_TIMEOUT_SECONDS", raising=False)
     with patch("worker.main.RedisBus") as mock_bus_cls, patch(
@@ -852,6 +874,7 @@ async def test_run_worker_health_probe_timeout_configuration(
 async def test_run_worker_missing_secondary_credentials_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
@@ -871,6 +894,7 @@ async def test_run_worker_missing_secondary_credentials_fails_startup(
 async def test_run_worker_unsupported_secondary_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,invalid_vendor")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -926,82 +950,70 @@ async def test_worker_redis_bus_serializes_fallback_transition_as_json() -> None
 
 
 @pytest.mark.anyio
-async def test_general_worker_with_inference_provider_retrievable_in_orchestrator() -> None:
-    redis_storage: dict[str, str] = {}
+async def test_general_worker_with_inference_provider_submits_canonical_completion() -> None:
+    completion_client = FakeCompletionClient()
 
     worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
     worker_bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
-
-    async def mock_set(key: str, value: str) -> None:
-        redis_storage[key] = value
-
-    worker_bus.client.set = AsyncMock(side_effect=mock_set)  # type: ignore[method-assign]
 
     inference_provider = StubInferenceProvider()
     processor = TaskProcessor(
         "worker-1",
         worker_bus,
-        result_store=worker_bus,
+        completion_client=completion_client,
         inference_provider=inference_provider,
     )
     task = TaskRequested.create("Generate release summary")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    # The runtime never writes canonical keys itself; it submits the canonical
+    # command whose bytes the platform persists atomically.
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.completed_result is not None
+    assert command.completed_result.task_id == task.task_id
+    assert command.completed_result.output == f"Generated response for: {task.prompt}"
+    assert command.semantic_fingerprint() == CompletionCommand(
+        completion_command_id="cmd-other",
+        assignment_id=ASSIGNMENT_ID,
+        execution_kind="initial",
+        completed_result=command.completed_result,
+    ).semantic_fingerprint()
 
-    async def mock_get(key: str) -> str | None:
-        return redis_storage.get(key)
-
-    gateway._client.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
-
-    retrieved = await gateway.get_result(task.task_id)
-    assert retrieved is not None
-    assert retrieved["task_id"] == task.task_id
-    assert retrieved["status"] == "completed"
-    assert retrieved["output"] == f"Generated response for: {task.prompt}"
-    assert retrieved["acknowledged"] is True
 
 
-
-# --- Orchestrator Retrieval Integration Test ---
+# --- Canonical Completion Submission Test ---
 
 
 @pytest.mark.anyio
-async def test_general_worker_task_produces_retrievable_result_in_orchestrator() -> None:
-    redis_storage: dict[str, str] = {}
+async def test_general_worker_task_submits_canonical_result_for_platform_persistence() -> None:
+    completion_client = FakeCompletionClient()
 
     worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
     worker_bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
 
-    async def mock_set(key: str, value: str) -> None:
-        redis_storage[key] = value
-
-    worker_bus.client.set = AsyncMock(side_effect=mock_set)  # type: ignore[method-assign]
-
-    processor = FastTaskProcessor("worker-1", worker_bus, result_store=worker_bus)
+    processor = FastTaskProcessor("worker-1", worker_bus, completion_client=completion_client)
     task = TaskRequested.create("Verify compile output")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    # Now verify that Orchestrator's RedisGateway retrieves the exact completed result
-    gateway = RedisGateway("redis://localhost:6379/0")
-
-    async def mock_get(key: str) -> str | None:
-        return redis_storage.get(key)
-
-    gateway._client.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
-
-    retrieved = await gateway.get_result(task.task_id)
-    assert retrieved is not None
-    assert retrieved["task_id"] == task.task_id
-    assert retrieved["status"] == "completed"
-    assert retrieved["output"] == f"Completed: {task.prompt}"
-    assert retrieved["acknowledged"] is True
+    # The canonical TaskResult the platform persists is exactly the submitted one.
+    assert len(completion_client.submitted) == 1
+    command = completion_client.submitted[0]
+    assert command.completed_result is not None
+    canonical = command.completed_result.to_json()
+    assert f"Completed: {task.prompt}" in canonical
+    assert command.semantic_fingerprint() == CompletionCommand(
+        completion_command_id="cmd-other",
+        assignment_id=ASSIGNMENT_ID,
+        execution_kind="initial",
+        completed_result=command.completed_result,
+    ).semantic_fingerprint()
 
 
 # --- Gemini Adapter Tests ---
@@ -1838,12 +1850,12 @@ async def test_worker_fallback_coordinator_returns_plain_str() -> None:
 @pytest.mark.anyio
 async def test_task_processor_direct_provider_injection_returns_plain_str() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     provider = StubInferenceProvider(custom_response="processor output")
     processor = TaskProcessor(
         agent_id="worker-compat-test",
         bus=bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
     task = TaskRequested.create("Run direct processor task")
@@ -1856,22 +1868,22 @@ async def test_task_processor_direct_provider_injection_returns_plain_str() -> N
 @pytest.mark.anyio
 async def test_normal_runtime_task_result_output_remains_plain_str() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     provider = StubInferenceProvider(custom_response="result store output")
     processor = TaskProcessor(
         agent_id="worker-compat-test",
         bus=bus,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=provider,
     )
     task = TaskRequested.create("Run result verification task")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert isinstance(saved, TaskResult)
-    assert type(saved.output) is str
-    assert saved.output == "result store output"
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert isinstance(completed, TaskResult)
+    assert type(completed.output) is str
+    assert completed.output == "result store output"
 
 
 @pytest.mark.anyio

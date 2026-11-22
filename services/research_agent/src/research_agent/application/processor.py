@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from agent_contracts import AgentEvent, TaskRequested
+from agent_contracts import (
+    AgentEvent,
+    CompletionCommand,
+    TaskRequested,
+    TaskResult,
+    classify_completion_failure,
+)
 
 from research_agent.application.ports import (
     InferenceProvider,
     MessageBus,
     ResearchExecutor,
-    ResultStore,
+    TurnCompletionClient,
 )
 from research_agent.domain.models import ResearchResult
 
@@ -29,23 +36,47 @@ class ResearchExecutionError(Exception):
 
 
 class ResearchProcessor:
+    """Assignment-backed research turn processor.
+
+    Every turn completes exclusively through the trusted Orchestrator
+    completion boundary via the injected TurnCompletionClient. Canonical
+    result/outcome keys are never written directly; failures submit only the
+    platform-owned safe failure code derived from the local exception, which
+    itself is never sent or persisted as canonical data.
+    """
+
     def __init__(
         self,
         agent_id: str,
         bus: MessageBus,
         executor: ResearchExecutor,
-        result_store: ResultStore | None = None,
+        completion_client: TurnCompletionClient | None = None,
         inference_provider: InferenceProvider | None = None,
         fallback_coordinator: ResearchFallbackCoordinator | None = None,
     ) -> None:
+        if completion_client is None:
+            raise TypeError("ResearchProcessor requires a TurnCompletionClient")
         self.agent_id = agent_id
         self.bus = bus
         self.executor = executor
-        self.result_store = result_store
+        self.completion_client = completion_client
         self.inference_provider = inference_provider
         self.fallback_coordinator = fallback_coordinator
 
-    async def run_once(self, task: TaskRequested) -> None:
+    async def run_once(
+        self,
+        task: TaskRequested,
+        *,
+        assignment_id: str,
+        assignment_proof: str,
+        execution_kind: str = "initial",
+        continuation_version: int | None = None,
+    ) -> None:
+        """Execute one claimed turn and submit its fenced completion."""
+        if not assignment_id or not str(assignment_id).strip():
+            raise ValueError("assignment_id must be a non-empty string")
+        if not assignment_proof or not str(assignment_proof).strip():
+            raise ValueError("assignment_proof must be a non-empty string")
         logger.info("Research agent %s processing task %s", self.agent_id, task.task_id)
         await self.bus.publish(
             AgentEvent.create(
@@ -78,26 +109,72 @@ class ResearchProcessor:
                     sources=result.sources,
                 )
 
-            if self.result_store is not None:
-                await self.result_store.save(result)
-            elif hasattr(self.bus, "save"):
-                await self.bus.save(result)
-
-            await self.bus.publish(
-                AgentEvent.create(
-                    self.agent_id, "idle", "Task completed", task.task_id
-                )
-            )
-            logger.info(
-                "Research agent %s completed task %s successfully",
-                self.agent_id,
-                task.task_id,
+            command = CompletionCommand(
+                completion_command_id=f"completion-{uuid4()}",
+                assignment_id=str(assignment_id).strip(),
+                execution_kind=execution_kind,
+                continuation_version=continuation_version,
+                completed_result=TaskResult(
+                    task_id=result.task_id,
+                    output=result.output,
+                    sources=[s.to_dict() for s in result.sources] or None,
+                ),
             )
         except Exception as exc:
             logger.exception("Research task %s failed during execution", task.task_id)
+            failure_code = classify_completion_failure(exc)
+            try:
+                failure_command = CompletionCommand(
+                    completion_command_id=f"completion-{uuid4()}",
+                    assignment_id=str(assignment_id).strip(),
+                    execution_kind=execution_kind,
+                    continuation_version=continuation_version,
+                    failure_code=failure_code,
+                )
+                await self.completion_client.submit_completion(
+                    task_id=task.task_id,
+                    command=failure_command,
+                    assignment_proof=assignment_proof,
+                )
+            except Exception as submit_exc:  # noqa: BLE001 - best-effort failure submission must never mask the original error
+                logger.error(
+                    "Research agent %s failed to submit safe failure completion for task %s: %s",
+                    self.agent_id,
+                    task.task_id,
+                    submit_exc,
+                )
             # Record failure in event stream and set current state to error.
             # Do not immediately overwrite error with idle.
             await self.bus.publish(
                 AgentEvent.create(self.agent_id, "error", "Task failed", task.task_id)
             )
             raise ResearchExecutionError(task.task_id, exc) from exc
+
+        try:
+            await self.completion_client.submit_completion(
+                task_id=task.task_id,
+                command=command,
+                assignment_proof=assignment_proof,
+            )
+        except Exception as submit_exc:
+            logger.error(
+                "Research agent %s failed to submit completion for task %s: %s",
+                self.agent_id,
+                task.task_id,
+                submit_exc,
+            )
+            await self.bus.publish(
+                AgentEvent.create(self.agent_id, "error", "Task failed", task.task_id)
+            )
+            raise ResearchExecutionError(task.task_id, submit_exc) from submit_exc
+
+        await self.bus.publish(
+            AgentEvent.create(
+                self.agent_id, "idle", "Task completed", task.task_id
+            )
+        )
+        logger.info(
+            "Research agent %s completed task %s successfully",
+            self.agent_id,
+            task.task_id,
+        )

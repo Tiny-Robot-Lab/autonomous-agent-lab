@@ -1,6 +1,7 @@
 import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 import redis.asyncio as redis
@@ -13,7 +14,6 @@ from agent_contracts import (
 from analysis_agent.infrastructure.redis_bus import RedisBus as AnalysisRedisBus
 from orchestrator.domain.capability import AgentCapability
 from orchestrator.infrastructure.redis_adapter import RedisGateway
-from research_agent.domain.models import ResearchResult
 from research_agent.infrastructure.redis_bus import RedisBus as ResearchRedisBus
 from worker.infrastructure.redis_bus import RedisBus
 
@@ -116,7 +116,7 @@ async def test_analysis_redis_bus_consumes_from_configured_queue() -> None:
 
 
 @pytest.mark.anyio
-async def test_analysis_redis_bus_registers_metadata_and_persists_task_result() -> None:
+async def test_analysis_redis_bus_registers_metadata_without_direct_result_write() -> None:
     bus = AnalysisRedisBus("redis://localhost:6379/0")
     bus.client.sadd = AsyncMock()
     bus.client.hset = AsyncMock()
@@ -128,10 +128,8 @@ async def test_analysis_redis_bus_registers_metadata_and_persists_task_result() 
         providers={"analysis_engine": "deterministic"},
         dispatch_target="agent.tasks.analysis",
     )
-    result = TaskResult(task_id="analysis-task", output="Analysis report")
 
     await bus.register(metadata)
-    await bus.save(result)
 
     bus.client.sadd.assert_awaited_once_with("agent.ids", "analysis-agent-1")
     assert bus.client.hset.await_args.args[0] == "agent.state:analysis-agent-1"
@@ -140,15 +138,10 @@ async def test_analysis_redis_bus_registers_metadata_and_persists_task_result() 
         bus.client.hset.await_args.kwargs["mapping"]["dispatch_target"]
         == "agent.tasks.analysis"
     )
-    bus.client.set.assert_awaited_once()
-    key, raw_result = bus.client.set.await_args.args
-    assert key == "task.result:analysis-task"
-    assert json.loads(raw_result) == {
-        "task_id": "analysis-task",
-        "status": "completed",
-        "output": "Analysis report",
-        "acknowledged": True,
-    }
+    # Canonical completion flows through the Orchestrator boundary; the bus
+    # exposes no direct result-write seam.
+    assert not hasattr(bus, "save")
+    bus.client.set.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -179,6 +172,7 @@ async def test_redis_bus_consumes_from_configured_queue() -> None:
 
 @pytest.mark.anyio
 async def test_run_worker_uses_task_queue_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.research")
     monkeypatch.setenv("AGENT_ID", "research-worker-1")
 
@@ -200,6 +194,7 @@ async def test_run_worker_uses_task_queue_env_var(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.anyio
 async def test_run_worker_defaults_to_general_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-1")
 
@@ -221,27 +216,45 @@ async def test_run_worker_defaults_to_general_queue(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_completed() -> None:
+    from agent_contracts import (
+        CompletionCommand,
+        build_terminal_outcome,
+    )
+
     gateway = RedisGateway("redis://localhost:6379/0")
-    result_data = {
-        "task_id": "task-res-1",
-        "status": "completed",
-        "output": "Found 3 articles",
-        "acknowledged": True,
-    }
-    gateway._client.get = AsyncMock(return_value=json.dumps(result_data))
+    command = CompletionCommand(
+        completion_command_id="cmd-res-1",
+        assignment_id="assign-res-1",
+        execution_kind="initial",
+        completed_result=TaskResult(task_id="task-res-1", output="Found 3 articles"),
+    )
+    outcome, result = build_terminal_outcome(
+        command=command,
+        task_id="task-res-1",
+        runtime_principal_id="principal-1",
+        bound_agent_id="agent-1",
+        completed_at="2026-11-20T00:00:00.000000Z",
+    )
+    assert result is not None
+    gateway._client.get = AsyncMock(
+        side_effect=[outcome.to_json(), result.to_json()]
+    )
 
     res = await gateway.get_result("task-res-1")
 
-    assert res == result_data
-    gateway._client.get.assert_awaited_once_with("task.result:task-res-1")
+    assert res == result.to_dict()
+    assert gateway._client.get.await_args_list == [
+        mock_call("task.outcome:task-res-1"),
+        mock_call("task.result:task-res-1"),
+    ]
 
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_pending() -> None:
     gateway = RedisGateway("redis://localhost:6379/0")
-    # First get() for task.result returns None, second for task.status returns status json
+    # Outcome, then legacy result, then status
     gateway._client.get = AsyncMock(
-        side_effect=[None, json.dumps({"task_id": "task-res-2", "status": "pending"})]
+        side_effect=[None, None, json.dumps({"task_id": "task-res-2", "status": "pending"})]
     )
 
     res = await gateway.get_result("task-res-2")
@@ -251,6 +264,57 @@ async def test_redis_gateway_get_result_pending() -> None:
         "status": "pending",
         "output": None,
     }
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_failed_outcome_has_no_result() -> None:
+    from agent_contracts import (
+        CompletionCommand,
+        build_terminal_outcome,
+    )
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    command = CompletionCommand(
+        completion_command_id="cmd-res-fail",
+        assignment_id="assign-res-fail",
+        execution_kind="initial",
+        failure_code="EXECUTION_FAILED",
+    )
+    outcome, result = build_terminal_outcome(
+        command=command,
+        task_id="task-res-fail",
+        runtime_principal_id="principal-1",
+        bound_agent_id="agent-1",
+        completed_at="2026-11-20T00:00:00.000000Z",
+    )
+    assert result is None
+    gateway._client.get = AsyncMock(side_effect=[outcome.to_json(), None])
+
+    res = await gateway.get_result("task-res-fail")
+
+    assert res == {
+        "task_id": "task-res-fail",
+        "status": "failed",
+        "output": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_legacy_result_remains_readable() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0")
+    legacy_data = {
+        "task_id": "task-legacy-1",
+        "status": "completed",
+        "output": "Legacy direct-write output",
+        "acknowledged": True,
+    }
+    gateway._client.get = AsyncMock(
+        side_effect=[None, json.dumps(legacy_data)]
+    )
+
+    res = await gateway.get_result("task-legacy-1")
+
+    assert res == legacy_data
 
 
 @pytest.mark.anyio
@@ -264,22 +328,156 @@ async def test_redis_gateway_get_result_unknown() -> None:
     assert res is None
 
 
+def _completed_outcome_and_result(task_id: str = "task-fc-1") -> tuple[str, str]:
+    from agent_contracts import (
+        CompletionCommand,
+        TaskResult,
+        build_terminal_outcome,
+    )
+
+    command = CompletionCommand(
+        completion_command_id="cmd-fc-1",
+        assignment_id="assign-fc-1",
+        execution_kind="initial",
+        completed_result=TaskResult(task_id=task_id, output="canonical output"),
+    )
+    outcome, result = build_terminal_outcome(
+        command=command,
+        task_id=task_id,
+        runtime_principal_id="principal-1",
+        bound_agent_id="agent-1",
+        completed_at="2026-11-20T00:00:00.000000Z",
+    )
+    assert result is not None
+    return outcome.to_json(), result.to_json()
+
+
 @pytest.mark.anyio
-async def test_research_redis_bus_save_result() -> None:
+async def test_redis_gateway_get_result_completed_missing_result_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    outcome_json, _ = _completed_outcome_and_result()
+    gateway._client.get = AsyncMock(side_effect=[outcome_json, None])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="refusing to fabricate output"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_completed_corrupt_result_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    outcome_json, _ = _completed_outcome_and_result()
+    gateway._client.get = AsyncMock(side_effect=[outcome_json, "not-json{{{"])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt canonical result"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_completed_wrong_task_result_fails_closed() -> None:
+    from agent_contracts import TaskResult
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    outcome_json, _ = _completed_outcome_and_result()
+    other = TaskResult(task_id="task-elsewhere", output="canonical output")
+    gateway._client.get = AsyncMock(side_effect=[outcome_json, other.to_json()])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="not bound to"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_completed_non_completed_result_fails_closed() -> None:
+    from agent_contracts import TaskResult
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    outcome_json, _ = _completed_outcome_and_result()
+    non_terminal = TaskResult(task_id="task-fc-1", output="canonical output", status="failed")
+    gateway._client.get = AsyncMock(side_effect=[outcome_json, non_terminal.to_json()])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="not bound to"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_failed_unexpected_result_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    from agent_contracts import CompletionCommand, build_terminal_outcome
+
+    command = CompletionCommand(
+        completion_command_id="cmd-fc-2",
+        assignment_id="assign-fc-2",
+        execution_kind="initial",
+        failure_code="EXECUTION_FAILED",
+    )
+    outcome, result = build_terminal_outcome(
+        command=command,
+        task_id="task-fc-2",
+        runtime_principal_id="principal-1",
+        bound_agent_id="agent-1",
+        completed_at="2026-11-20T00:00:00.000000Z",
+    )
+    assert result is None
+    gateway._client.get = AsyncMock(
+        side_effect=[outcome.to_json(), '{"task_id":"task-fc-2"}']
+    )
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Unexpected canonical result"):
+        await gateway.get_result("task-fc-2")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_corrupt_outcome_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway._client.get = AsyncMock(side_effect=["not-json{{{"])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt terminal outcome"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_mismatched_outcome_task_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    outcome_json, _ = _completed_outcome_and_result(task_id="task-other")
+    gateway._client.get = AsyncMock(side_effect=[outcome_json])
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="not bound to the requested task"):
+        await gateway.get_result("task-fc-1")
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_get_result_legacy_wrong_task_fails_closed() -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway._client.get = AsyncMock(
+        side_effect=[None, json.dumps({"task_id": "task-elsewhere", "output": "x"})]
+    )
+
+    with pytest.raises(CorruptAuthoritativeRecordError, match="not bound to the requested task"):
+        await gateway.get_result("task-legacy-9")
+
+
+@pytest.mark.anyio
+async def test_research_redis_bus_exposes_no_direct_result_write() -> None:
     bus = ResearchRedisBus("redis://localhost:6379/0")
     bus.client.set = AsyncMock()
 
-    result = ResearchResult(task_id="res-abc-123", output="Full research text")
-    await bus.save(result)
-
-    bus.client.set.assert_awaited_once()
-    key, val = bus.client.set.await_args[0]
-    assert key == "task.result:res-abc-123"
-    loaded = json.loads(val)
-    assert loaded["task_id"] == "res-abc-123"
-    assert loaded["status"] == "completed"
-    assert loaded["output"] == "Full research text"
-    assert loaded["acknowledged"] is True
+    # Canonical completion flows through the Orchestrator boundary; the bus
+    # exposes no direct result-write seam.
+    assert not hasattr(bus, "save")
+    bus.client.set.assert_not_awaited()
 
 
 @pytest.mark.anyio

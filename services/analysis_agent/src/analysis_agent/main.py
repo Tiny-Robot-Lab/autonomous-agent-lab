@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from uuid import uuid4
 
 from agent_contracts import (
     AgentCapabilityMetadata,
@@ -9,6 +10,7 @@ from agent_contracts import (
     HeartbeatRunner,
     parse_heartbeat_interval,
 )
+from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
 
 from analysis_agent.application.processor import AnalysisExecutionError, AnalysisProcessor
 from analysis_agent.infrastructure.deterministic_analyzer import (
@@ -28,6 +30,13 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
     agent_id = os.getenv("AGENT_ID", "analysis-agent-1")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.analysis")
+    orchestrator_base_url = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8080")
+    runtime_token = os.getenv("RUNTIME_TOKEN", "")
+    if not runtime_token.strip():
+        raise RuntimeError(
+            "RUNTIME_TOKEN must be set: the analysis agent claims and completes turns "
+            "only through the authenticated Orchestrator completion boundary"
+        )
     interval = (
         heartbeat_interval
         if heartbeat_interval is not None
@@ -35,11 +44,12 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
     )
 
     bus = RedisBus(redis_url, queue_name=task_queue)
+    orchestrator = OrchestratorClient(orchestrator_base_url, runtime_token)
     processor = AnalysisProcessor(
         agent_id=agent_id,
         bus=bus,
         analyzer=DeterministicMaterialAnalyzer(),
-        result_store=bus,
+        completion_client=orchestrator,
     )
     metadata = AgentCapabilityMetadata(
         agent_id=agent_id,
@@ -72,11 +82,29 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
             task = await bus.next_task()
             logger.info("Dispatching task %s to analysis processor", task.task_id)
             try:
-                await processor.run_once(task)
+                request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
+                assignment, proof = await orchestrator.claim_task(
+                    task.task_id, request_id, "analysis", "delegated_child"
+                )
+                await orchestrator.acknowledge_assignment(
+                    task.task_id, assignment["assignment_id"], proof
+                )
+                await processor.run_once(
+                    task,
+                    assignment_id=assignment["assignment_id"],
+                    assignment_proof=proof,
+                    execution_kind="delegated_child",
+                )
+            except CompletionSubmissionError as exc:
+                logger.warning(
+                    "Analysis task %s claim/acknowledge failed with error: %s; ready for next task",
+                    task.task_id,
+                    exc,
+                )
             except AnalysisExecutionError as exc:
                 logger.warning(
                     "Analysis task %s processing failed with error: %s; ready for next task",
-                    exc.task_id,
+                    task.task_id,
                     exc.original_error,
                 )
     finally:

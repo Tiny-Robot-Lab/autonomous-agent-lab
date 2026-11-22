@@ -46,12 +46,16 @@ def test_analysis_agent_dockerfile_packaging() -> None:
     lines = dockerfile.splitlines()
 
     copy_lines = [line.strip() for line in lines if line.strip().startswith("COPY packages/")]
-    assert copy_lines == ["COPY packages/contracts/src /app/contracts"]
+    assert copy_lines == [
+        "COPY packages/contracts/src /app/contracts",
+        "COPY packages/infrastructure/src /app/infrastructure",
+    ]
 
     env_line = next(line for line in lines if "PYTHONPATH=" in line)
-    assert "PYTHONPATH=/app/src:/app/contracts" in env_line
+    assert "PYTHONPATH=/app/src:/app/contracts:/app/infrastructure" in env_line
+    # Analysis Agent uses the shared completion client but not the policy package.
     assert "packages/policy" not in dockerfile
-    assert "packages/infrastructure" not in dockerfile
+    assert "/app/policy" not in env_line
 
 
 def test_orchestrator_dockerfile_preserves_boundaries() -> None:

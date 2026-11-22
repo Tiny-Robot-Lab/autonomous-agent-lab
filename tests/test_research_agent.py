@@ -9,6 +9,7 @@ import pytest
 from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
+    CompletionCommand,
     FallbackEligibleInferenceError,
     FallbackTransition,
     TaskRequested,
@@ -53,12 +54,28 @@ class FakeMessageBus:
         raise NotImplementedError
 
 
-class FakeResultStore:
-    def __init__(self) -> None:
-        self.saved: dict[str, ResearchResult] = {}
+class FakeCompletionClient:
+    """Captures fenced CompletionCommands instead of writing canonical keys."""
 
-    async def save(self, result: ResearchResult) -> None:
-        self.saved[result.task_id] = result
+    def __init__(self) -> None:
+        self.submitted: list[CompletionCommand] = []
+        self.proofs: list[str] = []
+        self.task_ids: list[str] = []
+
+    async def submit_completion(
+        self,
+        task_id: str,
+        command: CompletionCommand,
+        assignment_proof: str,
+    ) -> dict[str, Any]:
+        self.task_ids.append(task_id)
+        self.submitted.append(command)
+        self.proofs.append(assignment_proof)
+        return {"outcome": {}, "replayed": False}
+
+
+ASSIGNMENT_ID = "assign-research-1"
+ASSIGNMENT_PROOF = "proof-research-1"
 
 
 class FakeCompatibilityStateReader:
@@ -149,10 +166,13 @@ async def test_stub_research_executor_deterministic_failure() -> None:
 async def test_research_processor_success_transitions() -> None:
     bus = FakeMessageBus()
     executor = StubResearchExecutor()
-    processor = ResearchProcessor("research-agent-1", bus, executor)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor,
+        completion_client=FakeCompletionClient(),
+    )
     task = TaskRequested.create("Research consensus algorithms")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert len(bus.published) == 2
     working_event, idle_event = bus.published
@@ -176,11 +196,14 @@ async def test_research_processor_success_transitions() -> None:
 async def test_research_processor_failure_lifecycle_preserves_error_state() -> None:
     bus = FakeMessageBus()
     executor = StubResearchExecutor(failure_trigger="crash_task")
-    processor = ResearchProcessor("research-agent-1", bus, executor)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor,
+        completion_client=FakeCompletionClient(),
+    )
     task = TaskRequested.create("Execute task with crash_task trigger")
 
     with pytest.raises(ResearchExecutionError) as exc_info:
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert exc_info.value.task_id == task.task_id
     assert "Simulated execution failure" in str(exc_info.value.original_error)
@@ -202,17 +225,20 @@ async def test_research_processor_failure_lifecycle_preserves_error_state() -> N
 async def test_research_processor_recovers_to_working_on_subsequent_task() -> None:
     bus = FakeMessageBus()
     executor = StubResearchExecutor(failure_trigger="fail_first")
-    processor = ResearchProcessor("research-agent-1", bus, executor)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor,
+        completion_client=FakeCompletionClient(),
+    )
 
     task1 = TaskRequested.create("fail_first task")
     with pytest.raises(ResearchExecutionError):
-        await processor.run_once(task1)
+        await processor.run_once(task1, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert bus.published[-1].state == "error"
 
     # Subsequent task transitions from error to working then idle
     task2 = TaskRequested.create("good task")
-    await processor.run_once(task2)
+    await processor.run_once(task2, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert len(bus.published) == 4
     # Event sequence: task1 working -> task1 error -> task2 working -> task2 idle
@@ -231,7 +257,10 @@ async def test_orchestrator_state_reader_and_dashboard_compatibility() -> None:
     """
     bus = FakeMessageBus()
     executor = StubResearchExecutor(failure_trigger="fail_here")
-    processor = ResearchProcessor("research-agent-1", bus, executor)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor,
+        completion_client=FakeCompletionClient(),
+    )
 
     # Initial registration
     initial_event = AgentEvent.create("research-agent-1", "idle", "Waiting for work")
@@ -239,12 +268,12 @@ async def test_orchestrator_state_reader_and_dashboard_compatibility() -> None:
 
     # Execute a task
     task = TaskRequested.create("Analyze data portability")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Execute a failing task
     failing_task = TaskRequested.create("Trigger fail_here")
     with pytest.raises(ResearchExecutionError):
-        await processor.run_once(failing_task)
+        await processor.run_once(failing_task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # Transform published events into Redis state representations exactly like RedisBus does
     stored_states: dict[str, dict[str, str]] = {}
@@ -300,6 +329,7 @@ def test_research_agent_redis_bus_custom_queue() -> None:
 
 @pytest.mark.anyio
 async def test_run_research_agent_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.delenv("AGENT_ID", raising=False)
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -324,6 +354,7 @@ async def test_run_research_agent_defaults(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.anyio
 async def test_run_research_agent_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "custom-research-agent")
     monkeypatch.setenv("TASK_QUEUE", "custom.tasks.research")
 
@@ -391,6 +422,7 @@ def test_create_research_executor_unsupported_env_var(monkeypatch: pytest.Monkey
 async def test_run_research_agent_creates_stub_executor_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.delenv("RESEARCH_EXECUTOR", raising=False)
 
     with (
@@ -415,6 +447,7 @@ async def test_run_research_agent_creates_stub_executor_by_default(
 async def test_run_research_agent_explicit_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
 
     with (
@@ -439,6 +472,7 @@ async def test_run_research_agent_explicit_executor(
 async def test_run_research_agent_unsupported_executor_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "unsupported_model")
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls:
@@ -498,6 +532,7 @@ def test_create_research_executor_tavily_empty_key_raises(
 async def test_run_research_agent_tavily_missing_key_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "tavily")
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
@@ -517,6 +552,7 @@ async def test_run_research_agent_tavily_missing_key_fails_startup(
 async def test_run_research_agent_tavily_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "tavily")
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-12345")
 
@@ -676,10 +712,13 @@ async def test_research_processor_with_tavily_executor_integration() -> None:
 
     executor = TavilyResearchExecutor(api_key="tvly-mock", client=mock_client)
     bus = FakeMessageBus()
-    processor = ResearchProcessor("research-agent-1", bus, executor)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor,
+        completion_client=FakeCompletionClient(),
+    )
     task = TaskRequested.create("Survey consensus models")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     assert len(bus.published) == 2
     assert bus.published[0].state == "working"
@@ -689,20 +728,23 @@ async def test_research_processor_with_tavily_executor_integration() -> None:
 
 
 @pytest.mark.anyio
-async def test_research_processor_stores_result_on_success() -> None:
+async def test_research_processor_submits_completed_command_on_success() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
-    processor = ResearchProcessor("research-agent-1", bus, executor, result_store=store)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor, completion_client=completion_client
+    )
     task = TaskRequested.create("Investigate consensus algorithms")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert saved.task_id == task.task_id
-    assert f"Deterministic execution completed for task: {task.task_id}" in saved.output
-    assert saved.acknowledged is True
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.task_id == task.task_id
+    assert f"Deterministic execution completed for task: {task.task_id}" in completed.output
+    assert completion_client.submitted[0].failure_code is None
     # Operational events intact
     assert len(bus.published) == 2
     assert bus.published[0].state == "working"
@@ -710,24 +752,28 @@ async def test_research_processor_stores_result_on_success() -> None:
 
 
 @pytest.mark.anyio
-async def test_research_processor_error_does_not_store_result() -> None:
+async def test_research_processor_failure_submits_safe_failure_code() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor(failure_trigger="trigger_fail")
-    processor = ResearchProcessor("research-agent-1", bus, executor, result_store=store)
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor, completion_client=completion_client
+    )
     task = TaskRequested.create("Task containing trigger_fail in prompt")
 
     with pytest.raises(ResearchExecutionError):
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert len(store.saved) == 0
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].failure_code == "EXECUTION_FAILED"
+    assert completion_client.submitted[0].completed_result is None
     assert len(bus.published) == 2
     assert bus.published[0].state == "working"
     assert bus.published[1].state == "error"
 
 
 @pytest.mark.anyio
-async def test_research_processor_with_tavily_stores_grounded_result() -> None:
+async def test_research_processor_with_tavily_submits_grounded_result() -> None:
     mock_client = AsyncMock()
     mock_client.search.return_value = {
         "query": "Compare local and cloud LLMs",
@@ -742,31 +788,36 @@ async def test_research_processor_with_tavily_stores_grounded_result() -> None:
     }
     executor = TavilyResearchExecutor(api_key="tvly-mock", client=mock_client)
     bus = FakeMessageBus()
-    store = FakeResultStore()
-    processor = ResearchProcessor("research-agent-1", bus, executor, result_store=store)
+    completion_client = FakeCompletionClient()
+    processor = ResearchProcessor(
+        "research-agent-1", bus, executor, completion_client=completion_client
+    )
     task = TaskRequested.create("Compare local and cloud LLMs")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert saved.task_id == task.task_id
-    assert "Research query: Compare local and cloud LLMs" in saved.output
-    assert "Summary: Local LLMs offer privacy; cloud LLMs scale seamlessly." in saved.output
-    assert "[1] Local vs Cloud (https://example.com/llm-analysis)" in saved.output
-    assert "Benchmark shows 10x compute throughput on cloud." in saved.output
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.task_id == task.task_id
+    assert "Research query: Compare local and cloud LLMs" in completed.output
+    assert "Summary: Local LLMs offer privacy; cloud LLMs scale seamlessly." in completed.output
+    assert "[1] Local vs Cloud (https://example.com/llm-analysis)" in completed.output
+    assert "Benchmark shows 10x compute throughput on cloud." in completed.output
     assert len(bus.published) == 2
 
 
 @pytest.mark.anyio
-async def test_run_research_agent_wires_result_store(
+async def test_run_research_agent_wires_completion_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
 
     with (
         patch("research_agent.main.RedisBus") as mock_bus_cls,
         patch("research_agent.main.ResearchProcessor") as mock_processor_cls,
+        patch("research_agent.main.OrchestratorClient") as mock_client_cls,
     ):
         mock_bus = AsyncMock()
         mock_bus_cls.return_value = mock_bus
@@ -779,7 +830,7 @@ async def test_run_research_agent_wires_result_store(
 
         mock_processor_cls.assert_called_once()
         _, kwargs = mock_processor_cls.call_args
-        assert kwargs.get("result_store") == mock_bus
+        assert kwargs.get("completion_client") is mock_client_cls.return_value
 
 
 # --- Infrastructure Adapter Tests: StubInferenceProvider ---
@@ -869,26 +920,26 @@ def test_create_inference_provider_unsupported_raises() -> None:
 @pytest.mark.anyio
 async def test_research_processor_with_inference_provider_synthesizes_output() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
     inference_provider = StubInferenceProvider()
     processor = ResearchProcessor(
         "research-agent-1",
         bus,
         executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=inference_provider,
     )
     task = TaskRequested.create("Investigate raft log compaction")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert saved.task_id == task.task_id
-    assert "Synthesized research for: Investigate raft log compaction" in saved.output
-    assert f"Deterministic execution completed for task: {task.task_id}" in saved.output
-    assert saved.acknowledged is True
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert completed.task_id == task.task_id
+    assert "Synthesized research for: Investigate raft log compaction" in completed.output
+    assert f"Deterministic execution completed for task: {task.task_id}" in completed.output
 
     # Event stream verification
     assert len(bus.published) == 2
@@ -915,25 +966,26 @@ async def test_research_processor_with_tavily_and_inference_provider() -> None:
     executor = TavilyResearchExecutor(api_key="tvly-mock", client=mock_client)
     inference_provider = StubInferenceProvider()
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     processor = ResearchProcessor(
         "research-agent-1",
         bus,
         executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=inference_provider,
     )
     task = TaskRequested.create("Evaluate state machine replication")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert "Synthesized research for: Evaluate state machine replication" in saved.output
-    assert "Grounded evidence:" in saved.output
-    assert "Research query: Evaluate state machine replication" in saved.output
-    assert "Summary: SMR requires consistent state across nodes." in saved.output
-    assert "https://example.com/smr" in saved.output
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert "Synthesized research for: Evaluate state machine replication" in completed.output
+    assert "Grounded evidence:" in completed.output
+    assert "Research query: Evaluate state machine replication" in completed.output
+    assert "Summary: SMR requires consistent state across nodes." in completed.output
+    assert "https://example.com/smr" in completed.output
     assert len(bus.published) == 2
     assert bus.published[1].state == "idle"
 
@@ -941,22 +993,23 @@ async def test_research_processor_with_tavily_and_inference_provider() -> None:
 @pytest.mark.anyio
 async def test_research_processor_inference_error_publishes_error_event() -> None:
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     executor = StubResearchExecutor()
     inference_provider = StubInferenceProvider(failure_trigger="trigger_synthesis_fail")
     processor = ResearchProcessor(
         "research-agent-1",
         bus,
         executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=inference_provider,
     )
     task = TaskRequested.create("Task containing trigger_synthesis_fail in prompt")
 
     with pytest.raises(ResearchExecutionError, match="Simulated synthesis failure"):
-        await processor.run_once(task)
+        await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert len(store.saved) == 0
+    assert len(completion_client.submitted) == 1
+    assert completion_client.submitted[0].failure_code == "EXECUTION_FAILED"
     assert len(bus.published) == 2
     assert bus.published[0].state == "working"
     assert bus.published[1].state == "error"
@@ -971,6 +1024,7 @@ async def test_research_processor_inference_error_publishes_error_event() -> Non
 async def test_run_research_agent_wires_inference_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
 
@@ -989,7 +1043,7 @@ async def test_run_research_agent_wires_inference_provider(
 
         mock_processor_cls.assert_called_once()
         _, kwargs = mock_processor_cls.call_args
-        assert kwargs.get("result_store") == mock_bus
+        assert kwargs.get("completion_client") is not None
         assert isinstance(kwargs.get("inference_provider"), StubInferenceProvider)
 
 
@@ -997,6 +1051,7 @@ async def test_run_research_agent_wires_inference_provider(
 async def test_run_research_agent_unsupported_inference_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "unsupported_llm")
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls:
@@ -1012,6 +1067,7 @@ async def test_run_research_agent_unsupported_inference_provider_fails_startup(
 async def test_run_research_agent_multi_provider_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "research-multi")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-multi")
@@ -1036,6 +1092,7 @@ async def test_run_research_agent_multi_provider_startup(
 async def test_run_research_agent_health_probe_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     # 1. Default when unset is 3.0
     monkeypatch.delenv("HEALTH_PROBE_TIMEOUT_SECONDS", raising=False)
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch(
@@ -1093,6 +1150,7 @@ async def test_run_research_agent_health_probe_timeout_configuration(
 async def test_run_research_agent_missing_secondary_credentials_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
@@ -1112,6 +1170,7 @@ async def test_run_research_agent_missing_secondary_credentials_fails_startup(
 async def test_run_research_agent_unsupported_secondary_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,unknown_vendor")
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch("research_agent.main.ResearchProcessor"):
@@ -2235,23 +2294,23 @@ async def test_research_processor_with_tavily_and_cloudflare_inference() -> None
     )
 
     bus = FakeMessageBus()
-    store = FakeResultStore()
+    completion_client = FakeCompletionClient()
     processor = ResearchProcessor(
         "research-agent-1",
         bus,
         executor,
-        result_store=store,
+        completion_client=completion_client,
         inference_provider=inference_provider,
     )
     task = TaskRequested.create("Survey state machine replication")
 
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
-    assert task.task_id in store.saved
-    saved = store.saved[task.task_id]
-    assert "Key Findings: State machine replication" in saved.output
-    assert "https://example.com/smr-paper" in saved.output
-    assert saved.acknowledged is True
+    assert len(completion_client.submitted) == 1
+    completed = completion_client.submitted[0].completed_result
+    assert completed is not None
+    assert "Key Findings: State machine replication" in completed.output
+    assert "https://example.com/smr-paper" in completed.output
     assert len(bus.published) == 2
     assert bus.published[0].state == "working"
     assert bus.published[1].state == "idle"
@@ -2266,6 +2325,7 @@ async def test_research_processor_with_tavily_and_cloudflare_inference() -> None
 async def test_run_research_agent_cloudflare_missing_credentials_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
@@ -2285,6 +2345,7 @@ async def test_run_research_agent_cloudflare_missing_credentials_fails_startup(
 async def test_run_research_agent_cloudflare_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-main-test")
@@ -2305,7 +2366,7 @@ async def test_run_research_agent_cloudflare_success(
 
         mock_processor_cls.assert_called_once()
         _, kwargs = mock_processor_cls.call_args
-        assert kwargs.get("result_store") == mock_bus
+        assert kwargs.get("completion_client") is not None
         provider = kwargs.get("inference_provider")
         assert isinstance(provider, CloudflareInferenceProvider)
         assert provider._account_id == "acc-main-test"
@@ -2347,6 +2408,7 @@ async def test_research_agent_redis_bus_register() -> None:
 async def test_run_research_agent_registers_capability_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "research-agent-custom")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
@@ -2382,6 +2444,7 @@ async def test_run_research_agent_registers_capability_metadata(
 async def test_research_agent_metadata_does_not_expose_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     secret_tavily = "tvly-secret-key-12345"
     secret_cf_token = "cf-token-secret-67890"
     secret_cf_acc = "cf-account-id-abcdef"
@@ -2869,7 +2932,7 @@ async def test_tavily_executor_all_sources_filtered_yields_explanatory_message()
 
 
 @pytest.mark.anyio
-async def test_research_processor_preserves_sources_through_synthesis_and_saves_to_redis() -> None:
+async def test_research_processor_preserves_sources_through_synthesis_in_completion() -> None:
     mock_tavily = AsyncMock()
     mock_tavily.search.return_value = {
         "query": "Compare Raft and Paxos",
@@ -2899,19 +2962,19 @@ async def test_research_processor_preserves_sources_through_synthesis_and_saves_
     )
 
     fake_bus = FakeMessageBus()
-    fake_store = FakeResultStore()
+    fake_completion_client = FakeCompletionClient()
     executor = TavilyResearchExecutor(api_key="tvly-mock", client=mock_tavily)
 
     processor = ResearchProcessor(
         agent_id="research-agent-1",
         bus=fake_bus,
         executor=executor,
-        result_store=fake_store,
+        completion_client=fake_completion_client,
         inference_provider=mock_inference,
     )
 
     task = TaskRequested.create("Compare Raft and Paxos")
-    await processor.run_once(task)
+    await processor.run_once(task, assignment_id=ASSIGNMENT_ID, assignment_proof=ASSIGNMENT_PROOF)
 
     # 1. Synthesis only received evidence containing retained sources (no promotional content)
     mock_inference.synthesize.assert_awaited_once()
@@ -2920,13 +2983,14 @@ async def test_research_processor_preserves_sources_through_synthesis_and_saves_
     assert "deals.example.com" not in evidence_sent_to_llm
     assert "Authority: " in evidence_sent_to_llm
 
-    # 2. ResultStore saved ResearchResult with output AND structured evaluated sources
-    assert task.task_id in fake_store.saved
-    saved_result = fake_store.saved[task.task_id]
-    assert "Key Findings:" in saved_result.output
-    assert len(saved_result.sources) == 2
-    assert len(saved_result.retained_sources) == 1
-    assert saved_result.retained_sources[0].domain == "raft.github.io"
+    # 2. Submitted completion carries the canonical result with structured sources
+    assert len(fake_completion_client.submitted) == 1
+    submitted_result = fake_completion_client.submitted[0].completed_result
+    assert submitted_result is not None
+    assert "Key Findings:" in submitted_result.output
+    assert isinstance(submitted_result.sources, list)
+    assert len(submitted_result.sources) == 2
+    assert submitted_result.sources[0]["domain"] == "raft.github.io"
 
 
 def test_task_result_contract_round_trip_with_sources() -> None:

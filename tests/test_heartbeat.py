@@ -150,6 +150,7 @@ async def test_heartbeat_runner_publish_once_captures_state() -> None:
 async def test_general_worker_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "worker-live-1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0.04")
 
@@ -193,6 +194,7 @@ async def test_general_worker_periodically_refreshes_liveness(
 async def test_research_agent_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_ID", "research-live-1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0.04")
 
@@ -235,6 +237,7 @@ async def test_research_agent_periodically_refreshes_liveness(
 async def test_analysis_agent_registers_and_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.delenv("AGENT_ID", raising=False)
     monkeypatch.delenv("TASK_QUEUE", raising=False)
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
