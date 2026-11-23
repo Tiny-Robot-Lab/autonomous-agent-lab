@@ -1469,6 +1469,16 @@ class MockAtomicDispatcher(TaskDispatcher):
         self.dispatches.append((task, target))
         if self.task_store is not None:
             await self.task_store.update_status(task.task_id, "pending")
+            if hasattr(self.task_store, "hints"):
+                self.task_store.hints.append(
+                    WakeUpHint(
+                        hint_id=f"hint-{uuid4().hex[:8]}",
+                        capability=capability or "research",
+                        created_at=datetime.now(UTC).isoformat(),
+                        execution_kind="initial",
+                        task_id=task.task_id,
+                    )
+                )
 
 
 def make_candidate(

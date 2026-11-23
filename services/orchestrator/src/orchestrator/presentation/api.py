@@ -697,13 +697,13 @@ async def child_task_input_endpoint(
         )
 
     try:
-        task_input = await get_input_uc.execute(
+        material = await get_input_uc.execute(
             principal=principal,
             task_id=task_id,
             assignment_id=assignment_id,
             assignment_proof=header_proof,
         )
-        return {"task_input": task_input.to_dict()}
+        return material.to_dict()
     except UnauthorizedPrincipalError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except CapabilityMismatchError as exc:
@@ -783,7 +783,12 @@ def create_app(
 
     # 4. State reader, result reader, events, and routing recorder resolution
     reader = state_reader or gateway
-    results = result_reader or gateway or NoOpResultReader()
+    results = (
+        result_reader
+        or (task_store if hasattr(task_store, "get_result") else None)
+        or gateway
+        or NoOpResultReader()
+    )
     events_out = event_publisher or gateway
     routing_recorder_client = routing_recorder or (
         gateway if isinstance(gateway, RoutingRecorder) else None

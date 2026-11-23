@@ -10,6 +10,7 @@ from agent_contracts import (
     AgentEvent,
     ArtifactReference,
     AssignmentYieldRecord,
+    ChildTaskExecutionMaterial,
     ClaimExpiryRecord,
     ClaimTaskResponse,
     CompletionCommand,
@@ -383,7 +384,7 @@ class SubmitTask:
             raise RuntimeError("No task dispatcher or queue configured for dispatch")
 
         # Non-dynamic fallback path (candidate_finder is None) - for backward compatibility with older isolated tests
-        if self._queue is not None:
+        if self._dispatcher is not None or self._queue is not None:
             message = TaskRequested.create(task.prompt)
             rationale = (
                 f"Static configuration routed to capability '{resolved_capability.value}'"
@@ -394,7 +395,7 @@ class SubmitTask:
                 required_capabilities=[resolved_capability.value],
                 candidates_evaluated=[],
                 selected_agent_id=None,
-                dispatch_target=None,
+                dispatch_target=f"agent.tasks.{resolved_capability.value}",
                 rationale=rationale,
                 provenance=provenance.to_dict(),
             )
@@ -413,13 +414,27 @@ class SubmitTask:
                 required_capability=resolved_cap_str,
             )
 
-            try:
-                await self._queue.enqueue(message, resolved_capability)
-            except Exception:
-                await self._task_store.update_status(message.task_id, "dispatch_failed")
-                raise
-            await self._task_store.update_status(message.task_id, "pending")
-            return message
+            if self._queue is not None:
+                try:
+                    await self._queue.enqueue(message, resolved_capability)
+                except Exception:
+                    await self._task_store.update_status(message.task_id, "dispatch_failed")
+                    raise
+                await self._task_store.update_status(message.task_id, "pending")
+                return message
+
+            if self._dispatcher is not None:
+                clean_target = f"agent.tasks.{resolved_capability.value}"
+                try:
+                    await self._dispatcher.dispatch(
+                        message,
+                        clean_target,
+                        capability=resolved_cap_str,
+                    )
+                    return message
+                except Exception:
+                    await self._task_store.update_status(message.task_id, "dispatch_failed")
+                    raise
 
         raise RuntimeError("No task queue configured for legacy enqueue")
 
@@ -1759,21 +1774,22 @@ class GetResumedContinuationContext:
 
 
 class GetChildTaskInput:
-    """Authenticated task-input reader for delegated child turns.
+    """Authenticated task-input reader for claimed turns.
 
     Governed by ADR-0006, ADR-0007, and Issue #224:
     - Dedicated authenticated boundary (GET /api/tasks/{task_id}/input);
-    - Validates caller principal has 'analysis' capability;
+    - Validates caller principal has the required capability for the active claim;
     - Validates active claim exists for task_id and matches assignment_id;
     - Validates claim.runtime_principal_id == principal.principal_id;
     - Validates claim.bound_agent_id == principal.bound_agent_id;
-    - Validates claim.assigned_capability == 'analysis';
     - Validates claim.state == 'acknowledged';
-    - Validates claim.execution_kind == 'delegated_child';
+    - Validates claim.execution_kind in ('initial', 'delegated_child');
+    - For delegated_child, validates claim.assigned_capability == 'analysis';
     - Validates current fencing epoch matches claim.fencing_epoch;
     - Cryptographically verifies X-Assignment-Proof via verify_assignment_proof;
-    - Retrieves child_task_input (v1);
-    - Returns TaskInput.
+    - Retrieves task_input (v1);
+    - Retrieves referenced sealed StageArtifact records;
+    - Returns ChildTaskExecutionMaterial.
     """
 
     def __init__(
@@ -1793,13 +1809,9 @@ class GetChildTaskInput:
         task_id: str,
         assignment_id: str,
         assignment_proof: str,
-    ) -> TaskInput:
+    ) -> ChildTaskExecutionMaterial:
         if not principal or not principal.active:
             raise UnauthorizedPrincipalError("Principal is invalid or inactive")
-        if not principal.has_capability("analysis"):
-            raise CapabilityMismatchError(
-                f"Principal '{principal.principal_id}' lacks required capability 'analysis'"
-            )
 
         clean_task = str(task_id).strip()
         clean_assignment = str(assignment_id).strip()
@@ -1818,6 +1830,14 @@ class GetChildTaskInput:
                 f"Active claim for task '{clean_task}' and assignment '{clean_assignment}' not found"
             )
 
+        if not principal.has_capability(claim.assigned_capability):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability '{claim.assigned_capability}'"
+            )
+        if claim.execution_kind == "delegated_child" and not principal.has_capability("analysis"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'analysis'"
+            )
         if claim.runtime_principal_id != principal.principal_id:
             raise ClaimNotFoundError(
                 f"Assignment '{clean_assignment}' is not owned by principal '{principal.principal_id}'"
@@ -1827,15 +1847,15 @@ class GetChildTaskInput:
                 f"Assignment '{clean_assignment}' is bound to agent '{claim.bound_agent_id}', "
                 f"not '{principal.bound_agent_id}'"
             )
-        if claim.assigned_capability != "analysis":
-            raise CapabilityMismatchError(
-                f"Claim assigned_capability '{claim.assigned_capability}' is not 'analysis'"
-            )
         if claim.state != "acknowledged":
             raise TaskNotClaimableError("Assignment must be acknowledged before reading task input")
-        if claim.execution_kind != "delegated_child":
+        if claim.execution_kind not in ("initial", "delegated_child"):
             raise TaskNotClaimableError(
-                f"Child task input is only available for 'delegated_child', got '{claim.execution_kind}'"
+                f"Task input is only available for 'initial' or 'delegated_child', got '{claim.execution_kind}'"
+            )
+        if claim.execution_kind == "delegated_child" and claim.assigned_capability != "analysis":
+            raise CapabilityMismatchError(
+                f"Delegated child claim assigned_capability '{claim.assigned_capability}' is not 'analysis'"
             )
 
         cur_epoch = await self._task_store.get_fencing_epoch(clean_task)
@@ -1850,7 +1870,25 @@ class GetChildTaskInput:
         task_input = await self._task_store.get_task_input(clean_task, 1)
         if task_input is None:
             raise CorruptAuthoritativeRecordError(
-                f"Authoritative TaskInput v1 not found for child task '{clean_task}'"
+                f"Authoritative TaskInput v1 not found for task '{clean_task}'"
             )
 
-        return task_input
+        artifacts: list[StageArtifact] = []
+        for ref in task_input.artifact_references:
+            art = await self._task_store.get_stage_artifact(
+                ref.producing_task_id, ref.artifact_id, ref.artifact_version
+            )
+            if art is None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Referenced stage artifact '{ref.artifact_id}' not found for task '{clean_task}'"
+                )
+            if not art.sealed:
+                raise CorruptAuthoritativeRecordError(
+                    f"Referenced stage artifact '{ref.artifact_id}' is not sealed for task '{clean_task}'"
+                )
+            artifacts.append(art)
+
+        return ChildTaskExecutionMaterial(task_input=task_input, artifacts=tuple(artifacts))
+
+
+GetAssignmentInput = GetChildTaskInput

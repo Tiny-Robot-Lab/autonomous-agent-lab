@@ -21,13 +21,18 @@ Covers the full governed lifecycle across authenticated Orchestrator boundaries:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 import pytest
 from agent_contracts import (
+    CompletionCommand,
     TaskRequested,
+    TaskResult,
     normalize_canonical_utc_timestamp,
 )
 from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
@@ -35,6 +40,7 @@ from analysis_agent.application.processor import AnalysisExecutionError, Analysi
 from analysis_agent.infrastructure.deterministic_analyzer import (
     DeterministicMaterialAnalyzer,
 )
+from analysis_agent.main import run_analysis_agent
 from orchestrator.application.use_cases import EvaluateExpiry
 from orchestrator.config import Settings
 from orchestrator.domain.principal import RuntimePrincipal, compute_token_digest
@@ -42,6 +48,7 @@ from orchestrator.presentation.api import create_app
 from research_agent.application.delegation import ResearchDelegationCoordinator
 from research_agent.application.processor import ResearchProcessor
 from research_agent.domain.models import ResearchResult, SynthesisResult
+from research_agent.main import run_research_agent
 
 from tests.test_authoritative_task_store import (
     InMemoryAuthoritativeTaskStore,
@@ -88,17 +95,29 @@ PRINCIPALS_CONFIG: dict[str, dict[str, Any]] = {
 
 
 class MockEventBus:
-    def __init__(self) -> None:
+    def __init__(self, signals: list[Any] | None = None) -> None:
         self.published: list[Any] = []
         self.current_state: str = "idle"
+        self._signals = list(signals or [])
 
     async def publish(self, event: Any) -> None:
         self.published.append(event)
+        if hasattr(event, "state"):
+            self.current_state = event.state
 
     async def register(self, metadata: Any) -> None:
         pass
 
     async def heartbeat(self, heartbeat: Any) -> None:
+        pass
+
+    async def next_signal(self) -> Any:
+        if self._signals:
+            return self._signals.pop(0)
+        await asyncio.sleep(0.01)
+        raise TimeoutError("No more signals in mock event bus")
+
+    async def aclose(self) -> None:
         pass
 
 
@@ -142,6 +161,7 @@ def _build_test_app(store: InMemoryAuthoritativeTaskStore) -> tuple[Any, Setting
         settings=settings,
         task_store=store,
         dispatcher=MockAtomicDispatcher(store),
+        result_reader=store,
     )
     return app, settings
 
@@ -267,7 +287,7 @@ async def test_e2e_research_to_analysis_completed_child_cross_instance_resumptio
         child_id, child_claim["assignment_id"], child_proof
     )
     assert child_task_input.task_id == child_id
-    assert "Analyze research findings" in child_task_input.prompt
+    assert "Analyze the sealed Research evidence" in child_task_input.prompt
 
     # Step 9: analysis-agent-1 executes AnalysisProcessor and completes child turn
     bus_analysis = MockEventBus()
@@ -317,14 +337,38 @@ async def test_e2e_research_to_analysis_completed_child_cross_instance_resumptio
     assert resumed_claim["fencing_epoch"] == 2
     assert resumed_claim["continuation_version"] == 1
 
-    # Prove stale proof from research-agent-1 (proof_1) is rejected on resumed turn
-    with pytest.raises(CompletionSubmissionError) as exc_info:
-        await research_client_1.acknowledge_assignment(parent_id, claim_1["assignment_id"], proof_1)
-    assert exc_info.value.status_code == 403 or "failed" in str(exc_info.value)
-
+    # Acknowledge the resumed assignment under research-agent-2
     await research_client_2.acknowledge_assignment(
         parent_id, resumed_claim["assignment_id"], resumed_proof
     )
+
+    # Prove stale completion rejection (stale completion, not stale acknowledgement):
+    # research-agent-1 attempts stale completion submission after research-agent-2 owns the resumed epoch.
+    # Rejected at the detached-proof authorization boundary (exact HTTP 403);
+    # assignment existence is not disclosed.
+    hint_count_before = len(store.hints)
+    stale_comp_cmd = CompletionCommand(
+        completion_command_id=f"comp-stale-{uuid4().hex[:8]}",
+        assignment_id=claim_1["assignment_id"],
+        execution_kind="initial",
+        completed_result=TaskResult(task_id=parent_id, output="Stale initial completion attempt"),
+    )
+    with pytest.raises(CompletionSubmissionError) as exc_info:
+        await research_client_1.submit_completion(parent_id, stale_comp_cmd, proof_1)
+    assert exc_info.value.status_code == 403
+
+    # Assert exactly:
+    active_claim = await store.get_active_claim(parent_id)
+    assert active_claim is not None
+    assert active_claim.assignment_id == resumed_claim["assignment_id"]
+    assert active_claim.runtime_principal_id == "principal-research-2"
+    assert active_claim.bound_agent_id == "research-agent-2"
+    assert (await store.get_fencing_epoch(parent_id)) == 2
+    assert (await store.get_status(parent_id)) == "working"
+    assert (await store.get_terminal_outcome(parent_id)) is None
+    assert (await store.get_canonical_result(parent_id)) is None
+    assert len(store.hints) == hint_count_before
+    assert (await store.get_continuation(parent_id, 2)) is None
 
     # Step 12: research-agent-2 loads continuation context
     continuation_context = await research_client_2.get_resumed_continuation_context(
@@ -815,3 +859,161 @@ async def test_e2e_stage_artifact_security_boundaries() -> None:
         data = resp.json()
         assert data["artifact"]["artifact_id"] == "art-sec-1"
         assert data["artifact"]["sealed"] is True
+
+
+@pytest.mark.anyio
+async def test_e2e_production_loop_full_delegation_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """True production-loop deterministic test driving full delegation flow from POST /api/tasks.
+
+    Governed by Issue #224 Copilot Finding 3:
+    - Starts with POST /api/tasks in authenticated_claim mode;
+    - Drives full end-to-end delegation (Research initial -> Analysis child -> Research resumed);
+    - Invokes actual production runtime loop entry points (run_research_agent, run_analysis_agent);
+    - Contains zero forbidden direct calls in the test body;
+    - Proves all 14 points of the full delegation, specialization, and resumption lifecycle.
+    """
+    store = InMemoryAuthoritativeTaskStore()
+    app, _ = _build_test_app(store)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+        # 1. Initial TaskRequested hint is published after POST /api/tasks.
+        prompt_with_distinctive_fact = (
+            "Analyze topological Weyl materials. Topological Weyl semimetals exhibit Weyl fermions "
+            "and topological surface states with 23 meV magnetic exchange gap."
+        )
+        resp = await http_client.post(
+            "/api/tasks",
+            json={"prompt": prompt_with_distinctive_fact, "capability": "research"},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        parent_id = body["task_id"]
+        assert body["status"] == "accepted"
+
+        assert len(store.hints) == 1
+        initial_hint = store.hints[-1]
+        assert initial_hint.task_id == parent_id
+        assert initial_hint.execution_kind == "initial"
+        assert initial_hint.capability == "research"
+
+        # 2-4. Research Agent instance 1 runs initial production loop:
+        # consumes hint, claims root task, acknowledges assignment, fetches governed root input,
+        # stages sealed evidence artifact, and proposes delegation to Analysis.
+        monkeypatch.setenv("AGENT_ID", "research-agent-1")
+        monkeypatch.setenv("RUNTIME_TOKEN", RESEARCH_1_TOKEN)
+        monkeypatch.setenv("RESEARCH_DELEGATION_MODE", "delegate_analysis")
+        monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+
+        bus_1 = MockEventBus([initial_hint])
+        with (
+            patch("research_agent.main.RedisBus", return_value=bus_1),
+            patch(
+                "research_agent.main.OrchestratorClient",
+                side_effect=lambda url, token, **kw: OrchestratorClient(url, token, transport=transport, **kw),
+            ),
+            patch("research_agent.main.create_research_executor", return_value=DeterministicResearchExecutor()),
+        ):
+            await run_research_agent(max_signals=1)
+
+        # 5. Parent yielded, child task and child hint are published for Analysis.
+        assert store.statuses[parent_id] == "waiting_for_children"
+        assert (await store.get_active_claim(parent_id)) is None
+
+        assert len(store.hints) == 2
+        child_hint = store.hints[-1]
+        assert child_hint.execution_kind == "delegated_child"
+        assert child_hint.capability == "analysis"
+        child_id = child_hint.task_id
+        assert store.statuses[child_id] == "pending"
+
+        # Verify sealed research artifact was staged
+        staged_artifacts = [
+            art for (t_id, _, _), art in store.artifacts.items() if t_id == parent_id
+        ]
+        assert len(staged_artifacts) == 1
+        sealed_art = staged_artifacts[0]
+        assert sealed_art.sealed is True
+        assert sealed_art.artifact_type == "research_material"
+        assert "weyl" in str(sealed_art.content).lower()
+
+        # 6-9. Analysis Agent runs production loop on delegated child:
+        # consumes child hint, claims delegated child, acknowledges assignment, fetches
+        # ChildTaskExecutionMaterial (authoritative task input + sealed parent artifact),
+        # analyzes sealed material (distinctive fact reaches analysis result), and submits
+        # fenced completion yielding child result, transitioning child to completed, unblocking
+        # parent, minting continuation context, and publishing resumed Research hint.
+        monkeypatch.setenv("AGENT_ID", "analysis-agent-1")
+        monkeypatch.setenv("RUNTIME_TOKEN", ANALYSIS_1_TOKEN)
+
+        bus_analysis = MockEventBus([child_hint])
+        with (
+            patch("analysis_agent.main.RedisBus", return_value=bus_analysis),
+            patch(
+                "analysis_agent.main.OrchestratorClient",
+                side_effect=lambda url, token, **kw: OrchestratorClient(url, token, transport=transport, **kw),
+            ),
+        ):
+            await run_analysis_agent(max_signals=1)
+
+        assert store.statuses[child_id] == "completed"
+        assert (await store.get_active_claim(child_id)) is None
+        child_outcome = await store.get_terminal_outcome(child_id)
+        assert child_outcome is not None
+        assert child_outcome.terminal_status == "completed"
+
+        child_result = await store.get_canonical_result(child_id)
+        assert child_result is not None
+        # 8. Distinctive fact from sealed research artifact reaches analysis result
+        assert "weyl" in child_result.output.lower() or "topological" in child_result.output.lower()
+
+        # 9. Child completion unblocks parent, mints continuation context, publishes resumed hint
+        assert store.statuses[parent_id] == "resumable"
+        assert len(store.hints) == 3
+        resumed_hint = store.hints[-1]
+        assert resumed_hint.task_id == parent_id
+        assert resumed_hint.execution_kind == "resumed_continuation"
+        assert resumed_hint.capability == "research"
+        assert resumed_hint.expected_continuation_version == 1
+
+        # 10-14. Resumed Research production loop on distinct agent instance 2:
+        # claims resumed continuation turn under new fenced epoch 2, acknowledges,
+        # fetches governed continuation context, completes parent task under fenced epoch 2,
+        # with no instance-local state leaked from turn 1 into turn 2.
+        monkeypatch.setenv("AGENT_ID", "research-agent-2")
+        monkeypatch.setenv("RUNTIME_TOKEN", RESEARCH_2_TOKEN)
+        monkeypatch.setenv("RESEARCH_DELEGATION_MODE", "complete_locally")
+
+        bus_2 = MockEventBus([resumed_hint])
+        with (
+            patch("research_agent.main.RedisBus", return_value=bus_2),
+            patch(
+                "research_agent.main.OrchestratorClient",
+                side_effect=lambda url, token, **kw: OrchestratorClient(url, token, transport=transport, **kw),
+            ),
+        ):
+            await run_research_agent(max_signals=1)
+
+        # 13-14. Parent completed under fenced epoch 2, canonical result verified
+        assert store.statuses[parent_id] == "completed"
+        assert (await store.get_fencing_epoch(parent_id)) == 2
+        assert (await store.get_active_claim(parent_id)) is None
+
+        parent_outcome = await store.get_terminal_outcome(parent_id)
+        assert parent_outcome is not None
+        assert parent_outcome.terminal_status == "completed"
+        assert parent_outcome.bound_agent_id == "research-agent-2"
+
+        parent_result = await store.get_canonical_result(parent_id)
+        assert parent_result is not None
+        assert "Primary Research Evidence:" in parent_result.output
+        assert "Specialist Analysis Findings:" in parent_result.output
+        assert "weyl" in parent_result.output.lower()
+
+        # Canonical result query via GET /api/tasks/{parent_id}/result endpoint
+        res_resp = await http_client.get(f"/api/tasks/{parent_id}/result")
+        assert res_resp.status_code == 200
+        result_payload = res_resp.json()
+        assert result_payload["status"] == "completed"
+        assert "Primary Research Evidence:" in result_payload["output"]
+        assert "Specialist Analysis Findings:" in result_payload["output"]

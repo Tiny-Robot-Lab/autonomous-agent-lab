@@ -275,7 +275,7 @@ class ResearchProcessor:
                         assignment_id=assignment_id,
                         assignment_proof=assignment_proof,
                         proposal_id=proposal_id,
-                        child_intent=f"Analyze research findings for: {task.prompt}",
+                        child_intent="Analyze the sealed Research evidence for this delegated task.",
                         artifact_reference=art_ref,
                         target_capability="analysis",
                         parent_input_version=1,

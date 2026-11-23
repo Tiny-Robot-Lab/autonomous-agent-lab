@@ -112,7 +112,7 @@ from .task_continuation import (
     STAGE_CONTROL_FIELDS_ALLOWLIST,
     TaskContinuation,
 )
-from .task_input import TaskInput, TaskInputReference
+from .task_input import ChildTaskExecutionMaterial, TaskInput, TaskInputReference
 from .terminal_completion import (
     ALLOWED_COMPLETION_EXECUTION_KINDS,
     ALLOWED_COMPLETION_FAILURE_CODES,
@@ -235,6 +235,7 @@ __all__ = [
     "ArtifactReference",
     "AssignmentCompletionRecord",
     "AssignmentYieldRecord",
+    "ChildTaskExecutionMaterial",
     "ClaimExpiryRecord",
     "ClaimTaskResponse",
     "CompletionCommand",

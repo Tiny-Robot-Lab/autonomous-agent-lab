@@ -1,7 +1,14 @@
 from typing import Any
 
 import pytest
-from agent_contracts import AgentEvent, CompletionCommand, TaskRequested, TaskResult
+from agent_contracts import (
+    AgentEvent,
+    CompletionCommand,
+    StageArtifact,
+    TaskRequested,
+    TaskResult,
+    WakeUpHint,
+)
 from analysis_agent.application.processor import AnalysisExecutionError, AnalysisProcessor
 from analysis_agent.domain.analysis import AnalysisReport, analyze_material
 from analysis_agent.infrastructure.deterministic_analyzer import (
@@ -200,7 +207,7 @@ async def test_analysis_agent_malformed_hints_never_claim(monkeypatch: pytest.Mo
         _make_analysis_hint(task_id=""),
         _make_analysis_hint(task_id="   "),
         WakeUpHint(hint_id="h-missing", capability="analysis", created_at=now_iso, execution_kind="delegated_child", task_id=None),
-        WakeUpHint(hint_id="h3", task_id="t3", capability="analysis", execution_kind="initial", created_at=now_iso),
+        _make_analysis_hint(execution_kind="unsupported_kind"),
         WakeUpHint(hint_id="h4", task_id="t4", capability="analysis", execution_kind="resumed_continuation", created_at=now_iso),
         WakeUpHint(hint_id="h5", task_id="t5", capability="research", execution_kind="delegated_child", created_at=now_iso),
         _make_analysis_hint(execution_kind=None),
@@ -259,7 +266,6 @@ async def test_analysis_agent_valid_hint_claims_and_runs(monkeypatch: pytest.Mon
                 {
                     "assignment_id": "asgn-10",
                     "root_task_id": "task-root-1",
-                    "parent_task_id": "task-root-1",
                 },
                 "proof-10",
             )
@@ -310,6 +316,7 @@ async def test_analysis_agent_valid_hint_claims_and_runs(monkeypatch: pytest.Mon
     passed_task = mock_proc.run_once.call_args.args[0]
     assert passed_task.task_id == "task-child-10"
     assert passed_task.root_task_id == "task-root-1"
+    assert passed_task.parent_task_id == "task-root-1"
     assert passed_task.prompt == "Analyze rover sensor patterns for water signatures."
     assert mock_proc.run_once.call_args.kwargs["assignment_id"] == "asgn-10"
     assert mock_proc.run_once.call_args.kwargs["assignment_proof"] == "proof-10"
@@ -595,3 +602,147 @@ async def test_analysis_bus_idle_timeout_does_not_toggle_precedence() -> None:
         assert isinstance(sig3, WakeUpHint)
         assert mock_client.blpop.call_args_list[4].args[0] == ["agent.hints.analysis", "agent.tasks.analysis"]
         assert bus._prefer_hints is False
+
+
+@pytest.mark.anyio
+async def test_analysis_processor_analyzes_sealed_stage_artifact_findings() -> None:
+    """Prove specialist analyzes sealed Research findings from governed execution material.
+
+    Governed by Issue #224 Copilot Finding 2:
+    - Distinctive fact exists only in sealed artifact (never in root prompt or child intent);
+    - Analysis report in completed_result output measures and contains the distinctive fact.
+    """
+    bus = FakeMessageBus()
+    client = FakeCompletionClient()
+    processor = AnalysisProcessor(
+        agent_id="analysis-agent-test",
+        bus=bus,
+        analyzer=DeterministicMaterialAnalyzer(),
+        completion_client=client,
+    )
+
+    distinctive_fact = "anomalousperovskite"
+    root_prompt = "Perform comprehensive investigation of candidate perovskites for solar cells."
+    child_intent = "Analyze the sealed Research evidence for this delegated task."
+
+    assert distinctive_fact not in root_prompt
+    assert distinctive_fact not in child_intent
+
+    sealed_artifact = StageArtifact(
+        producing_task_id="task-root-1",
+        artifact_id="art-research-1",
+        artifact_type="research_material",
+        created_at="2026-11-22T00:00:00Z",
+        artifact_version=1,
+        sealed=True,
+        content={
+            "material": (
+                f"Experimental observation confirms {distinctive_fact} exhibits anomalous bandgap opening. "
+                f"Secondary measurement verifies {distinctive_fact} retains room-temperature structural phase stability."
+            )
+        },
+    )
+
+    child_task = TaskRequested(
+        task_id="task-child-1",
+        root_task_id="task-root-1",
+        parent_task_id="task-root-1",
+        prompt=child_intent,
+        created_at="2026-11-22T00:00:00Z",
+    )
+
+    await processor.run_once(
+        child_task,
+        assignment_id="asgn-child-1",
+        assignment_proof="proof-child-1",
+        execution_kind="delegated_child",
+        artifacts=(sealed_artifact,),
+    )
+
+    assert len(client.submitted) == 1
+    completed = client.submitted[0]
+    assert completed.completed_result is not None
+    output_text = completed.completed_result.output
+
+    # Prove the analysis result output contains the distinctive fact from the sealed artifact
+    assert distinctive_fact in output_text
+    assert f"{distinctive_fact} (2)" in output_text
+
+
+@pytest.mark.anyio
+async def test_analysis_agent_initial_wake_up_hint_claims_and_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prove Analysis runtime handles WakeUpHint with execution_kind='initial'.
+
+    Governed by Issue #224 Copilot Finding 3:
+    - WakeUpHint(execution_kind='initial') -> claim -> ack -> get input -> processor.run_once -> complete.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_contracts import TaskInput
+    from analysis_agent.main import run_analysis_agent
+
+    mock_bus = AsyncMock()
+    mock_orch = AsyncMock()
+    mock_proc = AsyncMock()
+
+    hint = WakeUpHint(
+        hint_id="hint-initial-1",
+        capability="analysis",
+        created_at="2026-11-22T00:00:00Z",
+        execution_kind="initial",
+        task_id="task-root-initial-1",
+    )
+    mock_bus.next_signal = AsyncMock(side_effect=[hint, TimeoutError("exit")])
+
+    mock_orch.claim_task = AsyncMock(
+        return_value=(
+            {
+                "assignment_id": "asgn-init-1",
+                "root_task_id": "task-root-initial-1",
+            },
+            "proof-init-1",
+        )
+    )
+    mock_orch.acknowledge_assignment = AsyncMock()
+    mock_orch.get_child_task_input = AsyncMock(
+        return_value=TaskInput(
+            task_id="task-root-initial-1",
+            prompt="Analyze direct dataset for patterns.",
+            created_at="2026-11-22T00:00:00Z",
+        )
+    )
+
+    with (
+        patch("analysis_agent.main.RedisBus", return_value=mock_bus),
+        patch("analysis_agent.main.OrchestratorClient", return_value=mock_orch),
+        patch("analysis_agent.main.AnalysisProcessor", return_value=mock_proc),
+        patch("analysis_agent.main.HeartbeatRunner") as mock_hb,
+    ):
+        mock_hb.return_value.start = MagicMock()
+        mock_hb.return_value.stop = AsyncMock()
+        monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+
+        with pytest.raises(TimeoutError, match="exit"):
+            await run_analysis_agent()
+
+    mock_orch.claim_task.assert_awaited_once_with(
+        task_id="task-root-initial-1",
+        request_id=mock_orch.claim_task.call_args.kwargs["request_id"],
+        capability="analysis",
+        execution_kind="initial",
+    )
+    mock_orch.acknowledge_assignment.assert_awaited_once_with(
+        "task-root-initial-1", "asgn-init-1", "proof-init-1"
+    )
+    mock_orch.get_child_task_input.assert_awaited_once_with(
+        "task-root-initial-1", "asgn-init-1", "proof-init-1"
+    )
+    mock_proc.run_once.assert_awaited_once()
+    passed_task = mock_proc.run_once.call_args.args[0]
+    assert passed_task.task_id == "task-root-initial-1"
+    assert passed_task.root_task_id == "task-root-initial-1"
+    assert passed_task.parent_task_id is None
+    assert passed_task.prompt == "Analyze direct dataset for patterns."
+    assert mock_proc.run_once.call_args.kwargs["assignment_id"] == "asgn-init-1"
+    assert mock_proc.run_once.call_args.kwargs["assignment_proof"] == "proof-init-1"
+    assert mock_proc.run_once.call_args.kwargs["execution_kind"] == "initial"

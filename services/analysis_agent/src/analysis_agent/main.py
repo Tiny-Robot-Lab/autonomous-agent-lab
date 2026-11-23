@@ -29,7 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger("analysis_agent")
 
 
-async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
+async def run_analysis_agent(
+    heartbeat_interval: float | None = None,
+    max_signals: int | None = None,
+) -> None:
     agent_id = os.getenv("AGENT_ID", "analysis-agent-1")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.analysis")
@@ -86,6 +89,7 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
         heartbeat_runner.start()
         logger.info("Analysis agent %s registered and waiting for tasks", agent_id)
 
+        processed_signals = 0
         while True:
             is_mock_task = (
                 hasattr(bus, "next_task")
@@ -116,7 +120,7 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
                     )
                     continue
                 execution_kind = getattr(hint, "execution_kind", None)
-                if execution_kind != "delegated_child":
+                if execution_kind not in ("delegated_child", "initial"):
                     logger.warning(
                         "Ignoring unsupported execution_kind '%s' on analysis hint queue for task %s",
                         execution_kind,
@@ -132,33 +136,43 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
                     )
                     continue
 
-                logger.info("Processing analysis wake-up hint for task %s", task_id)
+                logger.info(
+                    "Processing analysis wake-up hint for task %s (execution_kind=%s)",
+                    task_id,
+                    execution_kind,
+                )
                 try:
                     request_id = f"req-{task_id}-{uuid4().hex[:8]}"
                     assignment, proof = await orchestrator.claim_task(
                         task_id=task_id,
                         request_id=request_id,
                         capability="analysis",
-                        execution_kind="delegated_child",
+                        execution_kind=execution_kind,
                     )
                     await orchestrator.acknowledge_assignment(
                         task_id, assignment["assignment_id"], proof
                     )
-                    child_task_input = await orchestrator.get_child_task_input(
+                    child_material = await orchestrator.get_child_task_input(
                         task_id, assignment["assignment_id"], proof
+                    )
+                    parent_id = (
+                        assignment["root_task_id"]
+                        if execution_kind == "delegated_child"
+                        else None
                     )
                     task = TaskRequested(
                         task_id=task_id,
                         root_task_id=assignment["root_task_id"],
-                        parent_task_id=assignment.get("parent_task_id"),
-                        prompt=child_task_input.prompt,
-                        created_at=child_task_input.created_at,
+                        parent_task_id=parent_id,
+                        prompt=child_material.prompt,
+                        created_at=child_material.created_at,
                     )
                     await processor.run_once(
                         task,
                         assignment_id=assignment["assignment_id"],
                         assignment_proof=proof,
-                        execution_kind="delegated_child",
+                        execution_kind=execution_kind,
+                        artifacts=getattr(child_material, "artifacts", ()),
                     )
                 except CompletionSubmissionError as exc:
                     logger.warning(
@@ -201,6 +215,9 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
                         task.task_id,
                         exc.original_error,
                     )
+            processed_signals += 1
+            if max_signals is not None and processed_signals >= max_signals:
+                break
     finally:
         logger.info("Shutting down analysis agent %s, closing bus...", agent_id)
         await heartbeat_runner.stop()

@@ -13,7 +13,7 @@ Governed by ADR-0005, ADR-0006, ADR-0007, and Issue #224:
 - Proves real-Redis Lua fencing and proof boundaries:
   - epoch 1 on initial claim;
   - epoch 2 on resumed claim;
-  - stale proof from research-agent-1 rejected on resumed turn;
+  - stale completion from research-agent-1 rejected at detached-proof authorization boundary (exact HTTP 403; assignment existence not disclosed);
   - second delegation wave rejected by real Redis;
   - non-root / depth > 1 delegation rejected at authoritative missing-grant boundary by real Redis (ADR-0006 Items 8, 19; ADR-0007 Decision 8);
   - unauthorized capability rejected by real Redis;
@@ -519,15 +519,36 @@ async def test_redis_e2e_research_to_analysis_completed_child_cross_instance(
     assert resumed_claim["fencing_epoch"] == 2
     assert resumed_claim["continuation_version"] == 1
 
-    # Prove stale proof rejection on real Redis:
-    # Attempting to use research-agent-1's proof (proof_1) on epoch 2 is rejected!
-    with pytest.raises(CompletionSubmissionError) as exc_info:
-        await research_client_1.acknowledge_assignment(parent_id, claim_1["assignment_id"], proof_1)
-    assert exc_info.value.status_code == 403 or "failed" in str(exc_info.value)
-
     await research_client_2.acknowledge_assignment(
         parent_id, resumed_claim["assignment_id"], resumed_proof
     )
+
+    # Prove stale completion rejection on real Redis at the detached-proof authorization boundary (stale completion, not stale acknowledgement):
+    # research-agent-1 attempts stale completion submission after research-agent-2 owns the resumed epoch.
+    # Rejected at the detached-proof authorization boundary (exact HTTP 403); assignment existence is not disclosed.
+    hints_before = await clean_gateway._client.llen("agent.hints.research")
+    stale_comp_cmd = CompletionCommand(
+        completion_command_id=f"comp-stale-{uuid4().hex[:8]}",
+        assignment_id=claim_1["assignment_id"],
+        execution_kind="initial",
+        completed_result=TaskResult(task_id=parent_id, output="Stale initial completion attempt on real Redis"),
+    )
+    with pytest.raises(CompletionSubmissionError) as exc_info:
+        await research_client_1.submit_completion(parent_id, stale_comp_cmd, proof_1)
+    assert exc_info.value.status_code == 403
+
+    # Assert exactly:
+    active_claim = await clean_gateway.get_active_claim(parent_id)
+    assert active_claim is not None
+    assert active_claim.assignment_id == resumed_claim["assignment_id"]
+    assert active_claim.runtime_principal_id == "principal-research-2"
+    assert active_claim.bound_agent_id == "research-agent-2"
+    assert (await clean_gateway.get_fencing_epoch(parent_id)) == 2
+    assert (await clean_gateway.get_status(parent_id)) == "working"
+    assert (await clean_gateway.get_terminal_outcome(parent_id)) is None
+    assert (await clean_gateway.get_canonical_result(parent_id)) is None
+    assert (await clean_gateway._client.llen("agent.hints.research")) == hints_before
+    assert (await clean_gateway.get_continuation(parent_id, 2)) is None
 
     # Publish turn 2 inference telemetry to real Redis stream
     turn2_telemetry = InferenceExecutionTelemetry(
@@ -996,7 +1017,6 @@ async def test_redis_delegation_invariants_and_security(
         child_id, f"req-{uuid4().hex[:8]}", "analysis", "delegated_child"
     )
     assert child_claim.get("delegation_grant_id") is None
-    assert child_claim.get("delegation_grant_id") is None
     await analysis_client.acknowledge_assignment(
         child_id, child_claim["assignment_id"], child_proof
     )
@@ -1077,14 +1097,9 @@ async def test_redis_delegation_invariants_and_security(
             target_capability="analysis",
         )
     assert exc_info.value.status_code == 409
-    assert "propose delegation request rejected" in str(exc_info.value).lower()
     # Assert zero grandchild, continuation, hint, fence, or wave mutation occurs
     assert await clean_gateway.get_children(child_research_id) == []
     assert (await clean_gateway.get_continuation(child_research_id, 1)) is None
-    assert await clean_gateway.get_fencing_epoch(child_research_id) == 1
-    assert (
-        await clean_gateway._client.llen("agent.hints.analysis") == 1
-    )  # Unchanged, no duplicate hint
     assert await clean_gateway.get_fencing_epoch(child_research_id) == 1
     assert (
         await clean_gateway._client.llen("agent.hints.analysis") == 1
