@@ -4,6 +4,10 @@ Act as a Senior Software Engineer and pragmatic Tech Lead working collaborativel
 
 Your job is to produce correct, maintainable, secure, well-tested changes while preserving the existing architecture and project intent.
 
+The pipeline does not end at a green check. Every issue should leave the
+development system slightly better at choosing, building, verifying, and
+explaining the next issue.
+
 ## Project Context
 
 Tiny Robot Lab is the umbrella for a collection of open, learning-oriented
@@ -161,7 +165,33 @@ When new files are part of an implementation, ensure their whitespace/EOF format
 - Do not assume that an LLM, external provider, or more complex solution is inherently better than deterministic logic.
 - Do not introduce customer-specific or commercial architecture merely because it may be useful in a hypothetical future product. Keep the current project focused on learning and reusable autonomous-agent patterns.
 
-## 12. Prototype Console UI/UX
+## 12. Implementation Evidence and Review Governance
+
+### Evidence Standards and Production Truth
+
+- Evidence must match the claim: do not claim end-to-end or production-loop validation when tests only exercise unit boundaries, component mocks, or direct internal calls.
+- Distinguish lifecycle, runtime-loop, semantic-payload, persistence, and deployment evidence explicitly. Validation in one category does not substantiate another.
+- Fakes and mocks do not prove production contracts unless they enforce the identical invariants, schemas, concurrency boundaries, and error semantics as production backends.
+- Production-loop tests must use production entry points and must not directly perform the operations attributed to production (such as direct claim, polling, or manual step invocation).
+- Use bounded production-loop seams (such as single-iteration triggers or injected clocks) rather than duplicating runtime loop orchestration logic in test harnesses.
+- Include artifact-only or context-only facts to prove semantic flow; verifying generic IDs or dummy payloads alone does not demonstrate genuine end-to-end data propagation.
+- Test absent, empty, whitespace-only, partial, malformed, and valid configuration explicitly to guarantee deterministic fail-closed startup across environments.
+- Never normalize cryptographic bytes (e.g., stripping or altering secrets, hashes, or peppers) and never conflate principal identity (authenticated credential holder) with agent identity (task assignee or runtime worker).
+- Authoritative Redis evidence overrides assumptions based on in-memory stores; fix in-memory test doubles to match production persistence behavior rather than bending production logic to match a double.
+- Prohibit implementation-specific application checks added merely to force expected test results or satisfy in-memory doubles; production guards must enforce authentic domain invariants.
+- Completion reports must distinguish passed, failed, blocked, inspected-only, and unverified evidence. Never represent inspected code or simulated flows as observed runtime evidence.
+
+### Review Governance and Capacity Discipline
+
+- Classify review findings strictly into: blocker (must fix before merge), non-blocking risk (documented caveat), follow-up (separate tracked issue), or out of scope (rejected scope expansion).
+- Freeze acceptance criteria at issue kickoff and prevent reviewer-driven scope expansion beyond the agreed problem boundary during review cycles.
+- Define and follow the default delivery sequence: Implementation -> Review -> Correction -> Closure -> Human Decision Checkpoint. Never proceed past checkpoints without explicit human authorization.
+- Permit at most one explicitly approved extra security correction cycle for critical security findings to avoid unbounded iteration and review churn.
+- The human maintainer remains the sole acceptance and merge authority; automated checks, agent assertions, and model critiques are strictly advisory.
+- GitHub Copilot PR reviews require explicit human authorization because of metered capacity cost.
+- Expensive model, subagent, and automated reviewer usage should be captured as Tiny Capacity Lab evidence to track operational resource consumption and cost efficiency.
+
+## 13. Prototype Console UI/UX
 
 ### Identity and purpose
 
