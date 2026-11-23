@@ -85,6 +85,7 @@ def test_settings() -> Settings:
     return Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=30.0,
         child_claim_deadline_seconds=120.0,
         runtime_credential_pepper=PEPPER,
@@ -593,14 +594,13 @@ async def setup_delegated_child_turn(
         f"/api/tasks/{parent_id}/artifacts",
         json={
             "assignment_id": assignment["assignment_id"],
-            "assignment_proof": proof,
             "artifact_id": artifact_id,
             "artifact_type": "research_material",
             "content": {"material": "key findings"},
             "artifact_version": 1,
             "payload_schema_version": 1,
         },
-        headers=auth_headers,
+        headers={**auth_headers, "X-Assignment-Proof": proof},
     )
     assert stage_res.status_code == 200, stage_res.text
     delegation_res = await client.post(

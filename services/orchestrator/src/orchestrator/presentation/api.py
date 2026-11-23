@@ -9,7 +9,8 @@ from agent_contracts import (
     __version__,
 )
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -57,6 +58,7 @@ from orchestrator.application.use_cases import (
     ClaimTask,
     CompleteTurn,
     EvaluateExpiry,
+    GetChildTaskInput,
     GetResumedContinuationContext,
     ResolveExpiredClaim,
     StageArtifactUseCase,
@@ -207,12 +209,13 @@ class AcknowledgeAssignmentInput(BaseModel):
 
 class StageArtifactInput(BaseModel):
     assignment_id: str = Field(min_length=1)
-    assignment_proof: str = Field(min_length=1)
     artifact_id: str = Field(min_length=1)
     artifact_type: str = Field(min_length=1)
     content: dict[str, Any]
     artifact_version: int = 1
     payload_schema_version: int = 1
+
+    model_config = {"extra": "forbid"}
 
 
 class DelegationProposalInput(BaseModel):
@@ -254,6 +257,49 @@ class EvaluateExpiryInput(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+SAFE_CTX_KEYS = frozenset({
+    "expected",
+    "limit_value",
+    "gt",
+    "ge",
+    "lt",
+    "le",
+    "min_length",
+    "max_length",
+    "max_digits",
+    "decimal_places",
+    "pattern",
+})
+
+
+def _sanitize_validation_item(item: Any) -> Any:
+    if isinstance(item, dict):
+        sanitized: dict[str, Any] = {}
+        if "type" in item and isinstance(item["type"], str):
+            sanitized["type"] = item["type"]
+        if "loc" in item and isinstance(item["loc"], (tuple, list)):
+            sanitized["loc"] = list(item["loc"])
+        if "msg" in item and isinstance(item["msg"], str):
+            sanitized["msg"] = item["msg"]
+        if "ctx" in item and isinstance(item["ctx"], dict):
+            safe_ctx: dict[str, Any] = {}
+            for k, v in item["ctx"].items():
+                if k in SAFE_CTX_KEYS and isinstance(v, (int, float, bool, str)):
+                    safe_ctx[k] = v
+                elif k == "error" and isinstance(v, Exception):
+                    safe_ctx[k] = v.__class__.__name__
+            if safe_ctx:
+                sanitized["ctx"] = safe_ctx
+        return sanitized
+    elif isinstance(item, list):
+        return [_sanitize_validation_item(x) for x in item]
+    return item
+
+
+def sanitize_validation_errors(errors: list[Any]) -> list[dict[str, Any]]:
+    return [_sanitize_validation_item(err) for err in errors]
+
+
 def get_current_runtime_principal(request: Request) -> RuntimePrincipal:
     auth_header = request.headers.get("Authorization", "").strip()
     if not auth_header.startswith("Bearer "):
@@ -269,14 +315,12 @@ def get_current_runtime_principal(request: Request) -> RuntimePrincipal:
     for principal_id, cfg in principals.items():
         expected_digest = cfg.get("token_digest", "")
         if expected_digest and verify_token(token, pepper, expected_digest):
-            if not cfg.get("active", True):
+            if not cfg["active"]:
                 raise HTTPException(status_code=403, detail="Principal is inactive")
-            raw_caps = cfg.get("authorized_capabilities", ())
-            caps = tuple(raw_caps) if isinstance(raw_caps, (list, tuple)) else ()
             return RuntimePrincipal(
                 principal_id=principal_id,
-                bound_agent_id=cfg.get("bound_agent_id", principal_id),
-                authorized_capabilities=caps,
+                bound_agent_id=cfg["bound_agent_id"],
+                authorized_capabilities=tuple(cfg["authorized_capabilities"]),
                 active=True,
             )
 
@@ -364,12 +408,19 @@ async def stage_artifact_endpoint(
     stage_uc: StageArtifactUseCase | None = request.app.state.stage_artifact
     if stage_uc is None:
         raise HTTPException(status_code=503, detail="Artifact staging service is not enabled")
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(
+            status_code=401, detail="Missing assignment proof in X-Assignment-Proof header"
+        )
+
     try:
         artifact = await stage_uc.execute(
             principal=principal,
             task_id=task_id,
             assignment_id=value.assignment_id,
-            assignment_proof=value.assignment_proof,
+            assignment_proof=header_proof,
             artifact_id=value.artifact_id,
             artifact_type=value.artifact_type,
             content=value.content,
@@ -625,6 +676,52 @@ async def continuation_context_endpoint(
         ) from exc
 
 
+async def child_task_input_endpoint(
+    task_id: str,
+    assignment_id: str,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    get_input_uc: GetChildTaskInput | None = getattr(
+        request.app.state, "get_child_task_input", None
+    )
+    if get_input_uc is None:
+        raise HTTPException(
+            status_code=503, detail="Child task input service is not enabled"
+        )
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(
+            status_code=401, detail="Missing assignment proof in X-Assignment-Proof header"
+        )
+
+    try:
+        material = await get_input_uc.execute(
+            principal=principal,
+            task_id=task_id,
+            assignment_id=assignment_id,
+            assignment_proof=header_proof,
+        )
+        return material.to_dict()
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ClaimNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TaskAlreadyClaimedError, TaskNotClaimableError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidClaimProofError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(
+            status_code=500, detail="Authoritative record corruption detected"
+        ) from exc
+
+
 class NoOpResultReader:
     async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None:
         return None
@@ -686,7 +783,12 @@ def create_app(
 
     # 4. State reader, result reader, events, and routing recorder resolution
     reader = state_reader or gateway
-    results = result_reader or gateway or NoOpResultReader()
+    results = (
+        result_reader
+        or (task_store if hasattr(task_store, "get_result") else None)
+        or gateway
+        or NoOpResultReader()
+    )
     events_out = event_publisher or gateway
     routing_recorder_client = routing_recorder or (
         gateway if isinstance(gateway, RoutingRecorder) else None
@@ -723,9 +825,33 @@ def create_app(
     accept_delegation: AcceptDelegationProposal | None = None
     complete_turn: CompleteTurn | None = None
     get_resumed_continuation_context: GetResumedContinuationContext | None = None
-    evaluate_expiry: EvaluateExpiry = EvaluateExpiry(task_store=resolved_task_store)
-    resolve_expired_claim: ResolveExpiredClaim = ResolveExpiredClaim(task_store=resolved_task_store)
-    if resolved_settings.assignment_proof_pepper.strip():
+    get_child_task_input: GetChildTaskInput | None = None
+    evaluate_expiry: EvaluateExpiry | None = None
+    resolve_expired_claim: ResolveExpiredClaim | None = None
+
+    assignment_lifecycle_configured = bool(
+        resolved_settings.assignment_proof_pepper.strip()
+    )
+    executable_delegation_enabled = (
+        resolved_settings.task_delivery_mode == "authenticated_claim"
+        and assignment_lifecycle_configured
+    )
+
+    if resolved_settings.task_delivery_mode == "authenticated_claim":
+        if not resolved_settings.runtime_credential_pepper.strip():
+            raise ValueError(
+                "runtime_credential_pepper must be configured when task_delivery_mode is 'authenticated_claim'"
+            )
+        if not resolved_settings.assignment_proof_pepper.strip():
+            raise ValueError(
+                "assignment_proof_pepper must be configured when task_delivery_mode is 'authenticated_claim'"
+            )
+        if not resolved_settings.runtime_principals:
+            raise ValueError(
+                "runtime_principals must be configured when task_delivery_mode is 'authenticated_claim'"
+            )
+
+    if assignment_lifecycle_configured:
         claim_task = ClaimTask(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
@@ -735,15 +861,6 @@ def create_app(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             execution_claim_timeout_seconds=resolved_settings.execution_claim_timeout_seconds,
-        )
-        stage_artifact = StageArtifactUseCase(
-            task_store=resolved_task_store,
-            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
-        )
-        accept_delegation = AcceptDelegationProposal(
-            task_store=resolved_task_store,
-            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
-            child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
         )
         completion_store: TurnCompletionStore | None = (
             resolved_task_store
@@ -756,7 +873,24 @@ def create_app(
                 completion_store=completion_store,
                 assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             )
+        evaluate_expiry = EvaluateExpiry(task_store=resolved_task_store)
+        resolve_expired_claim = ResolveExpiredClaim(task_store=resolved_task_store)
+
+    if executable_delegation_enabled:
+        stage_artifact = StageArtifactUseCase(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
+        accept_delegation = AcceptDelegationProposal(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
+        )
         get_resumed_continuation_context = GetResumedContinuationContext(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+        )
+        get_child_task_input = GetChildTaskInput(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
         )
@@ -769,8 +903,17 @@ def create_app(
 
     app = FastAPI(title="Autonomous Agent Lab", version=__version__, lifespan=lifespan)
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        sanitized = sanitize_validation_errors(exc.errors())
+        return JSONResponse(status_code=422, content={"detail": sanitized})
+
     app.state.settings = resolved_settings
     app.state.gateway = gateway
+    app.state.assignment_lifecycle_configured = assignment_lifecycle_configured
+    app.state.executable_delegation_enabled = executable_delegation_enabled
     app.state.submit_task = submit_task
     app.state.get_agent_states = get_agent_states
     app.state.get_recent_events = get_recent_events
@@ -784,6 +927,7 @@ def create_app(
     app.state.accept_delegation = accept_delegation
     app.state.complete_turn = complete_turn
     app.state.get_resumed_continuation_context = get_resumed_continuation_context
+    app.state.get_child_task_input = get_child_task_input
     app.state.evaluate_expiry = evaluate_expiry
     app.state.resolve_expired_claim = resolve_expired_claim
     app.state.find_candidates = find_candidates_query
@@ -836,6 +980,11 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/continuation-context",
         continuation_context_endpoint,
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/input",
+        child_task_input_endpoint,
         methods=["GET"],
     )
     app.add_api_route(

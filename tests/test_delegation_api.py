@@ -73,6 +73,7 @@ def test_settings() -> Settings:
     return Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=30.0,
         child_claim_deadline_seconds=120.0,
         runtime_credential_pepper=PEPPER,

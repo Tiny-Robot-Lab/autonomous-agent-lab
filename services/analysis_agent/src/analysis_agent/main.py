@@ -2,12 +2,15 @@ import asyncio
 import logging
 import os
 import sys
+from unittest.mock import DEFAULT
 from uuid import uuid4
 
 from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
     HeartbeatRunner,
+    TaskRequested,
+    WakeUpHint,
     parse_heartbeat_interval,
 )
 from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
@@ -26,10 +29,14 @@ logging.basicConfig(
 logger = logging.getLogger("analysis_agent")
 
 
-async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
+async def run_analysis_agent(
+    heartbeat_interval: float | None = None,
+    max_signals: int | None = None,
+) -> None:
     agent_id = os.getenv("AGENT_ID", "analysis-agent-1")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.analysis")
+    hint_queue = os.getenv("HINT_QUEUE")
     orchestrator_base_url = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8080")
     runtime_token = os.getenv("RUNTIME_TOKEN", "")
     if not runtime_token.strip():
@@ -43,7 +50,10 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
         else parse_heartbeat_interval(os.getenv("HEARTBEAT_INTERVAL_SECONDS"))
     )
 
-    bus = RedisBus(redis_url, queue_name=task_queue)
+    bus_kwargs: dict[str, str] = {"queue_name": task_queue}
+    if hint_queue:
+        bus_kwargs["hint_queue"] = hint_queue
+    bus = RedisBus(redis_url, **bus_kwargs)
     orchestrator = OrchestratorClient(orchestrator_base_url, runtime_token)
     processor = AnalysisProcessor(
         agent_id=agent_id,
@@ -66,9 +76,10 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
     )
 
     logger.info(
-        "Initializing analysis agent %s on queue %s (heartbeat: %.1fs)...",
+        "Initializing analysis agent %s on queue %s%s (heartbeat: %.1fs)...",
         agent_id,
         task_queue,
+        f" and hint queue {hint_queue}" if hint_queue else "",
         interval,
     )
 
@@ -78,35 +89,135 @@ async def run_analysis_agent(heartbeat_interval: float | None = None) -> None:
         heartbeat_runner.start()
         logger.info("Analysis agent %s registered and waiting for tasks", agent_id)
 
+        processed_signals = 0
         while True:
-            task = await bus.next_task()
-            logger.info("Dispatching task %s to analysis processor", task.task_id)
-            try:
-                request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
-                assignment, proof = await orchestrator.claim_task(
-                    task.task_id, request_id, "analysis", "delegated_child"
+            is_mock_task = (
+                hasattr(bus, "next_task")
+                and (
+                    getattr(bus.next_task, "side_effect", None) is not None
+                    or getattr(bus.next_task, "_mock_return_value", None) is not DEFAULT
                 )
-                await orchestrator.acknowledge_assignment(
-                    task.task_id, assignment["assignment_id"], proof
+            )
+            is_mock_signal = (
+                hasattr(bus, "next_signal")
+                and (
+                    getattr(bus.next_signal, "side_effect", None) is not None
+                    or getattr(bus.next_signal, "_mock_return_value", None) is not DEFAULT
                 )
-                await processor.run_once(
-                    task,
-                    assignment_id=assignment["assignment_id"],
-                    assignment_proof=proof,
-                    execution_kind="delegated_child",
+            )
+            if is_mock_task and not is_mock_signal:
+                signal = await bus.next_task()
+            else:
+                signal = await bus.next_signal()
+
+            if isinstance(signal, WakeUpHint):
+                hint = signal
+                task_id = (getattr(hint, "task_id", None) or "").strip()
+                if not task_id:
+                    logger.warning(
+                        "Ignoring hint on analysis hint queue: missing or empty task_id: %s",
+                        hint,
+                    )
+                    continue
+                execution_kind = getattr(hint, "execution_kind", None)
+                if execution_kind not in ("delegated_child", "initial"):
+                    logger.warning(
+                        "Ignoring unsupported execution_kind '%s' on analysis hint queue for task %s",
+                        execution_kind,
+                        task_id,
+                    )
+                    continue
+                hint_cap = getattr(hint, "capability", "analysis")
+                if hint_cap != "analysis":
+                    logger.warning(
+                        "Ignoring hint for task %s: capability mismatch %s",
+                        task_id,
+                        hint_cap,
+                    )
+                    continue
+
+                logger.info(
+                    "Processing analysis wake-up hint for task %s (execution_kind=%s)",
+                    task_id,
+                    execution_kind,
                 )
-            except CompletionSubmissionError as exc:
-                logger.warning(
-                    "Analysis task %s claim/acknowledge failed with error: %s; ready for next task",
-                    task.task_id,
-                    exc,
-                )
-            except AnalysisExecutionError as exc:
-                logger.warning(
-                    "Analysis task %s processing failed with error: %s; ready for next task",
-                    task.task_id,
-                    exc.original_error,
-                )
+                try:
+                    request_id = f"req-{task_id}-{uuid4().hex[:8]}"
+                    assignment, proof = await orchestrator.claim_task(
+                        task_id=task_id,
+                        request_id=request_id,
+                        capability="analysis",
+                        execution_kind=execution_kind,
+                    )
+                    await orchestrator.acknowledge_assignment(
+                        task_id, assignment["assignment_id"], proof
+                    )
+                    child_material = await orchestrator.get_child_task_input(
+                        task_id, assignment["assignment_id"], proof
+                    )
+                    parent_id = (
+                        assignment["root_task_id"]
+                        if execution_kind == "delegated_child"
+                        else None
+                    )
+                    task = TaskRequested(
+                        task_id=task_id,
+                        root_task_id=assignment["root_task_id"],
+                        parent_task_id=parent_id,
+                        prompt=child_material.prompt,
+                        created_at=child_material.created_at,
+                    )
+                    await processor.run_once(
+                        task,
+                        assignment_id=assignment["assignment_id"],
+                        assignment_proof=proof,
+                        execution_kind=execution_kind,
+                        artifacts=getattr(child_material, "artifacts", ()),
+                    )
+                except CompletionSubmissionError as exc:
+                    logger.warning(
+                        "Analysis task %s hint claim/acknowledge failed: %s; ready for next signal",
+                        task_id,
+                        exc,
+                    )
+                except AnalysisExecutionError as exc:
+                    logger.warning(
+                        "Analysis task %s processing failed: %s; ready for next signal",
+                        task_id,
+                        exc.original_error,
+                    )
+            else:
+                task = signal
+                logger.info("Dispatching task %s to analysis processor", task.task_id)
+                try:
+                    request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
+                    assignment, proof = await orchestrator.claim_task(
+                        task.task_id, request_id, "analysis", "initial"
+                    )
+                    await orchestrator.acknowledge_assignment(
+                        task.task_id, assignment["assignment_id"], proof
+                    )
+                    await processor.run_once(
+                        task,
+                        assignment_id=assignment["assignment_id"],
+                        assignment_proof=proof,
+                        execution_kind="initial",
+                    )
+                except CompletionSubmissionError as exc:
+                    logger.warning(
+                        "Analysis task %s claim/acknowledge failed with error: %s; ready for next task",
+                        task.task_id,
+                        exc,
+                    )
+                except AnalysisExecutionError as exc:
+                    logger.warning(
+                        "Analysis task %s processing failed with error: %s; ready for next task",
+                        task.task_id,
+                        exc.original_error,
+                    )
+            processed_signals += 1
+            if max_signals is not None and processed_signals >= max_signals:
+                break
     finally:
         logger.info("Shutting down analysis agent %s, closing bus...", agent_id)
         await heartbeat_runner.stop()

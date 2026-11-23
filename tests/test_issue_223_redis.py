@@ -587,7 +587,6 @@ async def test_redis_resumed_research_e2e_flow(clean_gateway: RedisGateway, redi
             f"/api/tasks/{parent_id}/artifacts",
             json={
                 "assignment_id": asg["assignment_id"],
-                "assignment_proof": proof,
                 "artifact_id": artifact.artifact_id,
                 "artifact_type": artifact.artifact_type,
                 "content": dict(artifact.content),

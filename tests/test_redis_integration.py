@@ -273,6 +273,7 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
     settings = Settings(
         redis_url=clean_redis,
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=30.0,
         child_claim_deadline_seconds=120.0,
         runtime_credential_pepper=RUNTIME_CREDENTIAL_PEPPER,
@@ -320,14 +321,16 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
                 f"{base_url}/api/tasks/{parent_id}/artifacts",
                 json={
                     "assignment_id": parent_assignment["assignment_id"],
-                    "assignment_proof": parent_proof,
                     "artifact_id": f"art-{parent_id}",
                     "artifact_type": "research_material",
                     "content": {"material": ANALYSIS_MATERIAL},
                     "artifact_version": 1,
                     "payload_schema_version": 1,
                 },
-                headers={"Authorization": f"Bearer {RESEARCH_RUNTIME_TOKEN}"},
+                headers={
+                    "Authorization": f"Bearer {RESEARCH_RUNTIME_TOKEN}",
+                    "X-Assignment-Proof": parent_proof,
+                },
             )
             assert stage_res.status_code == 200, stage_res.text
             artifact_id = stage_res.json()["artifact"]["artifact_id"]

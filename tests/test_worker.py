@@ -1930,3 +1930,82 @@ async def test_traversal_retains_access_to_raw_inference_response_metadata() -> 
     assert raw_response.output_tokens == 15
     assert raw_response.total_tokens == 40
     assert raw_response.finish_reason == "stop"
+
+
+@pytest.mark.anyio
+async def test_worker_initial_wake_up_hint_claims_and_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prove Worker runtime handles WakeUpHint with execution_kind='initial'.
+
+    Governed by Issue #224 Copilot Finding 3:
+    - WakeUpHint(execution_kind='initial') -> claim -> ack -> get input -> processor.run_once -> complete.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_contracts import TaskInput, WakeUpHint
+    from worker.main import run_worker
+
+    mock_bus = AsyncMock()
+    mock_orch = AsyncMock()
+    mock_proc = AsyncMock()
+
+    hint = WakeUpHint(
+        hint_id="hint-worker-1",
+        capability="general",
+        created_at="2026-11-22T00:00:00Z",
+        execution_kind="initial",
+        task_id="task-root-worker-1",
+    )
+    mock_bus.next_signal = AsyncMock(side_effect=[hint, TimeoutError("exit")])
+
+    mock_orch.claim_task = AsyncMock(
+        return_value=(
+            {
+                "assignment_id": "asgn-worker-1",
+                "root_task_id": "task-root-worker-1",
+            },
+            "proof-worker-1",
+        )
+    )
+    mock_orch.acknowledge_assignment = AsyncMock()
+    mock_orch.get_child_task_input = AsyncMock(
+        return_value=TaskInput(
+            task_id="task-root-worker-1",
+            prompt="Worker general task prompt.",
+            created_at="2026-11-22T00:00:00Z",
+        )
+    )
+
+    with (
+        patch("worker.main.RedisBus", return_value=mock_bus),
+        patch("worker.main.OrchestratorClient", return_value=mock_orch),
+        patch("worker.main.TaskProcessor", return_value=mock_proc),
+        patch("worker.main.HeartbeatRunner") as mock_hb,
+    ):
+        mock_hb.return_value.start = MagicMock()
+        mock_hb.return_value.stop = AsyncMock()
+        monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+
+        with pytest.raises(TimeoutError, match="exit"):
+            await run_worker()
+
+    mock_orch.claim_task.assert_awaited_once_with(
+        task_id="task-root-worker-1",
+        request_id=mock_orch.claim_task.call_args.kwargs["request_id"],
+        capability="general",
+        execution_kind="initial",
+    )
+    mock_orch.acknowledge_assignment.assert_awaited_once_with(
+        "task-root-worker-1", "asgn-worker-1", "proof-worker-1"
+    )
+    mock_orch.get_child_task_input.assert_awaited_once_with(
+        "task-root-worker-1", "asgn-worker-1", "proof-worker-1"
+    )
+    mock_proc.run_once.assert_awaited_once()
+    passed_task = mock_proc.run_once.call_args.args[0]
+    assert passed_task.task_id == "task-root-worker-1"
+    assert passed_task.root_task_id == "task-root-worker-1"
+    assert passed_task.parent_task_id is None
+    assert passed_task.prompt == "Worker general task prompt."
+    assert mock_proc.run_once.call_args.kwargs["assignment_id"] == "asgn-worker-1"
+    assert mock_proc.run_once.call_args.kwargs["assignment_proof"] == "proof-worker-1"
+    assert mock_proc.run_once.call_args.kwargs["execution_kind"] == "initial"

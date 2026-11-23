@@ -14,8 +14,10 @@ from agent_contracts import (
     classify_completion_failure,
 )
 
+from research_agent.application.delegation import ResearchDelegationCoordinator
 from research_agent.application.ports import (
     ContinuationContextReader,
+    DelegationClient,
     InferenceProvider,
     MessageBus,
     ResearchExecutor,
@@ -57,6 +59,8 @@ class ResearchProcessor:
         inference_provider: InferenceProvider | None = None,
         fallback_coordinator: ResearchFallbackCoordinator | None = None,
         context_reader: ContinuationContextReader | None = None,
+        delegation_coordinator: ResearchDelegationCoordinator | None = None,
+        delegation_client: DelegationClient | None = None,
     ) -> None:
         if completion_client is None:
             raise TypeError("ResearchProcessor requires a TurnCompletionClient")
@@ -67,6 +71,14 @@ class ResearchProcessor:
         self.inference_provider = inference_provider
         self.fallback_coordinator = fallback_coordinator
         self.context_reader = context_reader
+        self.delegation_coordinator = (
+            delegation_coordinator
+            if delegation_coordinator is not None
+            else ResearchDelegationCoordinator("complete_locally")
+        )
+        self.delegation_client = delegation_client or (
+            completion_client if isinstance(completion_client, DelegationClient) else None
+        )
 
     async def run_once(
         self,
@@ -224,6 +236,67 @@ class ResearchProcessor:
                 )
             else:
                 result = await self.executor.execute(task)
+
+                decision = self.delegation_coordinator.decide(task, execution_kind)
+                if decision == "delegate_analysis":
+                    client = self.delegation_client or (
+                        self.completion_client
+                        if isinstance(self.completion_client, DelegationClient)
+                        else None
+                    )
+                    if client is None:
+                        raise RuntimeError(
+                            "DelegationClient is required for delegate_analysis execution"
+                        )
+                    evidence_text = result.output
+                    if not evidence_text or not evidence_text.strip():
+                        raise RuntimeError(
+                            "Primary research evidence text is empty for delegation"
+                        )
+                    artifact_id = f"art-{uuid4().hex[:8]}"
+                    await client.stage_artifact(
+                        task_id=task.task_id,
+                        assignment_id=assignment_id,
+                        assignment_proof=assignment_proof,
+                        artifact_id=artifact_id,
+                        artifact_type="research_material",
+                        content={"material": evidence_text},
+                        artifact_version=1,
+                        payload_schema_version=1,
+                    )
+                    proposal_id = f"prop-{uuid4().hex[:8]}"
+                    art_ref = {
+                        "artifact_id": artifact_id,
+                        "producing_task_id": task.task_id,
+                        "artifact_version": 1,
+                    }
+                    await client.propose_delegation(
+                        task_id=task.task_id,
+                        assignment_id=assignment_id,
+                        assignment_proof=assignment_proof,
+                        proposal_id=proposal_id,
+                        child_intent="Analyze the sealed Research evidence for this delegated task.",
+                        artifact_reference=art_ref,
+                        target_capability="analysis",
+                        parent_input_version=1,
+                    )
+                    await self.bus.publish(
+                        AgentEvent.create(
+                            self.agent_id,
+                            "idle",
+                            "Yielded turn for delegation",
+                            task.task_id,
+                            assignment_id=assignment_id,
+                            execution_kind=execution_kind,
+                            continuation_version=continuation_version,
+                        )
+                    )
+                    logger.info(
+                        "Research agent %s yielded turn for delegation on task %s",
+                        self.agent_id,
+                        task.task_id,
+                    )
+                    return
 
                 if self.fallback_coordinator is not None:
                     synthesis = await self.fallback_coordinator.synthesize(

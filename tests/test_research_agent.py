@@ -3755,15 +3755,8 @@ def _make_malformed_hint() -> Any:
         ),
         ("blank_task_id_whitespace", _make_hint(task_id="   ")),
         (
-            "execution_kind_initial",
-            WakeUpHint(
-                hint_id="h-init",
-                capability="research",
-                created_at="2026-11-22T00:00:00Z",
-                execution_kind="initial",
-                task_id="task-init",
-                expected_continuation_version=1,
-            ),
+            "execution_kind_unsupported",
+            _make_hint(execution_kind="unsupported_kind"),
         ),
         (
             "execution_kind_delegated_child",
@@ -4016,3 +4009,133 @@ async def test_run_research_agent_hint_handling_valid_control_proceeds_to_resume
         assert proc_kwargs["assignment_proof"] == "proof-resumed-ctrl"
         assert proc_kwargs["execution_kind"] == "resumed_continuation"
         assert proc_kwargs["continuation_version"] == 1
+
+
+@pytest.mark.anyio
+async def test_run_research_agent_initial_wake_up_hint_claims_and_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove Research runtime handles WakeUpHint with execution_kind='initial'.
+
+    Governed by Issue #224 Copilot Finding 3:
+    - WakeUpHint(execution_kind='initial') -> claim -> ack -> get input -> processor.run_once -> complete.
+    """
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("AGENT_ID", "research-agent-test")
+    monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+    monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+
+    now_iso = "2026-11-22T00:00:00Z"
+    initial_hint = WakeUpHint(
+        hint_id="hint-initial-research-1",
+        capability="research",
+        created_at=now_iso,
+        execution_kind="initial",
+        task_id="task-root-res-1",
+    )
+
+    root_input = TaskInput(
+        task_id="task-root-res-1",
+        prompt="Investigate perovskite solar material durability.",
+        created_at=now_iso,
+    )
+
+    with (
+        patch("research_agent.main.RedisBus") as mock_bus_cls,
+        patch("research_agent.main.OrchestratorClient") as mock_orch_cls,
+        patch("research_agent.main.ResearchProcessor") as mock_proc_cls,
+    ):
+        mock_bus = AsyncMock()
+        mock_bus_cls.return_value = mock_bus
+
+        mock_orch = AsyncMock()
+        mock_orch_cls.return_value = mock_orch
+        mock_orch.claim_task.return_value = (
+            {"assignment_id": "asgn-init-res", "task_id": "task-root-res-1", "root_task_id": "task-root-res-1"},
+            "proof-init-res",
+        )
+        mock_orch.get_child_task_input.return_value = root_input
+
+        mock_proc = AsyncMock()
+        mock_proc_cls.return_value = mock_proc
+
+        mock_bus.next_signal.side_effect = [
+            initial_hint,
+            asyncio.CancelledError(),
+        ]
+
+        from research_agent.main import run_research_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_research_agent()
+
+        mock_orch.claim_task.assert_awaited_once_with(
+            task_id="task-root-res-1",
+            request_id=mock_orch.claim_task.call_args.kwargs["request_id"],
+            capability="research",
+            execution_kind="initial",
+        )
+        mock_orch.acknowledge_assignment.assert_awaited_once_with(
+            "task-root-res-1", "asgn-init-res", "proof-init-res"
+        )
+        mock_orch.get_child_task_input.assert_awaited_once_with(
+            "task-root-res-1", "asgn-init-res", "proof-init-res"
+        )
+        mock_proc.run_once.assert_awaited_once()
+        proc_task = mock_proc.run_once.call_args[0][0]
+        proc_kwargs = mock_proc.run_once.call_args[1]
+        assert proc_task.task_id == "task-root-res-1"
+        assert proc_task.prompt == "Investigate perovskite solar material durability."
+        assert proc_task.root_task_id == "task-root-res-1"
+        assert proc_task.parent_task_id is None
+        assert proc_kwargs["assignment_id"] == "asgn-init-res"
+        assert proc_kwargs["assignment_proof"] == "proof-init-res"
+        assert proc_kwargs["execution_kind"] == "initial"
+
+
+@pytest.mark.anyio
+async def test_research_processor_delegation_with_exact_2000_char_prompt() -> None:
+    """Prove Research processor constructs bounded child_intent even with an exact 2000-char root prompt.
+
+    Governed by Issue #224 Copilot Finding 4:
+    - Root prompt is exactly 2,000 characters;
+    - child_intent does not prefix the full root prompt;
+    - child_intent stays within the 2,000 character limit and matches the stable instruction.
+    """
+    from research_agent.application.delegation import ResearchDelegationCoordinator
+    from research_agent.application.processor import ResearchProcessor
+
+    mock_bus = AsyncMock()
+    mock_executor = AsyncMock()
+    mock_executor.execute.return_value = ResearchResult(
+        task_id="task-res-2000",
+        output="Primary research findings on max length prompt.",
+        acknowledged=True,
+    )
+    mock_client = AsyncMock()
+
+    processor = ResearchProcessor(
+        agent_id="research-test",
+        bus=mock_bus,
+        executor=mock_executor,
+        completion_client=mock_client,
+        delegation_client=mock_client,
+        delegation_coordinator=ResearchDelegationCoordinator("delegate_analysis"),
+    )
+
+    exact_2000_char_prompt = "P" * 2000
+    assert len(exact_2000_char_prompt) == 2000
+
+    task = TaskRequested.create(exact_2000_char_prompt)
+    await processor.run_once(
+        task,
+        assignment_id="asgn-2000",
+        assignment_proof="proof-2000",
+        execution_kind="initial",
+    )
+
+    mock_client.propose_delegation.assert_awaited_once()
+    call_kwargs = mock_client.propose_delegation.call_args.kwargs
+    child_intent = call_kwargs["child_intent"]
+    assert len(child_intent) <= 2000
+    assert child_intent == "Analyze the sealed Research evidence for this delegated task."
