@@ -10,12 +10,15 @@ from agent_contracts import (
     AgentEvent,
     AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    ClaimExpiryRecord,
     CompletionCommand,
     CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
     FallbackTransition,
     InferenceExecutionTelemetry,
+    RecoveryDecisionCommand,
+    RecoveryDecisionRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     RoutingDecision,
@@ -26,11 +29,13 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    build_claim_timed_out_terminal_outcome,
     build_completion_audit,
     build_terminal_outcome,
     canonical_json_dumps,
     normalize_canonical_utc_timestamp,
 )
+from redis.exceptions import ResponseError
 
 from orchestrator.application.inference_history import (
     TaskEventObservation,
@@ -39,13 +44,17 @@ from orchestrator.application.inference_history import (
 from orchestrator.application.ports import (
     CapabilityMismatchError,
     ChildClaimDeadlineExpiredError,
+    ClaimDeadlineNotExpiredError,
     ClaimDeliveryLeaseExpiredError,
     ClaimNotFoundError,
+    ClaimTimeoutConflictError,
     CompletionConflictError,
     DelegationConflictError,
     FencingEpochRaceError,
     GrantAlreadyConsumedError,
     InvalidClaimProofError,
+    RecoveryConflictError,
+    RecoveryPreconditionFailedError,
     TaskAlreadyClaimedError,
     TaskNotClaimableError,
     TelemetryStorageError,
@@ -485,6 +494,11 @@ if redis.call('EXISTS', claim_key) == 1 then
     end
 
     local resolved_prior = c_prior_status or 'pending'
+
+    local c_exec_expires_at = cur_claim['execution_expires_at']
+    if c_state == 'acknowledged' and type(c_exec_expires_at) == 'string' and c_exec_expires_at ~= '' and now_iso > c_exec_expires_at then
+        return {'EXECUTION_CLAIM_EXPIRED', cur_claim_raw}
+    end
 
     if c_principal_id == principal_id and c_request_id == request_id then
         if c_state == 'acknowledged' then
@@ -1420,6 +1434,7 @@ local claim_key = KEYS[1]
 local assignment_id = ARGV[1]
 local principal_id = ARGV[2]
 local now_iso = ARGV[3]
+local execution_expires_at = ARGV[4]
 
 if redis.call('EXISTS', claim_key) == 0 then
     return {'CLAIM_NOT_FOUND'}
@@ -1468,6 +1483,9 @@ end
 -- State commit (Single mutating command)
 cur_claim['state'] = 'acknowledged'
 cur_claim['acknowledged_at'] = now_iso
+if execution_expires_at and execution_expires_at ~= '' then
+    cur_claim['execution_expires_at'] = execution_expires_at
+end
 local updated_raw = cjson.encode(cur_claim)
 redis.call('SET', claim_key, updated_raw)
 
@@ -1535,6 +1553,597 @@ end
 return {'CORRUPT_CLAIM'}
 """
 
+MATERIALIZE_CLAIM_TIMEOUT_LUA = """
+local child_status_key = KEYS[1]
+local child_claim_key = KEYS[2]
+local child_deadline_key = KEYS[3]
+local child_outcome_key = KEYS[4]
+local child_result_key = KEYS[5]
+local child_lineage_key = KEYS[6]
+local parent_status_key = KEYS[7]
+local parent_children_key = KEYS[8]
+local parent_continuation_key = KEYS[9]
+local parent_continuation_latest_key = KEYS[10]
+local child_marker_key = KEYS[11]
+local hint_queue_key = KEYS[12]
+
+local child_task_id = ARGV[1]
+local parent_task_id = ARGV[2]
+local now_iso = ARGV[3]
+local child_outcome_json = ARGV[4]
+local child_status_json = ARGV[5]
+local parent_status_json = ARGV[6]
+local marker_json = ARGV[7]
+local hint_json = ARGV[8]
+
+-- =============================================================================
+-- PHASE 1: Reads and Validations (Strictly Read-Only, Zero Mutations)
+-- =============================================================================
+
+-- 0. Key type validations
+for _, k in ipairs({child_status_key, child_claim_key, child_deadline_key, child_outcome_key, child_result_key, child_lineage_key, parent_status_key, parent_continuation_key, parent_continuation_latest_key, child_marker_key}) do
+    local t = redis.call('TYPE', k)['ok']
+    if t ~= 'none' and t ~= 'string' then
+        return {'WRONG_KEY_TYPE_' .. k, t}
+    end
+end
+local children_type = redis.call('TYPE', parent_children_key)['ok']
+if children_type ~= 'none' and children_type ~= 'set' then
+    return {'WRONG_KEY_TYPE_' .. parent_children_key, children_type}
+end
+local hint_type = redis.call('TYPE', hint_queue_key)['ok']
+if hint_type ~= 'none' and hint_type ~= 'list' then
+    return {'WRONG_KEY_TYPE_' .. hint_queue_key, hint_type}
+end
+
+-- 1. Check child status exists
+if redis.call('EXISTS', child_status_key) == 0 then
+    return {'CHILD_NOT_FOUND'}
+end
+local child_status_raw = redis.call('GET', child_status_key)
+local ok_cs, child_status_tbl = pcall(cjson.decode, child_status_raw)
+if not ok_cs or type(child_status_tbl) ~= 'table' then
+    return {'CORRUPT_CHILD_STATUS'}
+end
+local child_status = child_status_tbl['status']
+
+-- 2. Idempotent check: if child is already claim_timed_out
+if child_status == 'claim_timed_out' then
+    if redis.call('EXISTS', child_outcome_key) == 0 then
+        return {'OUTCOME_CONFLICT'}
+    end
+    local existing_outcome_raw = redis.call('GET', child_outcome_key)
+    local ok_out, existing_out = pcall(cjson.decode, existing_outcome_raw)
+    if not ok_out or type(existing_out) ~= 'table' then
+        return {'CORRUPT_TERMINAL_OUTCOME'}
+    end
+    if existing_out['task_id'] ~= child_task_id or existing_out['terminal_status'] ~= 'claim_timed_out' then
+        return {'OUTCOME_CONFLICT'}
+    end
+    local expected_outcome_id = existing_out['outcome_id']
+
+    -- No TaskResult may exist
+    if redis.call('EXISTS', child_result_key) == 1 then
+        return {'RESULT_CONFLICT'}
+    end
+
+    -- No active claim may exist
+    if redis.call('EXISTS', child_claim_key) == 1 then
+        return {'ACTIVE_CLAIM_EXISTS'}
+    end
+
+    -- Lineage and membership checks:
+    if redis.call('EXISTS', child_lineage_key) == 0 then
+        return {'CHILD_LINEAGE_NOT_FOUND'}
+    end
+    local lineage_raw = redis.call('GET', child_lineage_key)
+    local ok_l, lineage_tbl = pcall(cjson.decode, lineage_raw)
+    if not ok_l or type(lineage_tbl) ~= 'table' then
+        return {'CORRUPT_CHILD_LINEAGE'}
+    end
+    if lineage_tbl['task_id'] ~= child_task_id then
+        return {'LINEAGE_CHILD_MISMATCH'}
+    end
+    if lineage_tbl['parent_task_id'] ~= parent_task_id then
+        return {'LINEAGE_PARENT_MISMATCH'}
+    end
+    if lineage_tbl['root_task_id'] == nil or lineage_tbl['root_task_id'] == cjson.null or lineage_tbl['root_task_id'] == '' then
+        return {'CORRUPT_CHILD_LINEAGE'}
+    end
+
+    -- Parent children set must include child
+    if redis.call('EXISTS', parent_children_key) == 0 or redis.call('SISMEMBER', parent_children_key, child_task_id) ~= 1 then
+        return {'CHILD_NOT_MEMBER'}
+    end
+
+    -- Continuation checks:
+    if redis.call('EXISTS', parent_continuation_latest_key) == 0 then
+        return {'MISSING_CONTINUATION_LATEST'}
+    end
+    local latest_raw = redis.call('GET', parent_continuation_latest_key)
+    if tonumber(latest_raw) ~= 1 then
+        return {'CONTINUATION_LATEST_MISMATCH', tostring(latest_raw)}
+    end
+
+    if redis.call('EXISTS', parent_continuation_key) == 0 then
+        return {'MISSING_CONTINUATION'}
+    end
+    local cont_raw = redis.call('GET', parent_continuation_key)
+    local ok_cnt, cont_tbl = pcall(cjson.decode, cont_raw)
+    if not ok_cnt or type(cont_tbl) ~= 'table' then
+        return {'CORRUPT_CONTINUATION'}
+    end
+    if cont_tbl['parent_task_id'] ~= parent_task_id then
+        return {'CONTINUATION_PARENT_MISMATCH', tostring(cont_tbl['parent_task_id'])}
+    end
+    if tonumber(cont_tbl['continuation_version']) ~= 1 then
+        return {'CONTINUATION_VERSION_MISMATCH', tostring(cont_tbl['continuation_version'])}
+    end
+    if cont_tbl['stage'] ~= 'incorporate_analysis_child' then
+        return {'CONTINUATION_STAGE_MISMATCH', tostring(cont_tbl['stage'])}
+    end
+    if cont_tbl['child_task_id'] ~= child_task_id then
+        return {'CONTINUATION_CHILD_MISMATCH', tostring(cont_tbl['child_task_id'])}
+    end
+
+    -- Projection checks:
+    -- Child marker must exist and bind exact child, parent, outcome, and continuation version
+    if redis.call('EXISTS', child_marker_key) == 0 then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+    local marker_raw = redis.call('GET', child_marker_key)
+    local ok_m, marker_tbl = pcall(cjson.decode, marker_raw)
+    if not ok_m or type(marker_tbl) ~= 'table' then
+        return {'CORRUPT_CHILD_MARKER'}
+    end
+    if marker_tbl['child_task_id'] ~= child_task_id then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+    if marker_tbl['parent_task_id'] ~= parent_task_id then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+    if marker_tbl['outcome_id'] ~= expected_outcome_id then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+    if tonumber(marker_tbl['continuation_version']) ~= 1 then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+    if marker_tbl['status'] ~= 'claim_timed_out' then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+
+    -- Parent status must be exactly 'resumable'
+    if redis.call('EXISTS', parent_status_key) == 0 then
+        return {'PARENT_NOT_FOUND'}
+    end
+    local parent_st_raw = redis.call('GET', parent_status_key)
+    local ok_pst, parent_st_tbl = pcall(cjson.decode, parent_st_raw)
+    if not ok_pst or type(parent_st_tbl) ~= 'table' then
+        return {'CORRUPT_PARENT_STATUS'}
+    end
+    if parent_st_tbl['status'] ~= 'resumable' then
+        return {'INCOMPLETE_REPLAY_PROJECTION'}
+    end
+
+    -- Valid replay: return existing outcome with IDEMPOTENT flag (no writes, no hint emitted)
+    return {'IDEMPOTENT', existing_outcome_raw}
+end
+
+-- 3. Child must be in pending status
+if child_status ~= 'pending' then
+    return {'CHILD_NOT_PENDING', child_status}
+end
+
+-- 4. Check no terminal outcome, result, or marker already exists
+if redis.call('EXISTS', child_outcome_key) == 1 then
+    return {'OUTCOME_CONFLICT'}
+end
+if redis.call('EXISTS', child_result_key) == 1 then
+    return {'RESULT_CONFLICT'}
+end
+if redis.call('EXISTS', child_marker_key) == 1 then
+    return {'MARKER_CONFLICT'}
+end
+
+-- 5. Check active claim on child
+if redis.call('EXISTS', child_claim_key) == 1 then
+    local claim_raw = redis.call('GET', child_claim_key)
+    local ok_c, claim_tbl = pcall(cjson.decode, claim_raw)
+    if not ok_c or type(claim_tbl) ~= 'table' then
+        return {'CORRUPT_CLAIM'}
+    end
+    if claim_tbl['task_id'] ~= child_task_id then
+        return {'CORRUPT_CLAIM'}
+    end
+    local c_state = claim_tbl['state']
+    local c_expires_at = claim_tbl['delivery_expires_at']
+    if c_state == 'acknowledged' then
+        return {'ACTIVE_CLAIM_EXISTS'}
+    elseif c_state == 'claimed_unacknowledged' then
+        if type(c_expires_at) == 'string' and c_expires_at > now_iso then
+            return {'ACTIVE_CLAIM_EXISTS'}
+        end
+    else
+        return {'CORRUPT_CLAIM'}
+    end
+end
+
+-- 6. Child lineage validation
+if redis.call('EXISTS', child_lineage_key) == 0 then
+    return {'CHILD_LINEAGE_NOT_FOUND'}
+end
+local lineage_raw = redis.call('GET', child_lineage_key)
+local ok_l, lineage_tbl = pcall(cjson.decode, lineage_raw)
+if not ok_l or type(lineage_tbl) ~= 'table' then
+    return {'CORRUPT_CHILD_LINEAGE'}
+end
+if lineage_tbl['task_id'] ~= child_task_id then
+    return {'LINEAGE_CHILD_MISMATCH'}
+end
+if lineage_tbl['parent_task_id'] == nil or lineage_tbl['parent_task_id'] == cjson.null or lineage_tbl['parent_task_id'] ~= parent_task_id then
+    return {'LINEAGE_PARENT_MISMATCH'}
+end
+
+-- 7. Child claim deadline validation
+local deadline_val = nil
+if redis.call('EXISTS', child_deadline_key) == 1 then
+    deadline_val = redis.call('GET', child_deadline_key)
+elseif child_status_tbl['claim_deadline'] and child_status_tbl['claim_deadline'] ~= '' then
+    deadline_val = child_status_tbl['claim_deadline']
+end
+if not deadline_val or deadline_val == '' then
+    return {'MISSING_CLAIM_DEADLINE'}
+end
+
+-- Boundary check: now_iso must be strictly > deadline_val. At deadline (now_iso <= deadline_val), child remains claimable.
+if now_iso <= deadline_val then
+    return {'DEADLINE_NOT_EXPIRED', deadline_val}
+end
+
+-- 8. Parent status validation
+if redis.call('EXISTS', parent_status_key) == 0 then
+    return {'PARENT_NOT_FOUND'}
+end
+local parent_status_raw = redis.call('GET', parent_status_key)
+local ok_ps, parent_status_tbl = pcall(cjson.decode, parent_status_raw)
+if not ok_ps or type(parent_status_tbl) ~= 'table' then
+    return {'CORRUPT_PARENT_STATUS'}
+end
+if parent_status_tbl['task_id'] and parent_status_tbl['task_id'] ~= parent_task_id then
+    return {'CORRUPT_PARENT_STATUS'}
+end
+if parent_status_tbl['status'] ~= 'waiting_for_children' then
+    return {'PARENT_NOT_WAITING', parent_status_tbl['status']}
+end
+
+-- 9. Parent children membership validation
+if redis.call('EXISTS', parent_children_key) == 0 then
+    return {'PARENT_CHILDREN_NOT_FOUND'}
+end
+if redis.call('SISMEMBER', parent_children_key, child_task_id) ~= 1 then
+    return {'CHILD_NOT_MEMBER'}
+end
+
+-- 10. Parent continuation validation
+if redis.call('EXISTS', parent_continuation_latest_key) == 0 then
+    return {'MISSING_CONTINUATION_LATEST'}
+end
+local latest_raw = redis.call('GET', parent_continuation_latest_key)
+local latest_ver = tonumber(latest_raw)
+if not latest_ver or latest_ver ~= 1 then
+    return {'CONTINUATION_LATEST_MISMATCH', tostring(latest_ver or latest_raw)}
+end
+
+if redis.call('EXISTS', parent_continuation_key) == 0 then
+    return {'MISSING_CONTINUATION'}
+end
+local cont_raw = redis.call('GET', parent_continuation_key)
+local ok_cnt, cont_tbl = pcall(cjson.decode, cont_raw)
+if not ok_cnt or type(cont_tbl) ~= 'table' then
+    return {'CORRUPT_CONTINUATION'}
+end
+if cont_tbl['parent_task_id'] ~= parent_task_id then
+    return {'CONTINUATION_PARENT_MISMATCH', tostring(cont_tbl['parent_task_id'])}
+end
+local cont_ver = tonumber(cont_tbl['continuation_version'])
+if not cont_ver or cont_ver ~= latest_ver then
+    return {'CONTINUATION_VERSION_MISMATCH', tostring(cont_tbl['continuation_version'])}
+end
+if cont_tbl['stage'] ~= 'incorporate_analysis_child' then
+    return {'CONTINUATION_STAGE_MISMATCH', tostring(cont_tbl['stage'])}
+end
+if cont_tbl['child_task_id'] ~= child_task_id then
+    return {'CONTINUATION_CHILD_MISMATCH', tostring(cont_tbl['child_task_id'])}
+end
+
+-- =============================================================================
+-- PHASE 2: State Commit (Atomic Mutations; No Failures Permitted After First Mutation)
+-- =============================================================================
+
+-- 1. Store canonical TerminalOutcome for child
+redis.call('SET', child_outcome_key, child_outcome_json)
+
+-- 2. Transition child status to claim_timed_out
+redis.call('SET', child_status_key, child_status_json)
+
+-- 3. Write child completion marker
+redis.call('SET', child_marker_key, marker_json)
+
+-- 4. Transition parent status from waiting_for_children to resumable
+redis.call('SET', parent_status_key, parent_status_json)
+
+-- 5. Enqueue research wake-up hint
+redis.call('RPUSH', hint_queue_key, hint_json)
+
+return {'OK', child_outcome_json}
+"""
+
+TRANSITION_EXPIRED_CLAIM_LUA = """
+local status_key = KEYS[1]
+local claim_key = KEYS[2]
+local fence_key = KEYS[3]
+local expiry_key = KEYS[4]
+local outcome_key = KEYS[5]
+local result_key = KEYS[6]
+local events_key = KEYS[7]
+
+local task_id = ARGV[1]
+local now_iso = ARGV[2]
+local expiry_record_json = ARGV[3]
+local recovery_status_json = ARGV[4]
+local stream_event_json = ARGV[5]
+
+-- =============================================================================
+-- PHASE 1: Reads and Validations (Strictly Read-Only, Zero Mutations)
+-- =============================================================================
+
+-- 0. Key type validation
+for _, k in ipairs({status_key, claim_key, fence_key, expiry_key, outcome_key, result_key}) do
+    local t = redis.call('TYPE', k)['ok']
+    if t ~= 'none' and t ~= 'string' then
+        return {'WRONG_KEY_TYPE_' .. k, t}
+    end
+end
+local ev_type = redis.call('TYPE', events_key)['ok']
+if ev_type ~= 'none' and ev_type ~= 'stream' then
+    return {'WRONG_KEY_TYPE_' .. events_key, ev_type}
+end
+
+-- 1. Status key exists
+if redis.call('EXISTS', status_key) == 0 then
+    return {'NOT_FOUND'}
+end
+local status_raw = redis.call('GET', status_key)
+local ok_s, status_tbl = pcall(cjson.decode, status_raw)
+if not ok_s or type(status_tbl) ~= 'table' then
+    return {'CORRUPT_STATUS'}
+end
+local cur_status = status_tbl['status']
+
+-- 2. Idempotent check: if already in recovery_required and expiry record exists
+if cur_status == 'recovery_required' then
+    if redis.call('EXISTS', expiry_key) == 1 then
+        local existing_expiry = redis.call('GET', expiry_key)
+        return {'IDEMPOTENT', existing_expiry}
+    end
+    return {'EXPIRY_RECORD_MISSING'}
+end
+
+-- 3. Task must be in working status
+if cur_status ~= 'working' then
+    return {'NOT_WORKING', cur_status}
+end
+
+-- 4. Check no terminal outcome or result has already won
+if redis.call('EXISTS', outcome_key) == 1 then
+    return {'ALREADY_COMPLETED'}
+end
+if redis.call('EXISTS', result_key) == 1 then
+    return {'ALREADY_COMPLETED'}
+end
+
+-- 5. Active claim must exist
+if redis.call('EXISTS', claim_key) == 0 then
+    return {'CLAIM_NOT_FOUND'}
+end
+local claim_raw = redis.call('GET', claim_key)
+local ok_c, claim_tbl = pcall(cjson.decode, claim_raw)
+if not ok_c or type(claim_tbl) ~= 'table' then
+    return {'CORRUPT_CLAIM'}
+end
+
+-- 6. Claim must be in acknowledged state
+if claim_tbl['state'] ~= 'acknowledged' then
+    return {'CLAIM_NOT_ACKNOWLEDGED', tostring(claim_tbl['state'])}
+end
+
+-- 7. execution_expires_at must exist and be expired
+local exec_expires = claim_tbl['execution_expires_at']
+if not exec_expires or type(exec_expires) ~= 'string' or exec_expires == '' then
+    return {'MISSING_EXECUTION_EXPIRES_AT'}
+end
+if now_iso <= exec_expires then
+    return {'EXECUTION_NOT_EXPIRED', exec_expires}
+end
+
+-- 8. Fencing epoch must match current fence
+if redis.call('EXISTS', fence_key) == 0 then
+    return {'FENCE_NOT_FOUND'}
+end
+local fence_raw = redis.call('GET', fence_key)
+local cur_fence = tonumber(fence_raw)
+local claim_epoch = tonumber(claim_tbl['fencing_epoch'])
+if not cur_fence or not claim_epoch or cur_fence ~= claim_epoch then
+    return {'FENCE_MISMATCH', tostring(cur_fence), tostring(claim_epoch)}
+end
+
+-- 9. Validate prior_claimable_status matches execution_kind
+local ekind = claim_tbl['execution_kind']
+local prior_s = claim_tbl['prior_claimable_status']
+if ekind == 'resumed_continuation' then
+    if prior_s ~= 'resumable' then
+        return {'CORRUPT_PRIOR_STATUS', tostring(prior_s)}
+    end
+else
+    if prior_s ~= 'pending' then
+        return {'CORRUPT_PRIOR_STATUS', tostring(prior_s)}
+    end
+end
+
+-- =============================================================================
+-- PHASE 2: State Commit (Atomic Mutations; No Failures Permitted After First Mutation)
+-- =============================================================================
+
+-- 1. Invalidate/delete the ActiveClaim
+redis.call('DEL', claim_key)
+
+-- 2. Store the ClaimExpiryRecord
+redis.call('SET', expiry_key, expiry_record_json)
+
+-- 3. Transition task status to recovery_required
+redis.call('SET', status_key, recovery_status_json)
+
+-- NOTE: As required by approved decision 5: DO NOT increment task.fence!
+
+-- 4. Publish bounded non-secret observation to event stream if event provided
+if stream_event_json and stream_event_json ~= '' then
+    local ok_ev, ev_tbl = pcall(cjson.decode, stream_event_json)
+    if ok_ev and type(ev_tbl) == 'table' then
+        local args = {'XADD', events_key, 'MAXLEN', '~', '500', '*'}
+        for k, v in pairs(ev_tbl) do
+            table.insert(args, tostring(k))
+            table.insert(args, tostring(v))
+        end
+        redis.call(unpack(args))
+    end
+end
+
+return {'OK', expiry_record_json}
+"""
+
+RESOLVE_EXPIRED_CLAIM_LUA = """
+local status_key = KEYS[1]
+local claim_key = KEYS[2]
+local fence_key = KEYS[3]
+local expiry_key = KEYS[4]
+local decision_key = KEYS[5]
+local outcome_key = KEYS[6]
+
+local task_id = ARGV[1]
+local recovery_decision_id = ARGV[2]
+local expired_claim_id = ARGV[3]
+local expired_assignment_id = ARGV[4]
+local expired_epoch = tonumber(ARGV[5])
+local disposition = ARGV[6]
+local decision_record_json = ARGV[7]
+local decision_fingerprint = ARGV[8]
+local restored_status_json = ARGV[9]
+
+-- =============================================================================
+-- PHASE 1: Reads and Validations (Strictly Read-Only, Zero Mutations)
+-- =============================================================================
+
+-- 0. Key type validation
+for _, k in ipairs({status_key, claim_key, fence_key, expiry_key, decision_key, outcome_key}) do
+    local t = redis.call('TYPE', k)['ok']
+    if t ~= 'none' and t ~= 'string' then
+        return {'WRONG_KEY_TYPE_' .. k, t}
+    end
+end
+
+-- 1. Check idempotent replay of recovery decision
+if redis.call('EXISTS', decision_key) == 1 then
+    local existing_dec_raw = redis.call('GET', decision_key)
+    local ok_d, existing_dec = pcall(cjson.decode, existing_dec_raw)
+    if ok_d and type(existing_dec) == 'table' then
+        if existing_dec['semantic_fingerprint'] == decision_fingerprint then
+            return {'IDEMPOTENT', existing_dec_raw, existing_dec['restored_status']}
+        else
+            return {'DECISION_CONFLICT'}
+        end
+    end
+    return {'CORRUPT_DECISION'}
+end
+
+-- 2. Status key exists
+if redis.call('EXISTS', status_key) == 0 then
+    return {'NOT_FOUND'}
+end
+local status_raw = redis.call('GET', status_key)
+local ok_s, status_tbl = pcall(cjson.decode, status_raw)
+if not ok_s or type(status_tbl) ~= 'table' then
+    return {'CORRUPT_STATUS'}
+end
+local cur_status = status_tbl['status']
+
+-- 3. Task must be in recovery_required status
+if cur_status ~= 'recovery_required' then
+    return {'NOT_RECOVERY_REQUIRED', cur_status}
+end
+
+-- 4. Check no terminal outcome has won
+if redis.call('EXISTS', outcome_key) == 1 then
+    return {'ALREADY_COMPLETED'}
+end
+
+-- 5. No active claim must exist
+if redis.call('EXISTS', claim_key) == 1 then
+    return {'ACTIVE_CLAIM_EXISTS'}
+end
+
+-- 6. ClaimExpiryRecord must exist and match command
+if redis.call('EXISTS', expiry_key) == 0 then
+    return {'EXPIRY_RECORD_NOT_FOUND'}
+end
+local expiry_raw = redis.call('GET', expiry_key)
+local ok_exp, expiry_tbl = pcall(cjson.decode, expiry_raw)
+if not ok_exp or type(expiry_tbl) ~= 'table' then
+    return {'CORRUPT_EXPIRY_RECORD'}
+end
+
+if expiry_tbl['task_id'] ~= task_id or
+   expiry_tbl['claim_id'] ~= expired_claim_id or
+   expiry_tbl['assignment_id'] ~= expired_assignment_id or
+   tonumber(expiry_tbl['expired_fencing_epoch']) ~= expired_epoch then
+    return {'EXPIRY_RECORD_MISMATCH'}
+end
+
+-- 7. Disposition must be restore_claimable
+if disposition ~= 'restore_claimable' then
+    return {'UNSUPPORTED_DISPOSITION', disposition}
+end
+
+-- 8. Fencing epoch must still match expired_fencing_epoch
+if redis.call('EXISTS', fence_key) == 0 then
+    return {'FENCE_NOT_FOUND'}
+end
+local fence_raw = redis.call('GET', fence_key)
+local cur_fence = tonumber(fence_raw)
+if not cur_fence or cur_fence ~= expired_epoch then
+    return {'FENCE_MISMATCH', tostring(cur_fence), tostring(expired_epoch)}
+end
+
+-- 9. Verify prior_claimable_status in expiry record is valid
+local restored_status = expiry_tbl['prior_claimable_status']
+if restored_status ~= 'pending' and restored_status ~= 'resumable' then
+    return {'CORRUPT_PRIOR_STATUS', tostring(restored_status)}
+end
+
+-- =============================================================================
+-- PHASE 2: State Commit (Atomic Mutations; No Failures Permitted After First Mutation)
+-- =============================================================================
+
+-- 1. Store the RecoveryDecisionRecord
+redis.call('SET', decision_key, decision_record_json)
+
+-- 2. Restore task status to prior_claimable_status
+redis.call('SET', status_key, restored_status_json)
+
+-- NOTE: As required by approved decision 5: DO NOT increment task.fence!
+
+return {'OK', decision_record_json, restored_status}
+"""
+
 
 class RedisGateway:
     def __init__(self, url: str, delivery_mode: str = "legacy_push") -> None:
@@ -1594,23 +2203,28 @@ class RedisGateway:
         authority_json = root_authority.to_json()
         capability_json = required_cap_record.to_json()
 
-        raw_result = await self._client.eval(
-            REGISTER_ROOT_TASK_LUA,
-            6,
-            marker_key,
-            status_key,
-            lineage_key,
-            input_key,
-            authority_key,
-            capability_key,
-            marker_json,
-            status_json,
-            lineage_json,
-            input_json,
-            authority_json,
-            task.task_id,
-            capability_json,
-        )
+        try:
+            raw_result = await self._client.eval(
+                REGISTER_ROOT_TASK_LUA,
+                6,
+                marker_key,
+                status_key,
+                lineage_key,
+                input_key,
+                authority_key,
+                capability_key,
+                marker_json,
+                status_json,
+                lineage_json,
+                input_json,
+                authority_json,
+                task.task_id,
+                capability_json,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during register_root_task"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -1662,15 +2276,20 @@ class RedisGateway:
         })
         capability_json = cap_rec.to_json()
 
-        raw_result = await self._client.eval(
-            REGISTER_CHILD_TASK_LUA,
-            4,
-            *keys,
-            status_json,
-            lineage_json,
-            capability_json,
-            task.task_id,
-        )
+        try:
+            raw_result = await self._client.eval(
+                REGISTER_CHILD_TASK_LUA,
+                4,
+                *keys,
+                status_json,
+                lineage_json,
+                capability_json,
+                task.task_id,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during register_child_task"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -1749,45 +2368,124 @@ class RedisGateway:
             canonical_json_dumps({"status": clean_status, "task_id": clean_task_id}),
         )
 
-    async def get_status(self, task_id: str) -> str | None:
+    async def get_status(self, task_id: str, now: str = "") -> str | None:
         clean_task_id = str(task_id).strip()
         if not clean_task_id:
             return None
+
+        try:
+            raw_outcome = await self._client.get(f"task.outcome:{clean_task_id}")
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt terminal outcome at task.outcome:{clean_task_id}: {exc}"
+            ) from exc
+        if raw_outcome is not None:
+            try:
+                outcome_obj = TerminalOutcome.from_json(raw_outcome)
+                return outcome_obj.terminal_status
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt terminal outcome at task.outcome:{clean_task_id}: {exc}"
+                ) from exc
+
         key = f"task.status:{clean_task_id}"
-        raw = await self._client.get(key)
+        try:
+            raw = await self._client.get(key)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt task status record at key '{key}': {exc}"
+            ) from exc
         if raw is None:
             return None
         try:
             data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             if isinstance(data, dict) and isinstance(data.get("status"), str):
-                return data["status"]
-            raise ValueError("Status record must be a JSON object containing a string 'status'")
+                cur_s = data["status"]
+            else:
+                raise TypeError("Status record must be a JSON object containing a string 'status'")
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt task status record at key '{key}': {exc}"
             ) from exc
 
+        # Targeted task-specific expiry evaluation for pending/working tasks
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        if cur_s == "pending":
+            try:
+                raw_deadline = await self._client.get(f"task.claim_deadline:{clean_task_id}")
+            except ResponseError as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt claim deadline record at task.claim_deadline:{clean_task_id}: {exc}"
+                ) from exc
+            if raw_deadline is not None:
+                deadline_str = raw_deadline if isinstance(raw_deadline, str) else raw_deadline.decode("utf-8")
+                if deadline_str and now_iso > deadline_str:
+                    try:
+                        await self.materialize_claim_timeout(clean_task_id, now_iso)
+                        return "claim_timed_out"
+                    except (TaskNotClaimableError, CompletionConflictError, ClaimTimeoutConflictError):
+                        pass
+                    except CorruptAuthoritativeRecordError:
+                        raise
+        elif cur_s == "working":
+            try:
+                raw_claim = await self._client.get(f"task.claim:{clean_task_id}")
+            except ResponseError as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"
+                ) from exc
+            if raw_claim is not None:
+                try:
+                    claim_obj = ActiveClaim.from_json(raw_claim)
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"
+                    ) from exc
+                if (
+                    claim_obj.state == "acknowledged"
+                    and claim_obj.execution_expires_at
+                    and now_iso > claim_obj.execution_expires_at
+                ):
+                    try:
+                        await self.transition_expired_claim(clean_task_id, now_iso)
+                        return "recovery_required"
+                    except (TaskNotClaimableError, CompletionConflictError):
+                        pass
+                    except CorruptAuthoritativeRecordError:
+                        raise
+
+        return cur_s
+
     async def save_task_input(self, task_input: TaskInput) -> None:
         target_key = f"task.input:{task_input.task_id}:{task_input.input_version}"
         payload = task_input.to_json()
-        if task_input.input_version == 1:
-            raw_result = await self._client.eval(
-                SAVE_TASK_INPUT_LUA,
-                1,
-                target_key,
-                task_input.input_version,
-                payload,
-            )
-        else:
-            prior_key = f"task.input:{task_input.task_id}:{task_input.input_version - 1}"
-            raw_result = await self._client.eval(
-                SAVE_TASK_INPUT_LUA,
-                2,
-                target_key,
-                prior_key,
-                task_input.input_version,
-                payload,
-            )
+        try:
+            if task_input.input_version == 1:
+                raw_result = await self._client.eval(
+                    SAVE_TASK_INPUT_LUA,
+                    1,
+                    target_key,
+                    task_input.input_version,
+                    payload,
+                )
+            else:
+                prior_key = f"task.input:{task_input.task_id}:{task_input.input_version - 1}"
+                raw_result = await self._client.eval(
+                    SAVE_TASK_INPUT_LUA,
+                    2,
+                    target_key,
+                    prior_key,
+                    task_input.input_version,
+                    payload,
+                )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during save_task_input"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -1858,23 +2556,28 @@ class RedisGateway:
         payload = artifact.to_json()
         index_member = f"{artifact.artifact_id}:{artifact.artifact_version}"
 
-        raw_result = await self._client.eval(
-            SAVE_STAGE_ARTIFACT_LUA,
-            5,
-            target_key,
-            index_key,
-            claim_key,
-            fence_key,
-            prior_key,
-            artifact.artifact_version,
-            payload,
-            index_member,
-            clean_task_id,
-            clean_assignment_id,
-            clean_principal_id,
-            str(expected_fencing_epoch),
-            artifact.artifact_type,
-        )
+        try:
+            raw_result = await self._client.eval(
+                SAVE_STAGE_ARTIFACT_LUA,
+                5,
+                target_key,
+                index_key,
+                claim_key,
+                fence_key,
+                prior_key,
+                artifact.artifact_version,
+                payload,
+                index_member,
+                clean_task_id,
+                clean_assignment_id,
+                clean_principal_id,
+                str(expected_fencing_epoch),
+                artifact.artifact_type,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during save_stage_artifact"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -1939,29 +2642,34 @@ class RedisGateway:
         )
         latest_key = f"task.continuation_latest:{continuation.parent_task_id}"
         payload = continuation.to_json()
-        if continuation.continuation_version == 1:
-            raw_result = await self._client.eval(
-                SAVE_CONTINUATION_LUA,
-                2,
-                target_key,
-                latest_key,
-                continuation.continuation_version,
-                payload,
-            )
-        else:
-            prior_key = (
-                f"task.continuation:{continuation.parent_task_id}:"
-                f"{continuation.continuation_version - 1}"
-            )
-            raw_result = await self._client.eval(
-                SAVE_CONTINUATION_LUA,
-                3,
-                target_key,
-                latest_key,
-                prior_key,
-                continuation.continuation_version,
-                payload,
-            )
+        try:
+            if continuation.continuation_version == 1:
+                raw_result = await self._client.eval(
+                    SAVE_CONTINUATION_LUA,
+                    2,
+                    target_key,
+                    latest_key,
+                    continuation.continuation_version,
+                    payload,
+                )
+            else:
+                prior_key = (
+                    f"task.continuation:{continuation.parent_task_id}:"
+                    f"{continuation.continuation_version - 1}"
+                )
+                raw_result = await self._client.eval(
+                    SAVE_CONTINUATION_LUA,
+                    3,
+                    target_key,
+                    latest_key,
+                    prior_key,
+                    continuation.continuation_version,
+                    payload,
+                )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during save_continuation"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -2010,12 +2718,17 @@ class RedisGateway:
     async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
         target_key = f"task.authority:{authority.root_task_id}"
         payload = authority.to_json()
-        raw_result = await self._client.eval(
-            SAVE_ROOT_AUTHORITY_LUA,
-            1,
-            target_key,
-            payload,
-        )
+        try:
+            raw_result = await self._client.eval(
+                SAVE_ROOT_AUTHORITY_LUA,
+                1,
+                target_key,
+                payload,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during save_root_authority"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -2051,12 +2764,17 @@ class RedisGateway:
     async def save_authority_grant(self, grant: DelegationGrant) -> None:
         target_key = f"task.authority_grant:{grant.root_task_id}:{grant.grant_id}"
         payload = grant.to_json()
-        raw_result = await self._client.eval(
-            SAVE_AUTHORITY_GRANT_LUA,
-            1,
-            target_key,
-            payload,
-        )
+        try:
+            raw_result = await self._client.eval(
+                SAVE_AUTHORITY_GRANT_LUA,
+                1,
+                target_key,
+                payload,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during save_authority_grant"
+            ) from exc
         result = (
             raw_result.decode("utf-8")
             if isinstance(raw_result, (bytes, bytearray))
@@ -2101,7 +2819,12 @@ class RedisGateway:
         if not clean_task_id:
             return None
         key = f"task.claim:{clean_task_id}"
-        raw = await self._client.get(key)
+        try:
+            raw = await self._client.get(key)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt ActiveClaim at key '{key}': {exc}"
+            ) from exc
         if raw is None:
             return None
         try:
@@ -2118,7 +2841,12 @@ class RedisGateway:
         clean_task_id = str(task_id).strip()
         if not clean_task_id:
             return 0
-        raw = await self._client.get(f"task.fence:{clean_task_id}")
+        try:
+            raw = await self._client.get(f"task.fence:{clean_task_id}")
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt fencing epoch at key 'task.fence:{clean_task_id}': {exc}"
+            ) from exc
         if raw is None:
             return 0
         try:
@@ -2174,23 +2902,28 @@ class RedisGateway:
             deadline_key,
         ]
 
-        raw_res = await self._client.eval(
-            CLAIM_TASK_LUA,
-            8,
-            *keys,
-            clean_task_id,
-            now_iso,
-            claim.runtime_principal_id,
-            claim.request_id,
-            working_status_json,
-            claim_payload,
-            grant_payload,
-            str(claim.fencing_epoch),
-            claim.assigned_capability,
-            claim.execution_kind,
-            "1" if is_root else "0",
-            str(expected_continuation_version),
-        )
+        try:
+            raw_res = await self._client.eval(
+                CLAIM_TASK_LUA,
+                8,
+                *keys,
+                clean_task_id,
+                now_iso,
+                claim.runtime_principal_id,
+                claim.request_id,
+                working_status_json,
+                claim_payload,
+                grant_payload,
+                str(claim.fencing_epoch),
+                claim.assigned_capability,
+                claim.execution_kind,
+                "1" if is_root else "0",
+                str(expected_continuation_version),
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during atomic_claim_task"
+            ) from exc
 
         if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
             raise RuntimeError(f"Unexpected Redis claim_task response: {raw_res}")
@@ -2265,10 +2998,27 @@ class RedisGateway:
         if code == "ALREADY_CLAIMED":
             raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim by another runtime")
 
+        if code == "EXECUTION_CLAIM_EXPIRED":
+            try:
+                await self.transition_expired_claim(clean_task_id, now_iso)
+            except (TaskNotClaimableError, CompletionConflictError):
+                pass
+            except CorruptAuthoritativeRecordError:
+                raise
+            raise TaskNotClaimableError(
+                f"Task '{clean_task_id}' execution claim has expired and transitioned to recovery_required"
+            )
+
         if code == "CHILD_CLAIM_DEADLINE_EXPIRED":
             deadline_str = raw_res[1] if len(raw_res) > 1 else ""
             if isinstance(deadline_str, bytes):
                 deadline_str = deadline_str.decode("utf-8")
+            try:
+                await self.materialize_claim_timeout(clean_task_id, now_iso)
+            except (TaskNotClaimableError, CompletionConflictError, ClaimTimeoutConflictError):
+                pass
+            except CorruptAuthoritativeRecordError:
+                raise
             raise ChildClaimDeadlineExpiredError(
                 f"Claim deadline for child task '{clean_task_id}' has expired ({deadline_str})"
             )
@@ -2313,22 +3063,34 @@ class RedisGateway:
         assignment_id: str,
         principal_id: str,
         acknowledged_at: str,
+        execution_expires_at: str | None = None,
     ) -> ActiveClaim:
         clean_task_id = str(task_id).strip()
         clean_assignment_id = str(assignment_id).strip()
         clean_principal_id = str(principal_id).strip()
         clean_time = normalize_canonical_utc_timestamp(acknowledged_at)
+        clean_exec_expires = (
+            normalize_canonical_utc_timestamp(execution_expires_at)
+            if execution_expires_at
+            else ""
+        )
 
         claim_key = f"task.claim:{clean_task_id}"
 
-        raw_res = await self._client.eval(
-            ACKNOWLEDGE_CLAIM_LUA,
-            1,
-            claim_key,
-            clean_assignment_id,
-            clean_principal_id,
-            clean_time,
-        )
+        try:
+            raw_res = await self._client.eval(
+                ACKNOWLEDGE_CLAIM_LUA,
+                1,
+                claim_key,
+                clean_assignment_id,
+                clean_principal_id,
+                clean_time,
+                clean_exec_expires,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during acknowledge_claim"
+            ) from exc
         if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
             raise RuntimeError(f"Unexpected Redis acknowledge_claim response: {raw_res}")
 
@@ -2365,13 +3127,18 @@ class RedisGateway:
         )
         claim_key = f"task.claim:{clean_task_id}"
         status_key = f"task.status:{clean_task_id}"
-        res = await self._client.eval(
-            EXPIRE_DELIVERY_LEASE_LUA,
-            2,
-            claim_key,
-            status_key,
-            now_iso,
-        )
+        try:
+            res = await self._client.eval(
+                EXPIRE_DELIVERY_LEASE_LUA,
+                2,
+                claim_key,
+                status_key,
+                now_iso,
+            )
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during expire_delivery_lease"
+            ) from exc
         if not isinstance(res, (list, tuple)) or len(res) == 0:
             if res == 1:
                 return True
@@ -2495,7 +3262,12 @@ class RedisGateway:
             wake_up_hint.to_json(),
         ]
 
-        raw_res = await self._client.eval(ACCEPT_DELEGATION_LUA, len(keys), *keys, *argv)
+        try:
+            raw_res = await self._client.eval(ACCEPT_DELEGATION_LUA, len(keys), *keys, *argv)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during accept_delegation_proposal"
+            ) from exc
         if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
             raise RuntimeError(f"Unexpected Redis accept_delegation_proposal response: {raw_res}")
 
@@ -2695,9 +3467,12 @@ class RedisGateway:
             hint_json = hint.to_json()
             marker_json = canonical_json_dumps({
                 "child_task_id": clean_task,
-                "completion_command_id": command.completion_command_id,
                 "completed_at": now_iso,
+                "completion_command_id": command.completion_command_id,
+                "continuation_version": 1,
                 "outcome_id": outcome.outcome_id,
+                "parent_task_id": clean_parent,
+                "status": outcome.terminal_status,
             })
             parent_status_json = canonical_json_dumps({
                 "status": "resumable",
@@ -2757,7 +3532,12 @@ class RedisGateway:
             parent_status_json,
         ]
 
-        raw_res = await self._client.eval(COMPLETE_TURN_LUA, len(keys), *keys, *argv)
+        try:
+            raw_res = await self._client.eval(COMPLETE_TURN_LUA, len(keys), *keys, *argv)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during complete_turn"
+            ) from exc
         if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
             raise RuntimeError(f"Unexpected Redis complete_turn response: {raw_res}")
 
@@ -2882,7 +3662,7 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.completion:{clean_task}:{clean_cmd}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt completion record at task.completion:{clean_task}:{clean_cmd}"
             ) from exc
@@ -2901,7 +3681,7 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.outcome:{clean_task}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt terminal outcome at task.outcome:{clean_task}"
             ) from exc
@@ -2920,7 +3700,7 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.result:{clean_task}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt canonical result at task.result:{clean_task}"
             ) from exc
@@ -2952,7 +3732,7 @@ class RedisGateway:
             raw = await self._client.get(
                 f"task.assignment_completion:{clean_task}:{clean_assign}"
             )
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt assignment completion at task.assignment_completion:{clean_task}:{clean_assign}"
             ) from exc
@@ -2992,6 +3772,478 @@ class RedisGateway:
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Failed to decode delegation proposal at key '{target_key}': {exc}"
+            ) from exc
+
+    async def materialize_claim_timeout(
+        self,
+        child_task_id: str,
+        now: str = "",
+    ) -> tuple[TerminalOutcome, bool]:
+        clean_child = str(child_task_id).strip()
+        if not clean_child:
+            raise ValueError("child_task_id must be a non-empty string")
+
+        child_lineage = await self.get_lineage(clean_child)
+        if child_lineage is None or not child_lineage.parent_task_id:
+            raise TaskNotClaimableError(f"Child task '{clean_child}' has no authoritative parent")
+        clean_parent = child_lineage.parent_task_id
+
+        deadline_key = f"task.claim_deadline:{clean_child}"
+        try:
+            deadline_raw = await self._client.get(deadline_key)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(f"Corrupt claim deadline at {deadline_key}: {exc}") from exc
+        if not deadline_raw:
+            raise TaskNotClaimableError(f"Child task '{clean_child}' has no claim deadline")
+        clean_deadline = str(deadline_raw).strip()
+
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+
+        outcome = build_claim_timed_out_terminal_outcome(
+            task_id=clean_child,
+            claim_deadline=clean_deadline,
+            completed_at=now_iso,
+        )
+        child_status_json = canonical_json_dumps({
+            "claim_deadline": clean_deadline,
+            "status": "claim_timed_out",
+            "task_id": clean_child,
+        })
+        parent_status_json = canonical_json_dumps({
+            "status": "resumable",
+            "task_id": clean_parent,
+            "updated_at": now_iso,
+        })
+        marker_json = canonical_json_dumps({
+            "child_task_id": clean_child,
+            "continuation_version": 1,
+            "outcome_id": outcome.outcome_id,
+            "parent_task_id": clean_parent,
+            "status": "claim_timed_out",
+        })
+        hint = WakeUpHint(
+            hint_id=f"hint-{uuid4()}",
+            capability="research",
+            created_at=now_iso,
+            execution_kind="resumed_continuation",
+            task_id=clean_parent,
+            expected_continuation_version=1,
+        )
+
+        keys = [
+            f"task.status:{clean_child}",
+            f"task.claim:{clean_child}",
+            f"task.claim_deadline:{clean_child}",
+            f"task.outcome:{clean_child}",
+            f"task.result:{clean_child}",
+            f"task.lineage:{clean_child}",
+            f"task.status:{clean_parent}",
+            f"task.children:{clean_parent}",
+            f"task.continuation:{clean_parent}:1",
+            f"task.continuation_latest:{clean_parent}",
+            f"task.child_completion:{clean_child}",
+            "agent.hints.research",
+        ]
+
+        argv = [
+            clean_child,
+            clean_parent,
+            now_iso,
+            outcome.to_json(),
+            child_status_json,
+            parent_status_json,
+            marker_json,
+            hint.to_json(),
+        ]
+
+        try:
+            raw_res = await self._client.eval(MATERIALIZE_CLAIM_TIMEOUT_LUA, len(keys), *keys, *argv)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during materialize_claim_timeout"
+            ) from exc
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis materialize_claim_timeout response: {raw_res}")
+
+        def _s(val: object) -> str:
+            return val if isinstance(val, str) else val.decode("utf-8")
+
+        code = _s(raw_res[0])
+        if code in ("OK", "IDEMPOTENT"):
+            outcome_raw = _s(raw_res[1])
+            return (TerminalOutcome.from_json(outcome_raw), code == "IDEMPOTENT")
+
+        if code in ("OUTCOME_CONFLICT", "RESULT_CONFLICT", "MARKER_CONFLICT", "INCOMPLETE_REPLAY_PROJECTION"):
+            raise ClaimTimeoutConflictError(
+                f"Conflicting terminal completion state on task '{clean_child}': {code}"
+            )
+
+        if code == "DEADLINE_NOT_EXPIRED":
+            deadline_val = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise ClaimDeadlineNotExpiredError(
+                f"Claim deadline for task '{clean_child}' has not expired: deadline={deadline_val}, now={now_iso}"
+            )
+
+        if code == "CHILD_NOT_PENDING":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise TaskNotClaimableError(
+                f"Child task '{clean_child}' is not in 'pending' status: got '{cur_s}'"
+            )
+
+        if code == "ACTIVE_CLAIM_EXISTS":
+            raise TaskAlreadyClaimedError(f"Active claim exists for child task '{clean_child}'")
+
+        if code == "PARENT_NOT_WAITING":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise TaskNotClaimableError(
+                f"Parent task '{clean_parent}' is not 'waiting_for_children': got '{cur_s}'"
+            )
+
+        if code in (
+            "CHILD_NOT_FOUND",
+            "PARENT_NOT_FOUND",
+            "CHILD_LINEAGE_NOT_FOUND",
+            "PARENT_CHILDREN_NOT_FOUND",
+            "MISSING_CLAIM_DEADLINE",
+        ):
+            raise TaskNotClaimableError(
+                f"Required record not found for timeout materialization on task '{clean_child}': {code}"
+            )
+
+        if code in (
+            "LINEAGE_CHILD_MISMATCH",
+            "LINEAGE_PARENT_MISMATCH",
+            "CHILD_NOT_MEMBER",
+            "MISSING_CONTINUATION_LATEST",
+            "CONTINUATION_LATEST_MISMATCH",
+            "MISSING_CONTINUATION",
+            "CONTINUATION_STAGE_MISMATCH",
+            "CONTINUATION_CHILD_MISMATCH",
+            "CONTINUATION_PARENT_MISMATCH",
+            "CONTINUATION_VERSION_MISMATCH",
+        ):
+            raise TaskNotClaimableError(
+                f"Structural validation failed during timeout materialization on task '{clean_child}': {code}"
+            )
+
+        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_")):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative record corruption detected on task '{clean_child}': {code}"
+            )
+
+        raise RuntimeError(f"Unexpected materialize_claim_timeout result code: {code}")
+
+    async def transition_expired_claim(
+        self,
+        task_id: str,
+        now: str = "",
+    ) -> tuple[ClaimExpiryRecord, bool]:
+        clean_task = str(task_id).strip()
+        if not clean_task:
+            raise ValueError("task_id must be a non-empty string")
+
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+
+        claim = await self.get_active_claim(clean_task)
+        if claim is None:
+            existing_expiry = await self.get_claim_expiry(clean_task)
+            cur_status = await self.get_status(clean_task, now=now_iso)
+            if existing_expiry is not None and cur_status == "recovery_required":
+                return (existing_expiry, True)
+            raise ClaimNotFoundError(f"Active claim for task '{clean_task}' not found")
+
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError(
+                f"Claim for task '{clean_task}' is not acknowledged: state='{claim.state}'"
+            )
+
+        if not claim.execution_expires_at:
+            raise TaskNotClaimableError(
+                f"Claim for task '{clean_task}' has no execution_expires_at recorded"
+            )
+
+        if now_iso <= claim.execution_expires_at:
+            raise TaskNotClaimableError(
+                f"Execution claim for task '{clean_task}' has not expired: expires_at={claim.execution_expires_at}, now={now_iso}"
+            )
+
+        expiry_record = ClaimExpiryRecord(
+            task_id=clean_task,
+            claim_id=claim.claim_id,
+            assignment_id=claim.assignment_id,
+            principal_id=claim.runtime_principal_id,
+            bound_agent_id=claim.bound_agent_id,
+            execution_kind=claim.execution_kind,
+            expired_fencing_epoch=claim.fencing_epoch,
+            acknowledged_at=claim.acknowledged_at or now_iso,
+            execution_expires_at=claim.execution_expires_at,
+            expired_at=now_iso,
+            prior_claimable_status=claim.prior_claimable_status,
+            continuation_version=claim.continuation_version,
+            reason_code="EXECUTION_CLAIM_EXPIRED",
+        )
+        recovery_status_json = canonical_json_dumps({
+            "status": "recovery_required",
+            "task_id": clean_task,
+            "updated_at": now_iso,
+        })
+
+        event_payload = canonical_json_dumps({
+            "agent_id": claim.bound_agent_id,
+            "state": "recovery_required",
+            "detail": "Execution claim expired and transitioned to recovery_required",
+            "task_id": clean_task,
+            "occurred_at": now_iso,
+        })
+
+        keys = [
+            f"task.status:{clean_task}",
+            f"task.claim:{clean_task}",
+            f"task.fence:{clean_task}",
+            f"task.claim_expiry:{clean_task}",
+            f"task.outcome:{clean_task}",
+            f"task.result:{clean_task}",
+            "agent.events",
+        ]
+        argv = [
+            clean_task,
+            now_iso,
+            expiry_record.to_json(),
+            recovery_status_json,
+            event_payload,
+        ]
+
+        try:
+            raw_res = await self._client.eval(TRANSITION_EXPIRED_CLAIM_LUA, len(keys), *keys, *argv)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during transition_expired_claim"
+            ) from exc
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis transition_expired_claim response: {raw_res}")
+
+        def _s(val: object) -> str:
+            return val if isinstance(val, str) else val.decode("utf-8")
+
+        code = _s(raw_res[0])
+        if code in ("OK", "IDEMPOTENT"):
+            rec_raw = _s(raw_res[1])
+            return (ClaimExpiryRecord.from_json(rec_raw), code == "IDEMPOTENT")
+
+        if code == "ALREADY_COMPLETED":
+            raise CompletionConflictError(
+                f"Task '{clean_task}' already reached canonical terminal completion"
+            )
+
+        if code == "NOT_WORKING":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise TaskNotClaimableError(
+                f"Task '{clean_task}' is not in 'working' status: got '{cur_s}'"
+            )
+
+        if code == "CLAIM_NOT_FOUND":
+            raise ClaimNotFoundError(f"Active claim for task '{clean_task}' not found")
+
+        if code == "CLAIM_NOT_ACKNOWLEDGED":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise TaskNotClaimableError(
+                f"Claim for task '{clean_task}' is not acknowledged: got '{cur_s}'"
+            )
+
+        if code == "MISSING_EXECUTION_EXPIRES_AT":
+            raise TaskNotClaimableError(f"Claim for task '{clean_task}' lacks execution_expires_at")
+
+        if code == "EXECUTION_NOT_EXPIRED":
+            exp_val = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise TaskNotClaimableError(
+                f"Execution claim for task '{clean_task}' has not expired: expires={exp_val}, now={now_iso}"
+            )
+
+        if code == "FENCE_MISMATCH":
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch during expiry transition for task '{clean_task}'"
+            )
+
+        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_")):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative record corruption detected on task '{clean_task}': {code}"
+            )
+
+        raise RuntimeError(f"Unexpected transition_expired_claim result code: {code}")
+
+    async def resolve_expired_claim(
+        self,
+        command: RecoveryDecisionCommand,
+        operator_principal_id: str,
+        now: str = "",
+    ) -> tuple[RecoveryDecisionRecord, bool]:
+        clean_task = str(command.task_id).strip()
+        clean_dec_id = str(command.recovery_decision_id).strip()
+        clean_operator = str(operator_principal_id).strip()
+        if not clean_task or not clean_dec_id or not clean_operator:
+            raise ValueError(
+                "task_id, recovery_decision_id, and operator_principal_id must be non-empty strings"
+            )
+
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+
+        fp = command.semantic_fingerprint()
+
+        expiry_rec = await self.get_claim_expiry(clean_task)
+        if expiry_rec is None:
+            raise RecoveryPreconditionFailedError(
+                f"ClaimExpiryRecord for task '{clean_task}' not found"
+            )
+
+        restored_status = expiry_rec.prior_claimable_status
+        decision_rec = RecoveryDecisionRecord(
+            recovery_decision_id=clean_dec_id,
+            task_id=clean_task,
+            expired_claim_id=command.expired_claim_id,
+            expired_assignment_id=command.expired_assignment_id,
+            expired_fencing_epoch=command.expired_fencing_epoch,
+            disposition=command.disposition,
+            semantic_fingerprint=fp,
+            prior_status="recovery_required",
+            restored_status=restored_status,
+            operator_principal_id=clean_operator,
+            resolved_at=now_iso,
+        )
+
+        restored_status_json = canonical_json_dumps({
+            "status": restored_status,
+            "task_id": clean_task,
+            "updated_at": now_iso,
+        })
+
+        keys = [
+            f"task.status:{clean_task}",
+            f"task.claim:{clean_task}",
+            f"task.fence:{clean_task}",
+            f"task.claim_expiry:{clean_task}",
+            f"task.recovery_decision:{clean_task}:{clean_dec_id}",
+            f"task.outcome:{clean_task}",
+        ]
+        argv = [
+            clean_task,
+            clean_dec_id,
+            command.expired_claim_id,
+            command.expired_assignment_id,
+            str(command.expired_fencing_epoch),
+            command.disposition,
+            decision_rec.to_json(),
+            fp,
+            restored_status_json,
+        ]
+
+        try:
+            raw_res = await self._client.eval(RESOLVE_EXPIRED_CLAIM_LUA, len(keys), *keys, *argv)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during resolve_expired_claim"
+            ) from exc
+        if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
+            raise RuntimeError(f"Unexpected Redis resolve_expired_claim response: {raw_res}")
+
+        def _s(val: object) -> str:
+            return val if isinstance(val, str) else val.decode("utf-8")
+
+        code = _s(raw_res[0])
+        if code in ("OK", "IDEMPOTENT"):
+            rec_raw = _s(raw_res[1])
+            return (RecoveryDecisionRecord.from_json(rec_raw), code == "IDEMPOTENT")
+
+        if code == "DECISION_CONFLICT":
+            raise RecoveryConflictError(
+                f"Recovery decision '{clean_dec_id}' on task '{clean_task}' conflicts with existing decision payload"
+            )
+
+        if code == "ALREADY_COMPLETED":
+            raise CompletionConflictError(
+                f"Task '{clean_task}' already reached canonical terminal completion"
+            )
+
+        if code == "NOT_RECOVERY_REQUIRED":
+            cur_s = _s(raw_res[1]) if len(raw_res) > 1 else "unknown"
+            raise RecoveryPreconditionFailedError(
+                f"Task '{clean_task}' is not in 'recovery_required' status: got '{cur_s}'"
+            )
+
+        if code == "ACTIVE_CLAIM_EXISTS":
+            raise RecoveryPreconditionFailedError(
+                f"Active claim unexpectedly present on task '{clean_task}'"
+            )
+
+        if code in ("EXPIRY_RECORD_NOT_FOUND", "EXPIRY_RECORD_MISMATCH"):
+            raise RecoveryPreconditionFailedError(
+                f"ClaimExpiryRecord validation failed for task '{clean_task}': {code}"
+            )
+
+        if code == "UNSUPPORTED_DISPOSITION":
+            disp = _s(raw_res[1]) if len(raw_res) > 1 else command.disposition
+            raise RecoveryPreconditionFailedError(f"Unsupported recovery disposition: '{disp}'")
+
+        if code == "FENCE_MISMATCH":
+            raise RecoveryPreconditionFailedError(
+                f"Fencing epoch mismatch during recovery resolution for task '{clean_task}'"
+            )
+
+        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_")):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative record corruption detected on task '{clean_task}': {code}"
+            )
+
+        raise RuntimeError(f"Unexpected resolve_expired_claim result code: {code}")
+
+    async def get_claim_expiry(self, task_id: str) -> ClaimExpiryRecord | None:
+        clean_task = str(task_id).strip()
+        if not clean_task:
+            return None
+        target_key = f"task.claim_expiry:{clean_task}"
+        try:
+            raw = await self._client.get(target_key)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(f"Corrupt record at {target_key}") from exc
+        if raw is None:
+            return None
+        try:
+            return ClaimExpiryRecord.from_json(raw)
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Failed to decode ClaimExpiryRecord at {target_key}"
+            ) from exc
+
+    async def get_recovery_decision(
+        self, task_id: str, recovery_decision_id: str
+    ) -> RecoveryDecisionRecord | None:
+        clean_task = str(task_id).strip()
+        clean_dec = str(recovery_decision_id).strip()
+        if not clean_task or not clean_dec:
+            return None
+        target_key = f"task.recovery_decision:{clean_task}:{clean_dec}"
+        try:
+            raw = await self._client.get(target_key)
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(f"Corrupt record at {target_key}") from exc
+        if raw is None:
+            return None
+        try:
+            return RecoveryDecisionRecord.from_json(raw)
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Failed to decode RecoveryDecisionRecord at {target_key}"
             ) from exc
 
     async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
@@ -3072,7 +4324,7 @@ class RedisGateway:
             raise ValueError(f"Unknown capability: {capability}")
         await self.dispatch(task, queue_name)
 
-    async def get_result(self, task_id: str) -> dict[str, Any] | None:
+    async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None:
         """Read task completion state with the canonical outcome as authority.
 
         Governed by Issue #222:
@@ -3094,7 +4346,7 @@ class RedisGateway:
 
         try:
             raw_outcome = await self._client.get(f"task.outcome:{clean_task_id}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt terminal outcome at task.outcome:{clean_task_id}"
             ) from exc
@@ -3120,7 +4372,7 @@ class RedisGateway:
                 return result.to_dict()
             try:
                 unexpected = await self._client.get(f"task.result:{clean_task_id}")
-            except redis.exceptions.ResponseError as exc:
+            except ResponseError as exc:
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt canonical result at task.result:{clean_task_id}"
                 ) from exc
@@ -3130,13 +4382,13 @@ class RedisGateway:
                 )
             return {
                 "task_id": clean_task_id,
-                "status": "failed",
+                "status": outcome.terminal_status,
                 "output": None,
             }
 
         try:
             raw_result = await self._client.get(f"task.result:{clean_task_id}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt legacy result at task.result:{clean_task_id}"
             ) from exc
@@ -3160,7 +4412,7 @@ class RedisGateway:
 
         try:
             raw_status = await self._client.get(f"task.status:{clean_task_id}")
-        except redis.exceptions.ResponseError as exc:
+        except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt task status at task.status:{clean_task_id}"
             ) from exc
@@ -3175,9 +4427,69 @@ class RedisGateway:
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt task status at task.status:{clean_task_id}"
                 )
+            cur_s = status_data.get("status", "pending")
+
+            # Targeted task-specific expiry evaluation for pending/working tasks
+            now_iso = (
+                normalize_canonical_utc_timestamp(now)
+                if (now and str(now).strip())
+                else normalize_canonical_utc_timestamp(datetime.now(UTC))
+            )
+            if cur_s == "pending":
+                try:
+                    raw_deadline = await self._client.get(f"task.claim_deadline:{clean_task_id}")
+                except ResponseError as exc:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt claim deadline record at task.claim_deadline:{clean_task_id}: {exc}"
+                    ) from exc
+                if raw_deadline is not None:
+                    deadline_str = raw_deadline if isinstance(raw_deadline, str) else raw_deadline.decode("utf-8")
+                    if deadline_str and now_iso > deadline_str:
+                        try:
+                            await self.materialize_claim_timeout(clean_task_id, now_iso)
+                            return {
+                                "task_id": clean_task_id,
+                                "status": "claim_timed_out",
+                                "output": None,
+                            }
+                        except (TaskNotClaimableError, CompletionConflictError, ClaimTimeoutConflictError):
+                            pass
+                        except CorruptAuthoritativeRecordError:
+                            raise
+            elif cur_s == "working":
+                try:
+                    raw_claim = await self._client.get(f"task.claim:{clean_task_id}")
+                except ResponseError as exc:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"
+                    ) from exc
+                if raw_claim is not None:
+                    try:
+                        claim_obj = ActiveClaim.from_json(raw_claim)
+                    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                        raise CorruptAuthoritativeRecordError(
+                            f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"
+                        ) from exc
+                    if (
+                        claim_obj.state == "acknowledged"
+                        and claim_obj.execution_expires_at
+                        and now_iso > claim_obj.execution_expires_at
+                    ):
+                        try:
+                            await self.transition_expired_claim(clean_task_id, now_iso)
+                            return {
+                                "task_id": clean_task_id,
+                                "status": "recovery_required",
+                                "output": None,
+                            }
+                        except (TaskNotClaimableError, CompletionConflictError):
+                            pass
+                        except CorruptAuthoritativeRecordError:
+                            raise
+
             return {
                 "task_id": clean_task_id,
-                "status": status_data.get("status", "pending"),
+                "status": cur_s,
                 "output": None,
             }
 
@@ -3323,6 +4635,12 @@ class RedisGateway:
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     is_malformed = True
 
+            obs_turn_id = (parsed_telem.turn_id if parsed_telem and parsed_telem.turn_id else (parsed_trans.turn_id if parsed_trans and parsed_trans.turn_id else fields.get("turn_id"))) or None
+            obs_assignment_id = (parsed_telem.assignment_id if parsed_telem and parsed_telem.assignment_id else (parsed_trans.assignment_id if parsed_trans and parsed_trans.assignment_id else fields.get("assignment_id"))) or None
+            obs_execution_kind = (parsed_telem.execution_kind if parsed_telem and parsed_telem.execution_kind else (parsed_trans.execution_kind if parsed_trans and parsed_trans.execution_kind else fields.get("execution_kind"))) or None
+            raw_cver = (parsed_telem.continuation_version if parsed_telem and parsed_telem.continuation_version is not None else (parsed_trans.continuation_version if parsed_trans and parsed_trans.continuation_version is not None else fields.get("continuation_version")))
+            obs_continuation_version = int(raw_cver) if (raw_cver is not None and str(raw_cver).strip().isdigit()) else None
+
             observations.append(
                 TaskEventObservation(
                     event_id=event_id,
@@ -3335,6 +4653,10 @@ class RedisGateway:
                     is_terminal_lifecycle=is_terminal_lifecycle,
                     is_terminal_error=is_terminal_error,
                     is_malformed=is_malformed,
+                    turn_id=obs_turn_id,
+                    assignment_id=obs_assignment_id,
+                    execution_kind=obs_execution_kind,
+                    continuation_version=obs_continuation_version,
                 )
             )
 

@@ -134,7 +134,7 @@ class FakeTaskQueue(AuthoritativeTaskStore):
     async def update_status(self, task_id: str, status: str) -> None:
         self.statuses[task_id.strip()] = status.strip()
 
-    async def get_status(self, task_id: str) -> str | None:
+    async def get_status(self, task_id: str, now: str = "") -> str | None:
         return self.statuses.get(task_id.strip())
 
     async def save_task_input(self, task_input: TaskInput) -> None:
@@ -269,6 +269,7 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         assignment_id: str,
         principal_id: str,
         acknowledged_at: str,
+        execution_expires_at: str | None = None,
     ) -> ActiveClaim:
         clean_task_id = task_id.strip()
         claim = self.claims.get(clean_task_id)
@@ -285,6 +286,8 @@ class FakeTaskQueue(AuthoritativeTaskStore):
         ack_dict = claim.to_dict()
         ack_dict["state"] = "acknowledged"
         ack_dict["acknowledged_at"] = clean_time
+        if execution_expires_at is not None:
+            ack_dict["execution_expires_at"] = normalize_canonical_utc_timestamp(execution_expires_at)
         updated = ActiveClaim.from_dict(ack_dict)
         self.claims[clean_task_id] = updated
         return updated
@@ -307,6 +310,21 @@ class FakeTaskQueue(AuthoritativeTaskStore):
 
     async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
         self.hints.append((hint, target))
+
+    async def materialize_claim_timeout(self, child_task_id: str, now: str) -> Any:
+        raise NotImplementedError
+
+    async def transition_expired_claim(self, task_id: str, now: str) -> Any:
+        raise NotImplementedError
+
+    async def resolve_expired_claim(self, command: Any, operator_principal_id: str, now: str) -> Any:
+        raise NotImplementedError
+
+    async def get_claim_expiry(self, task_id: str) -> Any:
+        return None
+
+    async def get_recovery_decision(self, task_id: str, recovery_decision_id: str) -> Any:
+        return None
 
     async def enqueue(
         self,
@@ -490,7 +508,7 @@ class FakeResultReader:
         self.results = results or {}
         self.pending = pending or set()
 
-    async def get_result(self, task_id: str) -> dict[str, Any] | None:
+    async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None:
         if task_id in self.results:
             return self.results[task_id]
         if task_id in self.pending:

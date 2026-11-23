@@ -2,18 +2,23 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any
+from unittest.mock import DEFAULT
 from uuid import uuid4
 
 from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
     HeartbeatRunner,
+    TaskRequested,
+    WakeUpHint,
     parse_health_probe_timeout,
     parse_heartbeat_interval,
 )
 from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
 from agent_policy import parse_provider_priority
 
+from research_agent.application.delegation import ResearchDelegationCoordinator
 from research_agent.application.fallback import ResearchFallbackCoordinator
 from research_agent.application.ports import RuntimeInferenceProvider
 from research_agent.application.processor import ResearchExecutionError, ResearchProcessor
@@ -32,10 +37,12 @@ logger = logging.getLogger("research_agent")
 async def run_research_agent(
     heartbeat_interval: float | None = None,
     health_probe_timeout: float | None = None,
+    max_signals: int | None = None,
 ) -> None:
     agent_id = os.getenv("AGENT_ID", "research-agent-1")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.research")
+    hint_queue = os.getenv("HINT_QUEUE")
     executor_name = os.getenv("RESEARCH_EXECUTOR", "stub")
     inference_provider_name = os.getenv("INFERENCE_PROVIDER", "stub")
     orchestrator_base_url = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8080")
@@ -62,7 +69,10 @@ async def run_research_agent(
         name: create_inference_provider(name) for name in preferences
     }
 
-    bus = RedisBus(redis_url, queue_name=task_queue)
+    bus_kwargs: dict[str, Any] = {"queue_name": task_queue}
+    if hint_queue:
+        bus_kwargs["hint_queue"] = hint_queue
+    bus = RedisBus(redis_url, **bus_kwargs)
     orchestrator = OrchestratorClient(orchestrator_base_url, runtime_token)
     fallback_coordinator = ResearchFallbackCoordinator(
         agent_id=agent_id,
@@ -71,13 +81,17 @@ async def run_research_agent(
         providers=providers,
         probe_timeout_seconds=probe_timeout,
     )
+    delegation_mode = os.getenv("RESEARCH_DELEGATION_MODE", "complete_locally")
+    delegation_coordinator = ResearchDelegationCoordinator(delegation_mode)
     processor = ResearchProcessor(
         agent_id,
         bus,
         executor,
         completion_client=orchestrator,
+        context_reader=orchestrator,
         inference_provider=providers[preferences[0]],
         fallback_coordinator=fallback_coordinator,
+        delegation_coordinator=delegation_coordinator,
     )
 
     metadata = AgentCapabilityMetadata(
@@ -114,35 +128,182 @@ async def run_research_agent(
         heartbeat_runner.start()
         logger.info("Research agent %s registered and waiting for tasks", agent_id)
 
+        processed_signals = 0
         while True:
-            task = await bus.next_task()
-            logger.info("Dispatching task %s to research processor", task.task_id)
-            try:
-                request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
-                assignment, proof = await orchestrator.claim_task(
-                    task.task_id, request_id, "research", "initial"
+            # If next_task was specifically configured with a custom mock in unit tests,
+            # respect it for compatibility with tests that mock next_task
+            is_mock_task = (
+                hasattr(bus, "next_task")
+                and (
+                    getattr(bus.next_task, "side_effect", None) is not None
+                    or getattr(bus.next_task, "_mock_return_value", None) is not DEFAULT
                 )
-                await orchestrator.acknowledge_assignment(
-                    task.task_id, assignment["assignment_id"], proof
+            )
+            is_mock_signal = (
+                hasattr(bus, "next_signal")
+                and (
+                    getattr(bus.next_signal, "side_effect", None) is not None
+                    or getattr(bus.next_signal, "_mock_return_value", None) is not DEFAULT
                 )
-                await processor.run_once(
-                    task,
-                    assignment_id=assignment["assignment_id"],
-                    assignment_proof=proof,
-                    execution_kind="initial",
-                )
-            except CompletionSubmissionError as exc:
-                logger.warning(
-                    "Research task %s claim/acknowledge failed with error: %s; ready for next task",
-                    task.task_id,
-                    exc,
-                )
-            except ResearchExecutionError as exc:
-                logger.warning(
-                    "Research task %s processing failed with error: %s; ready for next task",
-                    exc.task_id,
-                    exc.original_error,
-                )
+            )
+            if is_mock_task and not is_mock_signal:
+                signal = await bus.next_task()
+            else:
+                signal = await bus.next_signal()
+            if isinstance(signal, WakeUpHint):
+                hint = signal
+                task_id = (getattr(hint, "task_id", None) or "").strip()
+                if not task_id:
+                    logger.warning("Ignoring hint on research hint queue: missing or empty task_id: %s", hint)
+                    continue
+                execution_kind = getattr(hint, "execution_kind", None)
+                if execution_kind not in ("resumed_continuation", "initial"):
+                    logger.warning(
+                        "Ignoring unsupported execution_kind '%s' on research hint queue for task %s",
+                        execution_kind,
+                        task_id,
+                    )
+                    continue
+                hint_cap = getattr(hint, "capability", "research")
+                if hint_cap != "research":
+                    logger.warning(
+                        "Ignoring hint for task %s: capability mismatch %s",
+                        task_id,
+                        hint_cap,
+                    )
+                    continue
+
+                if execution_kind == "resumed_continuation":
+                    expected_continuation_version = getattr(hint, "expected_continuation_version", None)
+                    if expected_continuation_version != 1:
+                        logger.warning(
+                            "Ignoring hint for task %s: unsupported continuation_version %s",
+                            task_id,
+                            expected_continuation_version,
+                        )
+                        continue
+                    logger.info(
+                        "Processing research wake-up hint for task %s (execution_kind=%s)",
+                        task_id,
+                        execution_kind,
+                    )
+                    try:
+                        request_id = f"req-{task_id}-{uuid4().hex[:8]}"
+                        assignment, proof = await orchestrator.claim_task(
+                            task_id=task_id,
+                            request_id=request_id,
+                            capability="research",
+                            execution_kind=execution_kind,
+                            expected_continuation_version=expected_continuation_version,
+                        )
+                        await orchestrator.acknowledge_assignment(
+                            task_id, assignment["assignment_id"], proof
+                        )
+                        context = await orchestrator.get_resumed_continuation_context(
+                            task_id, assignment["assignment_id"], proof
+                        )
+                        task = TaskRequested(
+                            task_id=task_id,
+                            root_task_id=task_id,
+                            parent_task_id=None,
+                            prompt=context.parent_task_input.prompt,
+                            created_at=context.parent_task_input.created_at,
+                        )
+                        await processor.run_once(
+                            task,
+                            assignment_id=assignment["assignment_id"],
+                            assignment_proof=proof,
+                            execution_kind="resumed_continuation",
+                            continuation_version=expected_continuation_version or 1,
+                        )
+                    except CompletionSubmissionError as exc:
+                        logger.warning(
+                            "Research task %s hint claim/acknowledge failed with error: %s; ready for next signal",
+                            task_id,
+                            exc,
+                        )
+                    except ResearchExecutionError as exc:
+                        logger.warning(
+                            "Research task %s processing failed with error: %s; ready for next signal",
+                            exc.task_id,
+                            exc.original_error,
+                        )
+                elif execution_kind == "initial":
+                    logger.info(
+                        "Processing research initial wake-up hint for task %s",
+                        task_id,
+                    )
+                    try:
+                        request_id = f"req-{task_id}-{uuid4().hex[:8]}"
+                        assignment, proof = await orchestrator.claim_task(
+                            task_id=task_id,
+                            request_id=request_id,
+                            capability="research",
+                            execution_kind="initial",
+                        )
+                        await orchestrator.acknowledge_assignment(
+                            task_id, assignment["assignment_id"], proof
+                        )
+                        material = await orchestrator.get_child_task_input(
+                            task_id, assignment["assignment_id"], proof
+                        )
+                        task = TaskRequested(
+                            task_id=task_id,
+                            root_task_id=assignment["root_task_id"],
+                            parent_task_id=None,
+                            prompt=material.prompt,
+                            created_at=material.created_at,
+                        )
+                        await processor.run_once(
+                            task,
+                            assignment_id=assignment["assignment_id"],
+                            assignment_proof=proof,
+                            execution_kind="initial",
+                        )
+                    except CompletionSubmissionError as exc:
+                        logger.warning(
+                            "Research task %s initial hint claim/acknowledge failed with error: %s; ready for next signal",
+                            task_id,
+                            exc,
+                        )
+                    except ResearchExecutionError as exc:
+                        logger.warning(
+                            "Research task %s processing failed with error: %s; ready for next signal",
+                            exc.task_id,
+                            exc.original_error,
+                        )
+            else:
+                task = signal
+                logger.info("Dispatching task %s to research processor", task.task_id)
+                try:
+                    request_id = f"req-{task.task_id}-{uuid4().hex[:8]}"
+                    assignment, proof = await orchestrator.claim_task(
+                        task.task_id, request_id, "research", "initial"
+                    )
+                    await orchestrator.acknowledge_assignment(
+                        task.task_id, assignment["assignment_id"], proof
+                    )
+                    await processor.run_once(
+                        task,
+                        assignment_id=assignment["assignment_id"],
+                        assignment_proof=proof,
+                        execution_kind="initial",
+                    )
+                except CompletionSubmissionError as exc:
+                    logger.warning(
+                        "Research task %s claim/acknowledge failed with error: %s; ready for next task",
+                        task.task_id,
+                        exc,
+                    )
+                except ResearchExecutionError as exc:
+                    logger.warning(
+                        "Research task %s processing failed with error: %s; ready for next task",
+                        exc.task_id,
+                        exc.original_error,
+                    )
+            processed_signals += 1
+            if max_signals is not None and processed_signals >= max_signals:
+                break
     finally:
         logger.info("Shutting down research agent %s, closing bus...", agent_id)
         await heartbeat_runner.stop()

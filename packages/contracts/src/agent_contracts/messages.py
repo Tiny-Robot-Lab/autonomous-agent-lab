@@ -151,6 +151,10 @@ class FallbackTransition:
     target_provider: str
     reason: str
     attempt_index: int
+    turn_id: str | None = None
+    assignment_id: str | None = None
+    execution_kind: str | None = None
+    continuation_version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.failed_provider, str) or not self.failed_provider.strip():
@@ -175,7 +179,21 @@ class FallbackTransition:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data: dict[str, Any] = {
+            "failed_provider": self.failed_provider,
+            "target_provider": self.target_provider,
+            "reason": self.reason,
+            "attempt_index": self.attempt_index,
+        }
+        if self.turn_id is not None:
+            data["turn_id"] = self.turn_id
+        if self.assignment_id is not None:
+            data["assignment_id"] = self.assignment_id
+        if self.execution_kind is not None:
+            data["execution_kind"] = self.execution_kind
+        if self.continuation_version is not None:
+            data["continuation_version"] = self.continuation_version
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FallbackTransition":
@@ -205,6 +223,10 @@ class InferenceExecutionTelemetry:
     model_name: str | None = None
     failure_reason: str | None = None
     status_code: int | None = None
+    turn_id: str | None = None
+    assignment_id: str | None = None
+    execution_kind: str | None = None
+    continuation_version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_name, str) or not self.provider_name.strip():
@@ -402,6 +424,10 @@ class AgentEvent:
     inference_telemetry: InferenceExecutionTelemetry | None = None
     version: int = 1
     tool_execution_telemetry: ToolExecutionTelemetry | None = None
+    turn_id: str | None = None
+    assignment_id: str | None = None
+    execution_kind: str | None = None
+    continuation_version: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.fallback_transition, dict):
@@ -464,6 +490,10 @@ class AgentEvent:
         fallback_transition: FallbackTransition | None = None,
         inference_telemetry: InferenceExecutionTelemetry | None = None,
         tool_execution_telemetry: ToolExecutionTelemetry | None = None,
+        turn_id: str | None = None,
+        assignment_id: str | None = None,
+        execution_kind: str | None = None,
+        continuation_version: int | None = None,
     ) -> "AgentEvent":
         return cls(
             agent_id=agent_id,
@@ -475,6 +505,10 @@ class AgentEvent:
             fallback_transition=fallback_transition,
             inference_telemetry=inference_telemetry,
             tool_execution_telemetry=tool_execution_telemetry,
+            turn_id=turn_id,
+            assignment_id=assignment_id,
+            execution_kind=execution_kind,
+            continuation_version=continuation_version,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -485,12 +519,24 @@ class AgentEvent:
             data.pop("routing_decision", None)
         if self.fallback_transition is None:
             data.pop("fallback_transition", None)
+        else:
+            data["fallback_transition"] = self.fallback_transition.to_dict()
         if self.inference_telemetry is None:
             data.pop("inference_telemetry", None)
+        else:
+            data["inference_telemetry"] = self.inference_telemetry.to_dict()
         if self.tool_execution_telemetry is None:
             data.pop("tool_execution_telemetry", None)
         else:
             data["tool_execution_telemetry"] = self.tool_execution_telemetry.to_dict()
+        if self.turn_id is None:
+            data.pop("turn_id", None)
+        if self.assignment_id is None:
+            data.pop("assignment_id", None)
+        if self.execution_kind is None:
+            data.pop("execution_kind", None)
+        if self.continuation_version is None:
+            data.pop("continuation_version", None)
         return data
 
     def to_json(self) -> str:
@@ -511,6 +557,10 @@ class AgentEvent:
             "inference_telemetry",
             "version",
             "tool_execution_telemetry",
+            "turn_id",
+            "assignment_id",
+            "execution_kind",
+            "continuation_version",
         }
         unexpected_fields = data.keys() - allowed_fields
         if unexpected_fields:
@@ -526,6 +576,10 @@ class AgentEvent:
             inference_telemetry=data.get("inference_telemetry"),
             version=data.get("version", 1),
             tool_execution_telemetry=data.get("tool_execution_telemetry"),
+            turn_id=data.get("turn_id"),
+            assignment_id=data.get("assignment_id"),
+            execution_kind=data.get("execution_kind"),
+            continuation_version=data.get("continuation_version"),
         )
 
     @classmethod

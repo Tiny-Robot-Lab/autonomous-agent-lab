@@ -11,7 +11,9 @@ from agent_contracts import canonical_json_dumps
 TOKEN_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.token-key.v1"
 VERIFIER_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.verifier-key.v1"
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-RECOGNIZED_CAPABILITIES: frozenset[str] = frozenset({"general", "research", "analysis"})
+RECOGNIZED_CAPABILITIES: frozenset[str] = frozenset(
+    {"general", "research", "analysis", "recovery_operator"}
+)
 
 
 @dataclass(frozen=True)
@@ -70,18 +72,20 @@ def parse_master_secret(raw: str | bytes) -> bytes:
     """Parse and validate master key material, ensuring at least 32 bytes of secret material.
 
     Accepts base64-encoded strings (preferred) or raw strings/bytes of at least 32 bytes.
+    Never trims or normalizes surrounding whitespace.
     """
     if isinstance(raw, str):
-        cleaned = raw.strip()
-        if not cleaned:
+        if not raw or not raw.strip():
             raise ValueError("Secret pepper must be a non-empty string")
+        if raw != raw.strip():
+            raise ValueError("Secret pepper cannot contain leading or trailing whitespace")
         try:
-            decoded = base64.b64decode(cleaned.encode("ascii"), validate=True)
+            decoded = base64.b64decode(raw.encode("ascii"), validate=True)
             if len(decoded) >= 32:
                 return decoded
         except ValueError:
             pass
-        utf8_bytes = cleaned.encode("utf-8")
+        utf8_bytes = raw.encode("utf-8")
         if len(utf8_bytes) >= 32:
             return utf8_bytes
         raise ValueError("Secret pepper must provide at least 32 bytes of secret material")
@@ -174,6 +178,15 @@ def verify_assignment_proof(
     return hmac.compare_digest(computed_digest, clean_expected)
 
 
+ALLOWED_PRINCIPAL_CONFIG_KEYS = frozenset({
+    "principal_id",
+    "bound_agent_id",
+    "token_digest",
+    "authorized_capabilities",
+    "active",
+})
+
+
 def validate_principal_config_registry(
     principals: Any,
 ) -> dict[str, dict[str, Any]]:
@@ -182,17 +195,18 @@ def validate_principal_config_registry(
     Governed by ADR-0007 (Decision 7, 8) and Issue #220:
     - outer key is a nonempty principal ID;
     - embedded principal_id, if present, equals outer key;
-    - bound_agent_id is a nonempty string;
+    - bound_agent_id is an explicit nonempty string (no fallback to principal_id);
     - token_digest is a valid canonical 64-character lowercase hexadecimal digest;
     - no two principals share a token_digest;
     - no two active principals share a bound_agent_id unless explicitly permitted;
     - authorized_capabilities is a nonempty collection of recognized nonempty capability strings;
-    - active is a Boolean;
+    - active is an explicit Boolean;
+    - no unexpected or ambiguous configuration fields;
     - each entry can construct a valid RuntimePrincipal;
     - malformed or ambiguous configuration fails startup without leaking raw secrets or JSON.
     """
     if not isinstance(principals, (dict, Mapping)) or not principals:
-        raise ValueError("runtime_principals must contain at least one principal when task_delivery_mode is 'authenticated_claim'")
+        raise ValueError("runtime_principals must contain at least one principal")
 
     seen_digests: set[str] = set()
     seen_active_agents: set[str] = set()
@@ -204,8 +218,14 @@ def validate_principal_config_registry(
             raise ValueError("Invalid principal configuration: principal_id must be a non-empty string")
         clean_outer = outer_key.strip()
 
-        if not isinstance(cfg, dict):
+        if not isinstance(cfg, (dict, Mapping)):
             raise ValueError("Invalid principal configuration: principal entry must be an object")  # noqa: TRY004
+
+        unexpected = set(cfg.keys()) - ALLOWED_PRINCIPAL_CONFIG_KEYS
+        if unexpected:
+            raise ValueError(
+                f"Invalid principal configuration: unexpected field(s): {sorted(unexpected)}"
+            )
 
         embedded_id = cfg.get("principal_id")
         if embedded_id is not None and (
@@ -213,19 +233,27 @@ def validate_principal_config_registry(
         ):
             raise ValueError("Invalid principal configuration: embedded principal_id must match outer key")
 
-        bound_agent = cfg.get("bound_agent_id")
+        if "bound_agent_id" not in cfg:
+            raise ValueError("Invalid principal configuration: bound_agent_id must be a non-empty string")
+        bound_agent = cfg["bound_agent_id"]
         if not isinstance(bound_agent, str) or not bound_agent.strip():
             raise ValueError("Invalid principal configuration: bound_agent_id must be a non-empty string")
         clean_bound_agent = bound_agent.strip()
 
-        digest = cfg.get("token_digest")
+        if "token_digest" not in cfg:
+            raise ValueError(
+                "Invalid principal configuration: token_digest must be a 64-character lowercase hexadecimal string"
+            )
+        digest = cfg["token_digest"]
         if not isinstance(digest, str) or not HEX_64_PATTERN.match(digest):
             raise ValueError("Invalid principal configuration: token_digest must be a 64-character lowercase hexadecimal string")
         if digest in seen_digests:
             raise ValueError("Invalid principal configuration: duplicate token_digest")
         seen_digests.add(digest)
 
-        active = cfg.get("active", True)
+        if "active" not in cfg:
+            raise ValueError("Invalid principal configuration: active field must be explicitly configured")
+        active = cfg["active"]
         if type(active) is not bool:
             raise ValueError("Invalid principal configuration: active must be a boolean")
         if active:
@@ -234,7 +262,9 @@ def validate_principal_config_registry(
                 raise ValueError("Invalid principal configuration: duplicate bound_agent_id for active principal")
             seen_active_agents.add(clean_bound_agent)
 
-        caps = cfg.get("authorized_capabilities")
+        if "authorized_capabilities" not in cfg:
+            raise ValueError("Invalid principal configuration: authorized_capabilities must be a non-empty collection")
+        caps = cfg["authorized_capabilities"]
         if not isinstance(caps, (list, tuple, set, frozenset)) or not caps:
             raise ValueError("Invalid principal configuration: authorized_capabilities must be a non-empty collection")
         clean_caps: list[str] = []
@@ -262,6 +292,6 @@ def validate_principal_config_registry(
         }
 
     if not has_active:
-        raise ValueError("runtime_principals must contain at least one active principal when task_delivery_mode is 'authenticated_claim'")
+        raise ValueError("runtime_principals must contain at least one active principal")
 
     return validated

@@ -785,6 +785,65 @@ def test_active_claim_state_and_acknowledged_at_invariant() -> None:
     assert claim_resumable.prior_claimable_status == "resumable"
 
 
+def test_delegated_child_assignment_and_claim_carry_no_delegation_grant() -> None:
+    """Proves delegated-child assignments carry no delegation grant (ADR-0006 Items 8, 19; ADR-0007 Decision 8)."""
+    now = datetime.now(UTC).isoformat()
+    input_ref = TaskInputReference(
+        task_id="task-child-1",
+        input_version=1,
+    )
+
+    child_assignment = TaskAssignment(
+        assignment_id="assign-child-001",
+        claim_id="claim-child-001",
+        task_id="task-child-1",
+        root_task_id="task-root-1",
+        turn_id="turn-child-001",
+        runtime_principal_id="principal-analysis-1",
+        bound_agent_id="analysis-agent-1",
+        execution_kind="delegated_child",
+        assigned_capability="analysis",
+        fencing_epoch=1,
+        claimed_at=now,
+        delivery_expires_at=now,
+        task_input_reference=input_ref,
+        continuation_version=None,
+        delegation_grant_id=None,
+    )
+    assert child_assignment.execution_kind == "delegated_child"
+    assert child_assignment.delegation_grant_id is None
+
+    asgn_dict = child_assignment.to_dict()
+    assert asgn_dict["delegation_grant_id"] is None
+    round_trip_asgn = TaskAssignment.from_dict(asgn_dict)
+    assert round_trip_asgn.delegation_grant_id is None
+
+    child_claim = ActiveClaim(
+        task_id="task-child-1",
+        assignment_id="assign-child-001",
+        claim_id="claim-child-001",
+        root_task_id="task-root-1",
+        turn_id="turn-child-001",
+        runtime_principal_id="principal-analysis-1",
+        bound_agent_id="analysis-agent-1",
+        assigned_capability="analysis",
+        execution_kind="delegated_child",
+        fencing_epoch=1,
+        proof_digest="a" * 64,
+        request_id="req-child-1",
+        claimed_at=now,
+        delivery_expires_at=now,
+        delegation_grant_id=None,
+    )
+    assert child_claim.execution_kind == "delegated_child"
+    assert child_claim.delegation_grant_id is None
+
+    claim_dict = child_claim.to_dict()
+    assert claim_dict["delegation_grant_id"] is None
+    round_trip_claim = ActiveClaim.from_dict(claim_dict)
+    assert round_trip_claim.delegation_grant_id is None
+
+
 def test_stage_artifact_timestamp_normalization() -> None:
     artifact = StageArtifact(
         artifact_id="art-1",

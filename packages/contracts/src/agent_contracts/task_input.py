@@ -11,6 +11,7 @@ from .serialization import (
     freeze_value,
     to_plain_json_structure,
 )
+from .stage_artifact import StageArtifact
 
 
 @dataclass(frozen=True)
@@ -220,4 +221,89 @@ class TaskInput:
 
     @classmethod
     def from_json(cls, value: str) -> "TaskInput":
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class ChildTaskExecutionMaterial:
+    """Governed execution material for delegated child turns and assignment inputs.
+
+    Governed by ADR-0006, ADR-0007, and Issue #224:
+    - Bundles immutable TaskInput and referenced sealed StageArtifact records;
+    - Proxy properties preserve TaskInput attribute access for runtimes and tests.
+    """
+
+    task_input: TaskInput
+    artifacts: tuple[StageArtifact, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_input, TaskInput):
+            raise TypeError(f"task_input must be a TaskInput, got {type(self.task_input).__name__}")
+        if isinstance(self.artifacts, (list, tuple)):
+            clean_artifacts: list[StageArtifact] = []
+            for art in self.artifacts:
+                if isinstance(art, StageArtifact):
+                    clean_artifacts.append(art)
+                elif isinstance(art, dict):
+                    clean_artifacts.append(StageArtifact.from_dict(art))
+                else:
+                    raise TypeError(f"artifacts elements must be StageArtifact, got {type(art).__name__}")
+            object.__setattr__(self, "artifacts", tuple(clean_artifacts))
+        else:
+            raise TypeError(f"artifacts must be a tuple or list, got {type(self.artifacts).__name__}")
+
+    @property
+    def task_id(self) -> str:
+        return self.task_input.task_id
+
+    @property
+    def prompt(self) -> str:
+        return self.task_input.prompt
+
+    @property
+    def created_at(self) -> str:
+        return self.task_input.created_at
+
+    @property
+    def input_version(self) -> int:
+        return self.task_input.input_version
+
+    @property
+    def artifact_references(self) -> tuple[ArtifactReference, ...]:
+        return self.task_input.artifact_references
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return self.task_input.metadata
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_input": self.task_input.to_dict(),
+            "artifacts": [art.to_dict() for art in self.artifacts],
+        }
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ChildTaskExecutionMaterial":
+        if not isinstance(data, (dict, Mapping)):
+            raise TypeError(f"data must be a dict or Mapping, got {type(data).__name__}")
+        task_input_data = data.get("task_input")
+        if task_input_data is None:
+            raise ValueError("task_input is required")
+        if not isinstance(task_input_data, Mapping):
+            raise TypeError("task_input must be a dictionary")
+        task_input = TaskInput.from_dict(task_input_data)
+        raw_artifacts = data.get("artifacts", ())
+        if not isinstance(raw_artifacts, (list, tuple)):
+            raise TypeError("artifacts must be a list or tuple")
+        artifacts = tuple(
+            StageArtifact.from_dict(a) if isinstance(a, Mapping) else a
+            for a in raw_artifacts
+        )
+        return cls(task_input=task_input, artifacts=artifacts)
+
+    @classmethod
+    def from_json(cls, value: str) -> "ChildTaskExecutionMaterial":
         return cls.from_dict(json.loads(value))

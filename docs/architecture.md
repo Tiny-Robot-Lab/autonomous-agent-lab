@@ -313,13 +313,14 @@ sandboxing. Discovery remains process-local as described above.
 Issue #221 establishes the atomic Research-to-Analysis delegation acceptance boundary,
 governed by ADR 0006 and ADR 0007.
 
-* **API Endpoint**: `POST /api/tasks/{task_id}/delegations` exposes delegation acceptance
-  for active Research parent tasks.
-* **Authentication and Proof Boundary**: The endpoint requires Bearer token authentication
+* **API Endpoints**: `POST /api/tasks/{task_id}/artifacts` and `POST /api/tasks/{task_id}/delegations`
+  expose artifact staging and delegation acceptance for active Research parent tasks.
+* **Authentication and Proof Boundary**: Both endpoints require Bearer token authentication
   mapped to an active runtime principal authorized for capability `research`. The caller
   must supply the cryptographic assignment proof exclusively via the `X-Assignment-Proof`
   HTTP header. Supplying assignment proof in the JSON request body is strictly rejected
-  to prevent secret persistence and leakage.
+  (with `StageArtifactInput` enforcing `model_config = {"extra": "forbid"}`) to prevent
+  secret persistence and leakage.
 * **Analysis-Only Target Capability**: The acceptance boundary enforces that `target_capability`
   is strictly `"analysis"`. Arbitrary or general capability targets are rejected.
 * **Child Claim Deadline**: The child task claim window is governed by `CHILD_CLAIM_DEADLINE_SECONDS`
@@ -384,3 +385,151 @@ continuation), governed by ADR 0006 and ADR 0007 (Decision 11).
   stay observational, and `GET /api/tasks/{task_id}/result` is outcome-driven (completed
   outcomes surface the canonical result, failed outcomes never fabricate one, legacy
   pre-boundary records remain readable).
+
+## 18. Resumed Parent Continuation, Claim Expiry/Recovery, and Turn-Aware Telemetry (Issue #223)
+
+Issue #223 implements resumed-parent pull-claim, Research continuation, claim expiry/recovery
+handling, and turn-aware inference telemetry, governed by ADR 0005, ADR 0006, and ADR 0007
+(Decisions 10, 11, 12, and 13).
+
+* **Governed Continuation-Context Boundary**: `GET /api/tasks/{task_id}/continuation-context`
+  provides an authenticated, bounded projection of parent and child context for resumed parent turns.
+  The endpoint strictly validates that the caller holds the `research` capability, the bound agent
+  matches the active claim, the detached `X-Assignment-Proof` header cryptographically validates
+  against the active claim's proof digest, the active claim is in `state="acknowledged"` with
+  `execution_kind="resumed_continuation"` and `continuation_version=1`, and the current fencing epoch
+  matches the claim's epoch. The endpoint returns strictly the canonical `ResumedContinuationContext`:
+  parent `TaskInput` v1, `TaskContinuation` v1 (`stage="incorporate_analysis_child"`), sealed parent
+  `StageArtifact`, child `TerminalOutcome`, and the canonical `TaskResult` (only when the child task
+  completed successfully). `ResumedContinuationContext` enforces that the continuation contains at least
+  one artifact reference and that the sealed stage artifact unambiguously binds to an authoritative reference
+  matching producing task, artifact ID, and artifact version. `OrchestratorClient` implements `ContinuationContextReader` through this boundary.
+* **Production Resumed Research Path**: Research Agent processes wake-up hints from `agent.hints.research`
+  (and initial tasks from `agent.tasks.research`). Resumed continuation turns pull-claim with
+  `capability="research"`, `execution_kind="resumed_continuation"`, and `expected_continuation_version=1`,
+  acknowledge assignment delivery, load the governed continuation context, and invoke
+  `ResearchProcessor.run_once`. If the child task succeeded, the agent synthesizes parent evidence and
+  child findings; if the child task failed or timed out (`claim_timed_out`), the agent produces degraded
+  synthesis explicitly noting the child failure; if primary research evidence is missing or corrupt,
+  it fails closed and submits an allowlisted `EXECUTION_FAILED` completion. Resumed turns complete
+  fenced without worker instance affinity, and second-wave delegation is forbidden. The agent bus
+  applies bounded queue fairness by alternating popping precedence between `agent.hints.research` and
+  `agent.tasks.research`, preventing hint bursts from starving ordinary task dispatch.
+* **Execution Claim Expiry and Recovery Handling**:
+  - `EXECUTION_CLAIM_TIMEOUT_SECONDS` (bounded between 60.0 and 7200.0 seconds, default 900.0 seconds)
+    governs acknowledged execution claim leases, distinct from `CLAIM_DELIVERY_LEASE_SECONDS` (which
+    governs unacknowledged delivery leases).
+  - Exact expiry equality boundary: `now <= execution_expires_at` means the claim remains valid and
+    unexpired; expiry may only materialize when `now > execution_expires_at`. At exact equality, the
+    task does not enter `recovery_required` and claims are not rejected as expired.
+  - Unacknowledged delivery expiry allows immediate re-claim by falling back to prior claimable status;
+    acknowledged execution claim expiry requires operator intervention and transitions task status to
+    `recovery_required`, recording an immutable `ClaimExpiryRecord` at `task.claim_expiry:{task_id}`.
+  - Expiry observations published to the event stream follow the repository's bounded `agent.events`
+    convention, using approximate stream trimming with `MAXLEN ~ 500`.
+  - Mutation-on-read semantics: Reading task status (`get_status`) or task result (`get_result`) evaluates
+    expiry deterministically for that single task only. If a platform transition is already due
+    (`now > child_claim_deadline` for pending children or `now > execution_expires_at` for acknowledged claims),
+    the read atomically materializes the canonical transition (`claim_timed_out` or `recovery_required`).
+    This operation is strictly task-scoped (no full-database scans), leaks no proofs or credentials, propagates
+    data corruption safely as `CorruptAuthoritativeRecordError`, and is idempotent on repeated reads.
+  - Legacy missing-expiry behavior: An acknowledged legacy `ActiveClaim` without `execution_expires_at`
+    does not invent a deadline, does not derive expiry from current configuration, and does not expire
+    automatically; targeted expiry evaluation returns diagnostic `action="none"`, `status="working"`,
+    leaving authoritative state untouched.
+  - Fencing epoch remains strictly unchanged during acknowledged claim expiry and recovery resolution;
+    only a subsequent successful pull-claim creates the next fencing epoch.
+  - Privileged recovery resolution (`POST /api/tasks/{task_id}/resolve-expired-claim`) is restricted to
+    callers with the `recovery_operator` capability and currently supports `disposition="restore_claimable"`,
+    which safely restores the prior claimable status (`pending` or `resumable`) without incrementing the fence.
+  - Child claim timeout (`claim_timed_out` terminal outcome) is materialized atomically when a pending child's
+    `child_claim_deadline` passes without an active claim (`now > child_claim_deadline`). Before or at the deadline
+    (`now <= child_claim_deadline`), expiry evaluation returns `action="none", status="pending"` with zero mutations,
+    preserving child claimability and parent `waiting_for_children` status.
+  - Full claim-timeout replay consistency: An exact `claim_timed_out` replay succeeds only when the entire canonical
+    projection remains internally consistent (child status `claim_timed_out`, canonical `TerminalOutcome` matches,
+    no `TaskResult`, no active claim, child lineage and parent children membership valid, continuation latest == 1,
+    continuation v1 matches, projection marker binds exact child, parent, outcome, and continuation version, and parent
+    status is exactly `resumable`). Any missing or corrupted projection invariant fails closed as conflict or corruption
+    with zero writes and zero hints emitted.
+  - Targeted task-specific expiry evaluation is integrated directly into atomic claim attempts and task
+    result/status access, avoiding full-database scans while preventing untrusted callers from triggering
+    privileged recovery.
+* **Resumed Continuation Execution and Failure Classification**:
+  - Resumed continuation executions preserve meaningful failure classification: exhaustion of all providers
+    via `AllInferenceProvidersFailedError` maps to `PROVIDER_UNAVAILABLE`, while missing/corrupt sealed primary
+    evidence, unsupported continuation contexts, or internal errors map to `EXECUTION_FAILED`.
+  - Raw exception details remain strictly local to the agent runtime and are never submitted to the orchestrator.
+* **Turn-Aware Telemetry**: `InferenceExecutionTelemetry` incorporates authoritative turn identity
+  fields (`assignment_id`, `turn_id`, `execution_kind`, `continuation_version`, and `attempt_index`),
+  preserving fine-grained operational observability across multi-turn task lifecycles. Task identity
+  (`task_id`) is carried by the enclosing event (`InferenceAttemptEvent`) or projected task history,
+  rather than being duplicated within the sanitized execution telemetry contract itself.
+
+---
+
+## 19. End-to-End Delegation, Child Execution, and Cross-Instance Resumption (Issue #224)
+
+Issue #224 serves as the final validation gate for multi-agent delegation, establishing end-to-end operational cohesion across the Research Agent, Analysis Agent, and authenticated Orchestrator boundaries, governed by ADR-0006, ADR-0007, and `docs/testing-strategy.md`.
+
+* **Delivery Transport, Assignment Lifecycle, and Delegation Decoupling**:
+  - `TASK_DELIVERY_MODE` controls task transport: `legacy_push` (default) vs `authenticated_claim`.
+  - Under `legacy_push`, full `TaskRequested` payloads are published directly to agent capability queues (`agent.tasks.general`, `agent.tasks.research`, `agent.tasks.analysis`).
+  - Under `authenticated_claim`, non-secret `WakeUpHint` notifications are published to hint queues (`agent.hints.research`, `agent.hints.analysis`), requiring agents to claim the turn and load authoritative inputs via governed endpoints.
+  - **Atomic Lifecycle Security Configuration**:
+    - `RUNTIME_CREDENTIAL_PEPPER`, `ASSIGNMENT_PROOF_PEPPER`, and `RUNTIME_PRINCIPALS_JSON` form a strictly atomic configuration group.
+    - Completely absent lifecycle configuration is supported under `TASK_DELIVERY_MODE="legacy_push"`, where the system operates in pure legacy task submission and queue delivery mode with assignment lifecycle and delegation surfaces disabled.
+    - Lifecycle environment variables must either all be omitted or all contain valid nonempty values; explicitly empty or whitespace-only values are invalid and fail startup.
+    - Supplying a partial or malformed lifecycle configuration in either delivery mode fails startup closed; the system never silently downgrades to unconfigured legacy mode.
+    - Every configured principal in `RUNTIME_PRINCIPALS_JSON` requires an explicit, non-empty `bound_agent_id`. Principal identity (`principal_id`) and agent identity (`bound_agent_id`) are not interchangeable, and no fallback binds `principal_id` as `bound_agent_id`.
+  - **Assignment Lifecycle Availability (`assignment_lifecycle_configured`)**: Root task claim (`POST /api/tasks/claim`), assignment delivery acknowledgement (`POST /api/assignments/{assignment_id}/acknowledge`), fenced turn completion (`POST /api/tasks/{task_id}/completion`), and trusted operator recovery/expiry evaluation (`POST /api/tasks/{task_id}/evaluate-expiry`, `POST /api/tasks/{task_id}/resolve-expired-claim`) are enabled whenever the atomic lifecycle security group is completely and validly configured. This allows existing runtimes (Worker, Research, Analysis) consuming root tasks from legacy pushed queues to use the authoritative assignment lifecycle and fenced completion boundaries.
+  - **Executable Delegation Enablement (`executable_delegation_enabled`)**: Multi-agent delegation surfaces—artifact staging (`POST /api/tasks/{task_id}/artifacts`), delegation proposal acceptance (`POST /api/tasks/{task_id}/delegations`), delegated-child task input reading (`GET /api/tasks/{task_id}/input`), and resumed continuation context reading (`GET /api/tasks/{task_id}/continuation-context`)—strictly require `TASK_DELIVERY_MODE="authenticated_claim"` in addition to valid runtime credentials and principals. In `legacy_push` mode, all delegation endpoints return HTTP 503 and perform zero mutation, ensuring that valid credentials alone do not accidentally enable child delegation.
+* **Research Turn Execution & Delegation Coordination**:
+  - `ResearchDelegationCoordinator` is an injectable production seam governing the initial turn branching decision (`complete_locally` vs `delegate_analysis`).
+  - The production runtime default is strictly `complete_locally`. No prompt heuristic, autonomous policy, or automatic delegation trigger is enabled in production.
+  - Issue #224 validation tests explicitly inject `delegate_analysis` to execute and validate the complete multi-agent lifecycle across production seams.
+  - Enabling authenticated claim deployment (`TASK_DELIVERY_MODE=authenticated_claim` with valid credentials) makes the end-to-end delegation and resumption lifecycle available to the runtime, but does not change the fail-closed `complete_locally` default.
+  - When `complete_locally` is selected (default), the Research Agent completes the turn directly through the universal fenced completion boundary without creating children.
+  - When `delegate_analysis` is selected, the Research Agent runs primary research execution, retains primary evidence, stages a sealed parent `StageArtifact` (`artifact_type="research_material"`, `sealed=True`), submits a single `DelegationProposal` to `analysis`, publishes an `agent.idle` event ("Yielded turn for delegation"), logs the yield, and immediately returns to its polling loop without completing the parent turn or waiting synchronously for child completion.
+  - Parent turn yield atomically retires the parent's active claim and transitions parent status to `waiting_for_children`.
+* **Parent Executor-Slot Invariant**:
+  - Upon yielding for delegation, the parent task holds no active claim in the authoritative store.
+  - The executing agent instance (`research-agent-1`) is immediately freed to claim and process other independent tasks. The executor slot is never held or blocked during child execution.
+* **Governed Child Task Input Read (`GET /api/tasks/{task_id}/input`)**:
+  - Analysis children load authoritative `TaskInput` exclusively through an authenticated Orchestrator boundary.
+  - Enforces Bearer authentication mapped to an active principal authorized for capability `analysis` and bound to the claiming agent identity.
+  - Strictly requires `X-Assignment-Proof` header verifying against the active claim's stored proof digest.
+  - Requires the active claim to be in `acknowledged` state with `execution_kind="delegated_child"` and valid fencing epoch.
+  - Returns immutable `TaskInput` v1 containing the prompt and created timestamp; plaintext proofs, tokens, and parent internals are never returned.
+* **Analysis Agent Execution & Queue Fairness**:
+  - The Analysis Agent bus consumes signals by alternating popping precedence between `agent.hints.analysis` and `agent.tasks.analysis`, preventing hint bursts from starving direct task queues.
+  - When a `WakeUpHint` is dequeued, the agent validates the hint (`task_id` present, `capability="analysis"`, `execution_kind="delegated_child"`), claims the child task turn, acknowledges assignment delivery, reads child `TaskInput` via the governed endpoint, executes `AnalysisProcessor`, and submits fenced turn completion via `POST /api/tasks/{child_id}/completion`.
+* **Three Validated Child Outcomes & Parent State Transitions**:
+  1. **Completed Child (`completed`)**:
+     - Child submits `completed_result`. The orchestrator atomically records the canonical result, marks child terminal status as `completed`, transitions the parent task to `resumable`, and emits a non-secret wake-up hint to `agent.hints.research`.
+  2. **Failed Child (`failed`)**:
+     - Child processing fails and submits an allowlisted `failure_code` (e.g., `EXECUTION_FAILED`). The orchestrator atomically records the failure outcome, transitions parent status to `resumable`, and emits a wake-up hint to `agent.hints.research`.
+  3. **Claim-Timed-Out Child (`claim_timed_out`)**:
+     - If the child is not claimed before `child_claim_deadline`, atomic expiry evaluation (via `EvaluateExpiry` use case or targeted read hook) transitions child status to `claim_timed_out`, transitions parent status to `resumable`, and emits a wake-up hint to `agent.hints.research`.
+* **Cross-Instance Research Resumption**:
+  - Resumption is completely decoupled from initial agent worker affinity. A different agent instance (`research-agent-2`) claims the resumed parent turn with `execution_kind="resumed_continuation"` and `expected_continuation_version=1`.
+  - Claiming the resumed turn increments the parent fencing epoch to 2, permanently retiring and invalidating all proofs and tokens from turn 1 (`research-agent-1`).
+  - `research-agent-2` acknowledges assignment delivery and loads governed `ResumedContinuationContext`.
+  - If the child task succeeded, the agent synthesizes a comprehensive final report combining primary sealed evidence and specialist analysis findings.
+  - If the child task failed or timed out, the agent synthesizes a degraded final report based on primary sealed research evidence, explicitly noting that specialist analysis was unavailable.
+  - The resumed turn completes fenced via `POST /api/tasks/{parent_id}/completion`, transitioning the parent task to `completed`.
+* **Single-Node Redis Atomicity & Persistence**:
+  - All multi-agent transitions (`claim_task`, `stage_artifact`, `accept_delegation_proposal`, `complete_turn`, `transition_expired_claim`) execute as atomic single-node Redis Lua scripts.
+  - Replays, concurrent claims, stale fences, and expired leases are resolved atomically without distributed locks or partial state writes.
+  - Durable state is persisted across container lifecycle restarts via append-only persistence (`--appendonly yes`).
+* **Artifact Staging Proof Normalization**:
+  - `POST /api/tasks/{task_id}/artifacts` strictly requires the assignment proof in the `X-Assignment-Proof` HTTP header.
+  - `StageArtifactInput` enforces `model_config = {"extra": "forbid"}` and strictly forbids `assignment_proof` within the JSON body, preventing secret smuggling and matching the security posture of `/delegations` and `/completion`.
+* **Bounded Delegation Authority & Non-Root Delegation Containment**:
+  - Under ADR-0006 (Items 8, 19) and ADR-0007 (Decision 8), delegation authority is bounded and non-transferable: delegation grants are issued exclusively to eligible initial Research root assignments (`lineage.is_root`).
+  - Delegated-child turn claims (`execution_kind="delegated_child"`) receive no delegation authority (`delegation_grant_id=None`).
+  - Non-root delegation proposals therefore fail closed at the authoritative missing-grant boundary (`TaskNotClaimableError: Active assignment has no delegation grant`, HTTP 409).
+  - Depth > 1 execution is structurally unreachable; zero grandchild, continuation, hint, fence, or wave mutation occurs.
+* **Multi-Turn Telemetry & Zero Secret Leakage**:
+  - Turn-aware telemetry records distinct turn IDs, assignment IDs, continuation versions, and execution kinds (`initial`, `delegated_child`, `resumed_continuation`) without collision across multiple turns. Attempt indices reset to 0 independently for each turn.
+  - Plaintext assignment proofs, Bearer tokens, and cryptographic peppers travel only in HTTP request headers; they are never persisted to Redis keys, hashes, lists, sets, or streams, and never serialized into event payloads or terminal outcomes.

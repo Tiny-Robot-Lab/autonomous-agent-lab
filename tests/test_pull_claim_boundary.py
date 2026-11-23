@@ -72,6 +72,7 @@ def test_settings() -> Settings:
     return Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=30.0,
         runtime_credential_pepper=PEPPER,
         assignment_proof_pepper=PROOF_PEPPER,
@@ -286,7 +287,6 @@ async def test_acknowledgement_and_artifact_staging_lifecycle(
         # 2. Attempt staging artifact before acknowledgement -> 409
         stage_payload = {
             "assignment_id": assignment_id,
-            "assignment_proof": proof,
             "artifact_id": "material-1",
             "artifact_type": "research_material",
             "content": {
@@ -298,7 +298,7 @@ async def test_acknowledgement_and_artifact_staging_lifecycle(
         res_early = await client.post(
             f"/api/tasks/{root.task_id}/artifacts",
             json=stage_payload,
-            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}"},
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}", "X-Assignment-Proof": proof},
         )
         assert res_early.status_code == 409
         assert "acknowledged" in res_early.json()["detail"].lower()
@@ -332,7 +332,7 @@ async def test_acknowledgement_and_artifact_staging_lifecycle(
         res_stage = await client.post(
             f"/api/tasks/{root.task_id}/artifacts",
             json=stage_payload,
-            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}"},
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}", "X-Assignment-Proof": proof},
         )
         assert res_stage.status_code == 200
         art_data = res_stage.json()["artifact"]
@@ -370,6 +370,7 @@ async def test_delivery_lease_expiry_restores_claimability_via_api() -> None:
     short_lease_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=0.1,
         runtime_credential_pepper=PEPPER,
         assignment_proof_pepper=PROOF_PEPPER,
@@ -494,6 +495,7 @@ async def test_expired_assignment_preserves_immutable_grants_and_advances_fencin
     short_lease_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         claim_delivery_lease_seconds=0.1,
         runtime_credential_pepper=PEPPER,
         assignment_proof_pepper=PROOF_PEPPER,
@@ -718,10 +720,14 @@ def test_settings_startup_validation_and_cryptographic_defaults(monkeypatch: pyt
     assert legacy_env_settings.assignment_proof_pepper == ""
     assert len(legacy_env_settings.runtime_principals) == 0
 
-    # 11. Valid RUNTIME_PRINCIPALS_JSON loads cleanly
+    # 11. Valid atomic lifecycle configuration loads cleanly from environment
+    monkeypatch.setenv("RUNTIME_CREDENTIAL_PEPPER", PEPPER)
+    monkeypatch.setenv("ASSIGNMENT_PROOF_PEPPER", PROOF_PEPPER)
     monkeypatch.setenv("RUNTIME_PRINCIPALS_JSON", json.dumps(PRINCIPALS_CONFIG))
     loaded_settings = Settings.from_env()
     assert len(loaded_settings.runtime_principals) == len(PRINCIPALS_CONFIG)
+    monkeypatch.delenv("RUNTIME_CREDENTIAL_PEPPER", raising=False)
+    monkeypatch.delenv("ASSIGNMENT_PROOF_PEPPER", raising=False)
     monkeypatch.delenv("RUNTIME_PRINCIPALS_JSON", raising=False)
 
 
