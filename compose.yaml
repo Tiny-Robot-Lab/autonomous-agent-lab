@@ -22,6 +22,13 @@ services:
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_ENV: ${APP_ENV:-development}
+      TASK_DELIVERY_MODE: ${TASK_DELIVERY_MODE:-legacy_push}
+      CLAIM_DELIVERY_LEASE_SECONDS: ${CLAIM_DELIVERY_LEASE_SECONDS:-30.0}
+      CHILD_CLAIM_DEADLINE_SECONDS: ${CHILD_CLAIM_DEADLINE_SECONDS:-120.0}
+      EXECUTION_CLAIM_TIMEOUT_SECONDS: ${EXECUTION_CLAIM_TIMEOUT_SECONDS:-900.0}
+      RUNTIME_CREDENTIAL_PEPPER:
+      ASSIGNMENT_PROOF_PEPPER:
+      RUNTIME_PRINCIPALS_JSON:
     depends_on:
       redis:
         condition: service_healthy
@@ -42,7 +49,7 @@ services:
       AGENT_ID: worker-1
       TASK_QUEUE: ${TASK_QUEUE:-agent.tasks.general}
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
-      RUNTIME_TOKEN: ${RUNTIME_TOKEN_WORKER:-}
+      RUNTIME_TOKEN: ${RUNTIME_TOKEN_WORKER:-${RUNTIME_TOKEN:-}}
       INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-stub}
       CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
       CLOUDFLARE_AI_API_TOKEN: ${CLOUDFLARE_AI_API_TOKEN:-}
@@ -67,8 +74,38 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       AGENT_ID: research-agent-1
       TASK_QUEUE: ${RESEARCH_TASK_QUEUE:-agent.tasks.research}
+      HINT_QUEUE: ${RESEARCH_HINT_QUEUE:-agent.hints.research}
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
-      RUNTIME_TOKEN: ${RUNTIME_TOKEN_RESEARCH:-}
+      RUNTIME_TOKEN: ${RUNTIME_TOKEN_RESEARCH_1:-${RUNTIME_TOKEN_RESEARCH:-}}
+      RESEARCH_EXECUTOR: ${RESEARCH_EXECUTOR:-stub}
+      INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-stub}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_AI_API_TOKEN: ${CLOUDFLARE_AI_API_TOKEN:-}
+      CLOUDFLARE_AI_MODEL: ${CLOUDFLARE_AI_MODEL:-@cf/mistralai/mistral-small-3.1-24b-instruct}
+      CLOUDFLARE_AI_MAX_TOKENS: ${CLOUDFLARE_AI_MAX_TOKENS:-1024}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      GEMINI_MAX_TOKENS: ${GEMINI_MAX_TOKENS:-1024}
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
+      HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [agent_net]
+    restart: unless-stopped
+
+  research-agent-2:
+    build:
+      context: .
+      dockerfile: services/research_agent/Dockerfile
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AGENT_ID: research-agent-2
+      TASK_QUEUE: ${RESEARCH_TASK_QUEUE:-agent.tasks.research}
+      HINT_QUEUE: ${RESEARCH_HINT_QUEUE:-agent.hints.research}
+      ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
+      RUNTIME_TOKEN: ${RUNTIME_TOKEN_RESEARCH_2:-}
       RESEARCH_EXECUTOR: ${RESEARCH_EXECUTOR:-stub}
       INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-stub}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
@@ -95,9 +132,10 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       AGENT_ID: analysis-agent-1
       TASK_QUEUE: ${ANALYSIS_TASK_QUEUE:-agent.tasks.analysis}
+      HINT_QUEUE: ${ANALYSIS_HINT_QUEUE:-agent.hints.analysis}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
-      RUNTIME_TOKEN: ${RUNTIME_TOKEN_ANALYSIS:-}
+      RUNTIME_TOKEN: ${RUNTIME_TOKEN_ANALYSIS_1:-${RUNTIME_TOKEN_ANALYSIS:-}}
     depends_on:
       redis:
         condition: service_healthy

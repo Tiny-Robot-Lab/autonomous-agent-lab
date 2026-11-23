@@ -1756,3 +1756,101 @@ class GetResumedContinuationContext:
             child_result=child_result,
             version=1,
         )
+
+
+class GetChildTaskInput:
+    """Authenticated task-input reader for delegated child turns.
+
+    Governed by ADR-0006, ADR-0007, and Issue #224:
+    - Dedicated authenticated boundary (GET /api/tasks/{task_id}/input);
+    - Validates caller principal has 'analysis' capability;
+    - Validates active claim exists for task_id and matches assignment_id;
+    - Validates claim.runtime_principal_id == principal.principal_id;
+    - Validates claim.bound_agent_id == principal.bound_agent_id;
+    - Validates claim.assigned_capability == 'analysis';
+    - Validates claim.state == 'acknowledged';
+    - Validates claim.execution_kind == 'delegated_child';
+    - Validates current fencing epoch matches claim.fencing_epoch;
+    - Cryptographically verifies X-Assignment-Proof via verify_assignment_proof;
+    - Retrieves child_task_input (v1);
+    - Returns TaskInput.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("GetChildTaskInput requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+    ) -> TaskInput:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("analysis"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'analysis'"
+            )
+
+        clean_task = str(task_id).strip()
+        clean_assignment = str(assignment_id).strip()
+        clean_proof = str(assignment_proof).strip()
+
+        if not clean_task:
+            raise ValueError("task_id must be a non-empty string")
+        if not clean_assignment:
+            raise ValueError("assignment_id must be a non-empty string")
+        if not clean_proof:
+            raise ValueError("assignment_proof must be a non-empty string")
+
+        claim = await self._task_store.get_active_claim(clean_task)
+        if claim is None or claim.assignment_id != clean_assignment:
+            raise ClaimNotFoundError(
+                f"Active claim for task '{clean_task}' and assignment '{clean_assignment}' not found"
+            )
+
+        if claim.runtime_principal_id != principal.principal_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assignment}' is not owned by principal '{principal.principal_id}'"
+            )
+        if claim.bound_agent_id != principal.bound_agent_id:
+            raise ClaimNotFoundError(
+                f"Assignment '{clean_assignment}' is bound to agent '{claim.bound_agent_id}', "
+                f"not '{principal.bound_agent_id}'"
+            )
+        if claim.assigned_capability != "analysis":
+            raise CapabilityMismatchError(
+                f"Claim assigned_capability '{claim.assigned_capability}' is not 'analysis'"
+            )
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Assignment must be acknowledged before reading task input")
+        if claim.execution_kind != "delegated_child":
+            raise TaskNotClaimableError(
+                f"Child task input is only available for 'delegated_child', got '{claim.execution_kind}'"
+            )
+
+        cur_epoch = await self._task_store.get_fencing_epoch(clean_task)
+        if claim.fencing_epoch != cur_epoch:
+            raise TaskAlreadyClaimedError(
+                f"Fencing epoch mismatch for assignment '{clean_assignment}': claim={claim.fencing_epoch}, current={cur_epoch}"
+            )
+
+        if not verify_assignment_proof(self._verifier_key, clean_proof, claim.proof_digest):
+            raise InvalidClaimProofError("Assignment proof verification failed")
+
+        task_input = await self._task_store.get_task_input(clean_task, 1)
+        if task_input is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative TaskInput v1 not found for child task '{clean_task}'"
+            )
+
+        return task_input

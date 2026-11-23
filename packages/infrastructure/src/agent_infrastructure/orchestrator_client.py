@@ -61,6 +61,7 @@ class OrchestratorClient:
         self._timeout = float(timeout_seconds)
         self._transport = transport
         self._cached_contexts: dict[str, ResumedContinuationContext] = {}
+        self._cached_inputs: dict[str, TaskInput] = {}
 
     def _headers(self, proof: str | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._token}"}
@@ -149,6 +150,104 @@ class OrchestratorClient:
             raise CompletionSubmissionError(task_id, response.status_code, "completion request rejected")
         return response.json()
 
+    async def stage_artifact(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        artifact_id: str,
+        artifact_type: str,
+        content: dict[str, Any],
+        artifact_version: int = 1,
+        payload_schema_version: int = 1,
+    ) -> dict[str, Any]:
+        """Stage a sealed parent artifact via POST /api/tasks/{task_id}/artifacts."""
+        clean_task = str(task_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        payload = {
+            "assignment_id": str(assignment_id).strip(),
+            "artifact_id": str(artifact_id).strip(),
+            "artifact_type": str(artifact_type).strip(),
+            "content": content,
+            "artifact_version": artifact_version,
+            "payload_schema_version": payload_schema_version,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+                response = await client.post(
+                    f"{self._base_url}/api/tasks/{clean_task}/artifacts",
+                    json=payload,
+                    headers=self._headers(clean_proof),
+                )
+        except httpx.HTTPError as exc:
+            raise CompletionSubmissionError(clean_task, None, "stage artifact transport failed") from exc
+        if response.status_code != 200:
+            raise CompletionSubmissionError(clean_task, response.status_code, "stage artifact request rejected")
+        return response.json()
+
+    async def propose_delegation(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        proposal_id: str,
+        child_intent: str,
+        artifact_reference: dict[str, Any],
+        target_capability: str = "analysis",
+        parent_input_version: int = 1,
+        control_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Propose delegation to Analysis via POST /api/tasks/{task_id}/delegations."""
+        clean_task = str(task_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        payload = {
+            "proposal_id": str(proposal_id).strip(),
+            "assignment_id": str(assignment_id).strip(),
+            "child_intent": str(child_intent).strip(),
+            "artifact_reference": artifact_reference,
+            "target_capability": target_capability,
+            "parent_input_version": parent_input_version,
+            "control_fields": control_fields or {},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+                response = await client.post(
+                    f"{self._base_url}/api/tasks/{clean_task}/delegations",
+                    json=payload,
+                    headers=self._headers(clean_proof),
+                )
+        except httpx.HTTPError as exc:
+            raise CompletionSubmissionError(clean_task, None, "propose delegation transport failed") from exc
+        if response.status_code != 200:
+            raise CompletionSubmissionError(clean_task, response.status_code, "propose delegation request rejected")
+        return response.json()
+
+    async def get_child_task_input(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+    ) -> TaskInput:
+        """Fetch authoritative child TaskInput via GET /api/tasks/{task_id}/input."""
+        clean_task = str(task_id).strip()
+        clean_assignment = str(assignment_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+                response = await client.get(
+                    f"{self._base_url}/api/tasks/{clean_task}/input",
+                    params={"assignment_id": clean_assignment},
+                    headers=self._headers(clean_proof),
+                )
+        except httpx.HTTPError as exc:
+            raise CompletionSubmissionError(clean_task, None, "child task input transport failed") from exc
+        if response.status_code != 200:
+            raise CompletionSubmissionError(clean_task, response.status_code, "child task input request rejected")
+        body = response.json()
+        task_input = TaskInput.from_dict(body["task_input"])
+        self._cached_inputs[clean_task] = task_input
+        return task_input
+
     async def get_resumed_continuation_context(
         self,
         task_id: str,
@@ -176,6 +275,10 @@ class OrchestratorClient:
 
     async def get_task_input(self, task_id: str, version: int = 1) -> TaskInput | None:
         clean_task = str(task_id).strip()
+        if clean_task in self._cached_inputs:
+            inp = self._cached_inputs[clean_task]
+            if inp.input_version == version:
+                return inp
         ctx = self._cached_contexts.get(clean_task)
         if ctx is not None and ctx.parent_task_input.input_version == version:
             return ctx.parent_task_input

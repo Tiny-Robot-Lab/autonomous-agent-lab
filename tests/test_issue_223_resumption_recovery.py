@@ -714,6 +714,7 @@ async def test_api_evaluate_expiry_and_resolve_expired_claim() -> None:
     test_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         runtime_credential_pepper="pepper" * 8,
         assignment_proof_pepper="proof" * 8,
         runtime_principals={
@@ -863,6 +864,7 @@ async def test_evaluate_expiry_child_deadline_parity_and_endpoints() -> None:
     test_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         runtime_credential_pepper="pepper" * 8,
         assignment_proof_pepper="proof" * 8,
         runtime_principals={
@@ -918,6 +920,7 @@ async def test_continuation_context_endpoint_and_use_case() -> None:
     test_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         runtime_credential_pepper="pepper" * 8,
         assignment_proof_pepper="proof" * 8,
         runtime_principals={
@@ -2179,6 +2182,7 @@ async def test_api_boundary_corrupt_authoritative_record_error_sanitization() ->
     test_settings = Settings(
         redis_url="redis://fake:6379/9",
         app_env="test",
+        task_delivery_mode="authenticated_claim",
         runtime_credential_pepper="pepper" * 8,
         assignment_proof_pepper="proof" * 8,
         runtime_principals={
