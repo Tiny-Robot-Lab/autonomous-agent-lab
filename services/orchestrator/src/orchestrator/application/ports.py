@@ -6,10 +6,13 @@ from agent_contracts import (
     AgentEvent,
     AssignmentCompletionRecord,
     AssignmentYieldRecord,
+    ClaimExpiryRecord,
     CompletionCommand,
     CompletionRecord,
     DelegationGrant,
     DelegationProposalRecord,
+    RecoveryDecisionCommand,
+    RecoveryDecisionRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     RoutingDecision,
@@ -60,6 +63,10 @@ class ChildClaimDeadlineExpiredError(TaskNotClaimableError):
     """Raised when an attempt is made to claim a child task after its claim deadline has passed."""
 
 
+class ClaimDeadlineNotExpiredError(TaskNotClaimableError):
+    """Raised when an attempt is made to materialize claim timeout before or at the claim deadline."""
+
+
 class DelegationConflictError(Exception):
     """Raised when a delegation proposal conflicts with existing authoritative state."""
 
@@ -91,6 +98,18 @@ class CompletionReplayAuthorizationError(Exception):
     Always surfaced to callers as one generic authorization failure that
     reveals no result, outcome, command, task-state, or existence information.
     """
+
+
+class ClaimTimeoutConflictError(Exception):
+    """Raised when materializing a claim timeout conflicts with existing terminal state."""
+
+
+class RecoveryConflictError(Exception):
+    """Raised when a recovery decision conflicts with an existing decision or semantic payload."""
+
+
+class RecoveryPreconditionFailedError(Exception):
+    """Raised when recovery preconditions (status, claim, fence, or expiry record) are not met."""
 
 
 @runtime_checkable
@@ -162,7 +181,7 @@ class AuthoritativeTaskStore(Protocol):
 
     async def update_status(self, task_id: str, status: str) -> None: ...
 
-    async def get_status(self, task_id: str) -> str | None: ...
+    async def get_status(self, task_id: str, now: str = "") -> str | None: ...
 
     async def save_task_input(self, task_input: TaskInput) -> None: ...
 
@@ -226,9 +245,55 @@ class AuthoritativeTaskStore(Protocol):
         assignment_id: str,
         principal_id: str,
         acknowledged_at: str,
+        execution_expires_at: str | None = None,
     ) -> ActiveClaim: ...
 
     async def expire_delivery_lease(self, task_id: str, now: str) -> bool: ...
+
+    async def materialize_claim_timeout(
+        self,
+        child_task_id: str,
+        now: str = "",
+    ) -> tuple[TerminalOutcome, bool]:
+        """Atomically materialize claim_timed_out terminal outcome for an unclaimed child.
+
+        Returns (outcome, is_replay).
+        """
+        ...
+
+    async def transition_expired_claim(
+        self,
+        task_id: str,
+        now: str = "",
+    ) -> tuple[ClaimExpiryRecord, bool]:
+        """Atomically detect an expired acknowledged execution claim and transition task to recovery_required.
+
+        Returns (claim_expiry_record, is_replay).
+        """
+        ...
+
+    async def resolve_expired_claim(
+        self,
+        command: RecoveryDecisionCommand,
+        operator_principal_id: str,
+        now: str = "",
+    ) -> tuple[RecoveryDecisionRecord, bool]:
+        """Atomically apply an operator recovery decision to clear recovery_required.
+
+        Returns (recovery_decision_record, is_replay).
+        """
+        ...
+
+    async def get_claim_expiry(
+        self,
+        task_id: str,
+    ) -> ClaimExpiryRecord | None: ...
+
+    async def get_recovery_decision(
+        self,
+        task_id: str,
+        recovery_decision_id: str,
+    ) -> RecoveryDecisionRecord | None: ...
 
     async def accept_delegation_proposal(
         self,
@@ -366,4 +431,4 @@ class RoutingAdvisor(Protocol):
 
 
 class ResultReader(Protocol):
-    async def get_result(self, task_id: str) -> dict[str, Any] | None: ...
+    async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None: ...

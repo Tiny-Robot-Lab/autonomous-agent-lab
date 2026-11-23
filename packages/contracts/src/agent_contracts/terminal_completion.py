@@ -137,7 +137,12 @@ ALLOWED_COMPLETION_EXECUTION_KINDS: frozenset[str] = frozenset({
 ALLOWED_COMPLETION_TERMINAL_STATUSES: frozenset[str] = frozenset({
     "completed",
     "failed",
+    "claim_timed_out",
 })
+
+CLAIM_TIMED_OUT_SAFE_SUMMARY: str = (
+    "Child task claim deadline expired before being claimed."
+)
 
 
 def classify_completion_failure(exc: BaseException) -> str:
@@ -506,6 +511,13 @@ class TerminalOutcome:
         if self.terminal_status == "completed":
             if self.failure_code is not None:
                 raise ValueError("failure_code must be absent for completed outcomes")
+        elif self.terminal_status == "claim_timed_out":
+            if self.failure_code is not None:
+                raise ValueError("failure_code must be absent for claim_timed_out outcomes")
+            if self.safe_summary != CLAIM_TIMED_OUT_SAFE_SUMMARY:
+                raise ValueError(
+                    f"safe_summary must be the fixed platform summary for claim_timed_out: '{CLAIM_TIMED_OUT_SAFE_SUMMARY}'"
+                )
         else:
             if self.failure_code is None:
                 raise ValueError("failure_code is required for failed outcomes")
@@ -969,4 +981,62 @@ def build_completion_audit(
         execution_kind=outcome.execution_kind,
         completed_at=outcome.completed_at,
         continuation_version=outcome.continuation_version,
+    )
+
+
+def compute_timeout_fingerprint(
+    task_id: str,
+    claim_deadline: str,
+) -> str:
+    """Compute the deterministic canonical semantic fingerprint for a claim_timed_out outcome."""
+    clean_task = str(task_id).strip()
+    if not clean_task:
+        raise ValueError("task_id must be a non-empty string")
+    normalized_deadline = normalize_canonical_utc_timestamp(claim_deadline)
+    payload = {
+        "claim_deadline": normalized_deadline,
+        "execution_kind": "delegated_child",
+        "status": "claim_timed_out",
+        "task_id": clean_task,
+    }
+    return hashlib.sha256(canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def build_claim_timed_out_terminal_outcome(
+    *,
+    task_id: str,
+    claim_deadline: str,
+    completed_at: str,
+    runtime_principal_id: str = "platform:orchestrator",
+    bound_agent_id: str = "platform:orchestrator",
+) -> TerminalOutcome:
+    """Construct the canonical TerminalOutcome for an unclaimed child timeout.
+
+    Governed by ADR-0007 (Decision 10) and Issue #223:
+    - Generated exclusively by the trusted Orchestrator timeout materialization boundary;
+    - terminal_status is 'claim_timed_out';
+    - failure_code is None;
+    - safe_summary is the fixed platform summary;
+    - outcome_id is derived deterministically from the semantic fingerprint;
+    - contains no fabricated TaskResult.
+    """
+    clean_task = str(task_id).strip()
+    if not clean_task:
+        raise ValueError("task_id must be a non-empty string")
+    fingerprint = compute_timeout_fingerprint(clean_task, claim_deadline)
+    outcome_id = derive_terminal_outcome_id(fingerprint)
+    return TerminalOutcome(
+        outcome_id=outcome_id,
+        task_id=clean_task,
+        assignment_id=f"timeout-unassigned-{clean_task}",
+        completion_command_id=f"timeout-{clean_task}",
+        semantic_fingerprint=fingerprint,
+        runtime_principal_id=str(runtime_principal_id).strip(),
+        bound_agent_id=str(bound_agent_id).strip(),
+        execution_kind="delegated_child",
+        terminal_status="claim_timed_out",
+        safe_summary=CLAIM_TIMED_OUT_SAFE_SUMMARY,
+        completed_at=normalize_canonical_utc_timestamp(completed_at),
+        continuation_version=None,
+        failure_code=None,
     )

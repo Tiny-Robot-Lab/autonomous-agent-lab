@@ -9,6 +9,7 @@ from agent_contracts import (
     AgentEvent,
     AgentHeartbeat,
     TaskRequested,
+    WakeUpHint,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,10 +43,35 @@ async def retry_with_backoff[T](
 
 
 class RedisBus:
-    def __init__(self, url: str, queue_name: str = "agent.tasks.general") -> None:
+    def __init__(
+        self,
+        url: str,
+        queue_name: str = "agent.tasks.general",
+        hint_queue: str = "agent.hints.general",
+    ) -> None:
         self.client = redis.from_url(url, decode_responses=True)
         self.queue_name = queue_name
+        self.hint_queue = hint_queue
         self.current_state: str = "idle"
+        self._prefer_hints: bool = True
+
+    async def next_signal(self) -> TaskRequested | WakeUpHint:
+        async def fetch():
+            queues = (
+                [self.hint_queue, self.queue_name]
+                if self._prefer_hints
+                else [self.queue_name, self.hint_queue]
+            )
+            return await self.client.blpop(queues, timeout=2)
+
+        while True:
+            result = await retry_with_backoff(fetch)
+            if result is not None:
+                source_queue, value = result
+                self._prefer_hints = not self._prefer_hints
+                if source_queue == self.hint_queue:
+                    return WakeUpHint.from_json(value)
+                return TaskRequested.from_json(value)
 
     async def next_task(self) -> TaskRequested:
         async def _fetch():

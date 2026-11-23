@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
 from uuid import uuid4
 
 from agent_contracts import (
     AgentEvent,
     CompletionCommand,
+    StageArtifact,
     TaskRequested,
     TaskResult,
     classify_completion_failure,
@@ -57,8 +60,9 @@ class AnalysisProcessor:
         assignment_proof: str,
         execution_kind: str = "delegated_child",
         continuation_version: int | None = None,
+        artifacts: tuple[StageArtifact, ...] | list[StageArtifact] | None = None,
     ) -> None:
-        """Execute one claimed delegated-child turn and submit its fenced completion."""
+        """Execute one claimed turn and submit its fenced completion."""
         if not assignment_id or not str(assignment_id).strip():
             raise ValueError("assignment_id must be a non-empty string")
         if not assignment_proof or not str(assignment_proof).strip():
@@ -68,7 +72,29 @@ class AnalysisProcessor:
             AgentEvent.create(self.agent_id, "working", "Analyzing supplied material", task.task_id)
         )
         try:
-            report = self.analyzer.analyze(task.prompt)
+            material_to_analyze = task.prompt
+            if artifacts:
+                for art in artifacts:
+                    if isinstance(art.content, Mapping) and art.content:
+                        if "material" in art.content:
+                            material_to_analyze = str(art.content["material"])
+                            break
+                        if "summary" in art.content:
+                            material_to_analyze = str(art.content["summary"])
+                            break
+                        if "findings" in art.content:
+                            material_to_analyze = str(art.content["findings"])
+                            break
+                        if "text" in art.content:
+                            material_to_analyze = str(art.content["text"])
+                            break
+                        material_to_analyze = json.dumps(art.content)
+                        break
+                    if isinstance(art.content, str) and art.content.strip():
+                        material_to_analyze = art.content.strip()
+                        break
+
+            report = self.analyzer.analyze(material_to_analyze)
             command = CompletionCommand(
                 completion_command_id=f"completion-{uuid4()}",
                 assignment_id=str(assignment_id).strip(),

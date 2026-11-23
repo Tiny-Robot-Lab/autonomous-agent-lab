@@ -6,7 +6,12 @@ from agent_contracts import (
     AgentHeartbeat,
     CompletionCommand,
     InferenceProviderHealth,
+    StageArtifact,
+    TaskContinuation,
+    TaskInput,
     TaskRequested,
+    TaskResult,
+    TerminalOutcome,
 )
 
 from research_agent.domain.models import ResearchResult, SynthesisResult
@@ -56,3 +61,44 @@ class InferenceHealthProbe(Protocol):
 @runtime_checkable
 class RuntimeInferenceProvider(InferenceProvider, InferenceHealthProbe, Protocol):
     """Application port combining research synthesis and health probing capabilities."""
+
+
+@runtime_checkable
+class ContinuationContextReader(Protocol):
+    """Port for loading authoritative parent and child context for resumed continuation."""
+
+    async def get_task_input(self, task_id: str, version: int = 1) -> TaskInput | None: ...
+    async def get_continuation(self, task_id: str, version: int = 1) -> TaskContinuation | None: ...
+    async def get_stage_artifact(self, producing_task_id: str, artifact_id: str, artifact_version: int = 1) -> StageArtifact | None: ...
+    async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None: ...
+    async def get_canonical_result(self, task_id: str) -> TaskResult | None: ...
+
+
+@runtime_checkable
+class DelegationClient(Protocol):
+    """Port for staging parent artifacts and submitting delegation proposals."""
+
+    async def stage_artifact(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        artifact_id: str,
+        artifact_type: str,
+        content: dict[str, Any],
+        artifact_version: int = 1,
+        payload_schema_version: int = 1,
+    ) -> dict[str, Any]: ...
+
+    async def propose_delegation(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        proposal_id: str,
+        child_intent: str,
+        artifact_reference: dict[str, Any],
+        target_capability: str = "analysis",
+        parent_input_version: int = 1,
+        control_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...

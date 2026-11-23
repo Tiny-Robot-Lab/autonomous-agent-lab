@@ -44,6 +44,7 @@ class ActiveClaim:
     continuation_version: int | None = None
     delegation_grant_id: str | None = None
     acknowledged_at: str | None = None
+    execution_expires_at: str | None = None
     version: int = ACTIVE_CLAIM_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -131,6 +132,15 @@ class ActiveClaim:
                 normalize_canonical_utc_timestamp(self.acknowledged_at),
             )
 
+        if self.execution_expires_at is not None:
+            if not isinstance(self.execution_expires_at, str) or not self.execution_expires_at.strip():
+                raise ValueError("execution_expires_at must be a non-empty string when present")
+            object.__setattr__(
+                self,
+                "execution_expires_at",
+                normalize_canonical_utc_timestamp(self.execution_expires_at),
+            )
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "acknowledged_at": self.acknowledged_at,
@@ -142,6 +152,7 @@ class ActiveClaim:
             "continuation_version": self.continuation_version,
             "delegation_grant_id": self.delegation_grant_id,
             "delivery_expires_at": self.delivery_expires_at,
+            "execution_expires_at": self.execution_expires_at,
             "execution_kind": self.execution_kind,
             "fencing_epoch": self.fencing_epoch,
             "prior_claimable_status": self.prior_claimable_status,
@@ -175,6 +186,7 @@ class ActiveClaim:
             "continuation_version",
             "delegation_grant_id",
             "delivery_expires_at",
+            "execution_expires_at",
             "execution_kind",
             "fencing_epoch",
             "prior_claimable_status",
@@ -238,6 +250,7 @@ class ActiveClaim:
             continuation_version=data.get("continuation_version"),
             delegation_grant_id=data.get("delegation_grant_id"),
             acknowledged_at=data.get("acknowledged_at"),
+            execution_expires_at=data.get("execution_expires_at"),
             version=version,
         )
 
