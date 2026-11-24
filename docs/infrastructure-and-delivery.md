@@ -66,11 +66,29 @@ Observability operates in a dedicated passive lane alongside runtime services:
 - **Behavior**: Detects tunnel or host reachability disruptions.
 - **Alerting**: Cloudflare dispatches operational notifications directly through its own alerting channel.
 
-### Layer 2: External Service Monitor (Planned)
+### Layer 2: External Service Monitor (Current and verified)
 
-- **Planned Tool**: UptimeRobot synthetic probing.
-- **Scope**: Probes `https://agents.tinyrobotlab.com/health` to observe application responsiveness.
-- **Alerting**: Dispatches independent notifications directly through UptimeRobot upon detected downtime.
+- **Status**: Current and verified via controlled failure and recovery testing (five-minute polling interval via UptimeRobot).
+- **Alerting**: Dispatches independent email notifications directly through UptimeRobot upon detected downtime or recovery; alerts do not flow through SMTP2GO. External monitoring observes public reachability and does not participate in request processing or diagnose internal failure causes.
+
+#### Tiny Agent Lab Lookout
+
+Public availability observation for Tiny Agent Lab.
+
+#### Tiny Agent Lab Pulse
+
+`GET`-based keyword monitoring of `https://agents.tinyrobotlab.com/health` checking for `"status":"ok"`. An initial standard HTTP monitor sent `HEAD` to `/health`, which accepts `GET` and returned HTTP 405 Method Not Allowed (a monitor-method mismatch rather than an application outage), so Pulse was configured as a `GET` keyword monitor.
+
+#### Tiny Robot Lab Beacon
+
+External availability observation for the separately hosted Tiny Robot Lab website.
+
+#### Controlled Validation Summary
+
+- **Polling interval**: UptimeRobot polls at a five-minute interval; exact outage-detection or recovery latency is intentionally not characterized because transitions may occur anywhere within that interval.
+- **Controlled application-down**: Stopping the Orchestrator while Cloudflare Tunnel remained running caused external monitoring to report the service down and send a down email while Layer 1 tunnel availability remained intact; restarting the Orchestrator restored `Up` status and triggered a recovery email.
+- **Controlled tunnel-down**: Stopping Cloudflare Tunnel while Tiny Agent Lab remained running locally on `home-core` triggered a Cloudflare tunnel-down notification followed by external down detection and notification from UptimeRobot; restarting the tunnel restored both layers with recovery notifications (a transient DNS-related error was observed during public-path recovery before `/health` became reachable again, without inferring a root cause).
+- **Final recovery evidence (`2026-11-24T06:38:49+00:00`)**: All Tiny Agent Lab Compose services were running, Orchestrator and Redis reported healthy, and public `GET https://agents.tinyrobotlab.com/health` returned `{"status":"ok"}`.
 
 ### Outbound Email Gateway: SMTP2GO (Available / Planned)
 
@@ -90,7 +108,7 @@ Operational capabilities are explicitly classified by verified status:
 | Cloudflare Tunnel | Private Connector | Current and verified | Outbound tunnel daemon defined in `compose.yaml`. |
 | `home-core` Services | Infrastructure | Current and verified | Container stack (Orchestrator, Redis Store, Agent Runtimes). |
 | Tunnel Health (Layer 1) | Monitoring | Current and verified | Operational Cloudflare tunnel health alerts. |
-| External Service Monitor (Layer 2) | Monitoring | Planned | Intended synthetic HTTP monitor for `/health`. |
+| External Service Monitor (Layer 2) | Monitoring | Current and verified | UptimeRobot external probes including `GET` `/health` keyword check at five-minute intervals. |
 | Outbound Email Gateway (SMTP2GO) | Email / Alerting | Available / Planned | Outbound service available; automated pipeline planned. |
 | Approved `home-core` Deployment | Delivery | Current and verified | Deliberate, human-mediated deployment process. |
 

@@ -308,16 +308,16 @@
 
     <!-- Card M2: External Monitor -->
     <g id="card-layer2">
-      <rect x="1276" y="268" width="268" height="142" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="1.5" stroke-dasharray="5,4" />
-      <rect x="1436" y="276" width="98" height="16" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1" />
-      <text x="1485" y="284" class="status-pill" fill="#b45309">PLANNED • ADVISORY</text>
+      <rect x="1276" y="268" width="268" height="142" rx="6" fill="#ffffff" stroke="#d97706" stroke-width="1.5" />
+      <rect x="1436" y="276" width="98" height="16" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1" />
+      <text x="1485" y="284" class="status-pill" fill="#15803d">CURRENT • VERIFIED</text>
 
       <text x="1288" y="288" class="box-title">External Monitor</text>
-      <text x="1288" y="302" class="box-sub">Layer 2 · Public endpoint</text>
-      <text x="1288" y="324" class="box-body">• Probes public endpoint (<tspan class="mono">/health</tspan>)</text>
-      <text x="1288" y="342" class="box-body">• Observes application responsiveness</text>
+      <text x="1288" y="302" class="box-sub">Layer 2 · Public service health</text>
+      <text x="1288" y="324" class="box-body">• Probes public endpoint (<tspan class="mono">GET /health</tspan>)</text>
+      <text x="1288" y="342" class="box-body">• Observes external service availability</text>
       <text x="1288" y="360" class="box-body">• Independent notifications (UptimeRobot)</text>
-      <text x="1288" y="390" class="box-body" fill="#b45309" font-weight="600">Depicted as planned per evidence rules</text>
+      <text x="1288" y="390" class="box-body" fill="#b45309" font-weight="600">External public-service health evidence</text>
     </g>
 
     <!-- Card M3: Outbound Email -->
