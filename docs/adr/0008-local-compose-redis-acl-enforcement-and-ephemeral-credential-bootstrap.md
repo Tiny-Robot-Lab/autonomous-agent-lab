@@ -252,22 +252,27 @@ combination.
 A version-controlled Redis entrypoint performs these steps before Redis binds
 its service port:
 
-1. verify every identity declared by the selected profile has a secret file;
-2. reject missing, unreadable, empty, short, malformed, whitespace-containing,
+1. verify `/run/redis` is an exact tmpfs mount using `/proc/self/mountinfo`,
+   rejecting missing, non-tmpfs, and non-root mount-root entries before
+   creating ACL material;
+2. verify every identity declared by the selected profile has a secret file;
+3. reject missing, unreadable, empty, short, malformed, whitespace-containing,
    newline-containing, or control-character-containing secrets;
-3. compute each secret's SHA-256 digest;
-4. combine the non-secret ACL policy/template with `#<64-hex-digest>` password
+4. compute each secret's SHA-256 digest;
+5. combine the non-secret ACL policy/template with `#<64-hex-digest>` password
    rules, never plaintext `><password>` rules;
-5. verify there is exactly one canonical
+6. reject broad selectors and command categories, plaintext password rules,
+   committed password hashes, test/admin identities, and duplicate or
+   competing default-user rules; then verify there is exactly one canonical
    `user default off resetpass resetkeys resetchannels -@all` directive and no
    competing `user default` line;
-6. ensure `/run/redis` is traversable by the unprivileged Redis user, using
+7. ensure `/run/redis` is traversable by the unprivileged Redis user, using
    `root:redis` mode `0750` or an equivalently restrictive verified layout;
-7. render to a temporary file under `/run/redis`;
-8. set the ACL file to `root:redis` mode `0440`, keeping it readable by Redis
+8. render to a temporary file under `/run/redis`;
+9. set the ACL file to `root:redis` mode `0440`, keeping it readable by Redis
    but not writable by the Redis process or world-readable;
-9. atomically rename the temporary file to `/run/redis/users.acl`; and
-10. replace the entrypoint shell with `redis-server` via `exec`, running Redis
+10. atomically rename the temporary file to `/run/redis/users.acl`; and
+11. replace the entrypoint shell with `redis-server` via `exec`, running Redis
     as the unprivileged Redis user and PID 1 with AOF data under `/data` and the
     ACL file under `/run/redis`.
 
@@ -461,7 +466,8 @@ Implementation is not complete until deterministic tests prove:
 - the Orchestrator is denied database flush, ACL/config/module/function
   administration, script flush, and out-of-namespace access;
 - missing or malformed bootstrap secrets fail closed;
-- `/run/redis/users.acl` is on tmpfs, mode `0600`, and contains hashes without
+- `/run/redis/users.acl` is on tmpfs, owned by `root:redis`, mode `0440`, and
+  contains hashes without
   plaintext credentials;
 - default Compose contains an exact Redis image pin, credential-free URLs,
   explicit per-service secret isolation, and no test/admin identity;
@@ -487,6 +493,13 @@ Implementation is not complete until deterministic tests prove:
 Existing claim, delegation, continuation, completion, expiry/recovery,
 routing, container-packaging, and end-to-end Redis suites must remain green
 under authenticated identities.
+
+The normal unit suite's static Compose/ACL checks do not prove container
+runtime enforcement. The opt-in
+`scripts/validate_redis_acl_containers.py` Docker smoke verifies bounded image
+packaging, tmpfs bootstrap, authenticated health, unauthenticated denial,
+non-root execution, secret-copy permissions, and AOF writes only. It is not the
+full ACL positive/negative enforcement matrix above.
 
 ### 13. Required implementation artifacts
 

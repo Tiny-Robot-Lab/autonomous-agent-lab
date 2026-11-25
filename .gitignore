@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+.secrets/redis/*
+!.secrets/redis/.gitkeep
 .venv/
 __pycache__/
 .pytest_cache/

@@ -1,15 +1,35 @@
 name: autonomous-agent-lab
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine
+    entrypoint: ["/bin/sh", "/usr/local/bin/redis-acl-entrypoint.sh"]
     command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+      - ./infrastructure/redis/redis-acl-entrypoint.sh:/usr/local/bin/redis-acl-entrypoint.sh:ro
+      - ./infrastructure/redis/redis-healthcheck.sh:/usr/local/bin/redis-healthcheck.sh:ro
+      - ./infrastructure/redis/redis-mountinfo.sh:/usr/local/bin/redis-mountinfo.sh:ro
+      - ./infrastructure/redis/users.acl.template:/usr/local/bin/users.acl.template:ro
+    tmpfs:
+      - /run/redis:rw,noexec,nosuid,nodev,size=16m,mode=0750
+    secrets:
+      - source: redis_orchestrator
+        target: orchestrator
+      - source: redis_worker_1
+        target: worker-1
+      - source: redis_research_agent_1
+        target: research-agent-1
+      - source: redis_research_agent_2
+        target: research-agent-2
+      - source: redis_analysis_agent_1
+        target: analysis-agent-1
+      - source: redis_healthcheck
+        target: healthcheck
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "/bin/sh", "/usr/local/bin/redis-healthcheck.sh"]
       interval: 5s
       timeout: 3s
       retries: 10
-    volumes:
-      - redis_data:/data
     networks: [agent_net]
     restart: unless-stopped
 
@@ -20,7 +40,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_AUTH_MODE: required
+      REDIS_USERNAME: orchestrator
+      REDIS_PASSWORD_FILE: /run/redis-auth/password
       APP_ENV: ${APP_ENV:-development}
       TASK_DELIVERY_MODE: ${TASK_DELIVERY_MODE:-legacy_push}
       CLAIM_DELIVERY_LEASE_SECONDS: ${CLAIM_DELIVERY_LEASE_SECONDS:-30.0}
@@ -29,6 +52,9 @@ services:
       RUNTIME_CREDENTIAL_PEPPER:
       ASSIGNMENT_PROOF_PEPPER:
       RUNTIME_PRINCIPALS_JSON:
+    secrets:
+      - source: redis_orchestrator
+        target: redis_password
     depends_on:
       redis:
         condition: service_healthy
@@ -45,9 +71,13 @@ services:
       context: .
       dockerfile: services/worker/Dockerfile
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_AUTH_MODE: required
+      REDIS_USERNAME: worker-1
+      REDIS_PASSWORD_FILE: /run/redis-auth/password
       AGENT_ID: worker-1
       TASK_QUEUE: ${TASK_QUEUE:-agent.tasks.general}
+      HINT_QUEUE: agent.hints.general
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
       RUNTIME_TOKEN: ${RUNTIME_TOKEN_WORKER:-${RUNTIME_TOKEN:-}}
       INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-stub}
@@ -60,6 +90,9 @@ services:
       GEMINI_MAX_TOKENS: ${GEMINI_MAX_TOKENS:-1024}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
+    secrets:
+      - source: redis_worker_1
+        target: redis_password
     depends_on:
       redis:
         condition: service_healthy
@@ -71,7 +104,10 @@ services:
       context: .
       dockerfile: services/research_agent/Dockerfile
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_AUTH_MODE: required
+      REDIS_USERNAME: research-agent-1
+      REDIS_PASSWORD_FILE: /run/redis-auth/password
       AGENT_ID: research-agent-1
       TASK_QUEUE: ${RESEARCH_TASK_QUEUE:-agent.tasks.research}
       HINT_QUEUE: ${RESEARCH_HINT_QUEUE:-agent.hints.research}
@@ -89,6 +125,9 @@ services:
       GEMINI_MAX_TOKENS: ${GEMINI_MAX_TOKENS:-1024}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
+    secrets:
+      - source: redis_research_agent_1
+        target: redis_password
     depends_on:
       redis:
         condition: service_healthy
@@ -100,7 +139,10 @@ services:
       context: .
       dockerfile: services/research_agent/Dockerfile
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_AUTH_MODE: required
+      REDIS_USERNAME: research-agent-2
+      REDIS_PASSWORD_FILE: /run/redis-auth/password
       AGENT_ID: research-agent-2
       TASK_QUEUE: ${RESEARCH_TASK_QUEUE:-agent.tasks.research}
       HINT_QUEUE: ${RESEARCH_HINT_QUEUE:-agent.hints.research}
@@ -118,6 +160,9 @@ services:
       GEMINI_MAX_TOKENS: ${GEMINI_MAX_TOKENS:-1024}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
+    secrets:
+      - source: redis_research_agent_2
+        target: redis_password
     depends_on:
       redis:
         condition: service_healthy
@@ -129,13 +174,19 @@ services:
       context: .
       dockerfile: services/analysis_agent/Dockerfile
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_AUTH_MODE: required
+      REDIS_USERNAME: analysis-agent-1
+      REDIS_PASSWORD_FILE: /run/redis-auth/password
       AGENT_ID: analysis-agent-1
       TASK_QUEUE: ${ANALYSIS_TASK_QUEUE:-agent.tasks.analysis}
       HINT_QUEUE: ${ANALYSIS_HINT_QUEUE:-agent.hints.analysis}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
       RUNTIME_TOKEN: ${RUNTIME_TOKEN_ANALYSIS_1:-${RUNTIME_TOKEN_ANALYSIS:-}}
+    secrets:
+      - source: redis_analysis_agent_1
+        target: redis_password
     depends_on:
       redis:
         condition: service_healthy
@@ -156,3 +207,16 @@ networks:
     driver: bridge
 volumes:
   redis_data:
+secrets:
+  redis_orchestrator:
+    file: .secrets/redis/orchestrator
+  redis_worker_1:
+    file: .secrets/redis/worker-1
+  redis_research_agent_1:
+    file: .secrets/redis/research-agent-1
+  redis_research_agent_2:
+    file: .secrets/redis/research-agent-2
+  redis_analysis_agent_1:
+    file: .secrets/redis/analysis-agent-1
+  redis_healthcheck:
+    file: .secrets/redis/healthcheck
