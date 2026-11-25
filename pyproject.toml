@@ -15,10 +15,11 @@ pythonpath = [
     "packages/policy/src",
 ]
 testpaths = ["tests"]
-addopts = "-m 'not redis'"
+addopts = "-m 'not redis and not live_redis_acl'"
 strict_markers = true
 markers = [
     "redis: integration tests requiring an explicit live Redis instance via REDIS_URL",
+    "live_redis_acl: live Docker-backed Redis 7.4.12 ACL allow/deny enforcement matrix",
     "external_provider: opt-in live tests targeting external network or live providers",
 ]
 

@@ -262,3 +262,31 @@ def test_healthcheck_is_ping_only_and_uses_scoped_secret_environment() -> None:
     assert "cmp -s -" in source
     assert "-a" not in source
     assert "redis://" not in source
+
+
+def test_live_acl_harness_is_isolated_and_uses_real_template_without_ports_or_host_secrets() -> None:
+    compose = COMPOSE_FILE.read_text()
+    template = ACL_TEMPLATE.read_text()
+    harness = (REPO_ROOT / "scripts" / "redis_acl_live_harness.py").read_text()
+    live_suite = (REPO_ROOT / "tests" / "test_redis_acl_live.py").read_text()
+
+    # Normal deployment artifacts contain zero test-admin identity or secret references
+    assert "fixture-admin" not in compose
+    assert "fixture-admin" not in template
+    assert not re.search(r"redis_(?:test|admin)", compose)
+
+    # Live harness pins exact Redis image, uses real bootstrap files, and avoids real .secrets/redis
+    assert 'REDIS_IMAGE: Final[str] = "redis:7.4.12-alpine"' in harness
+    assert "redis:7-alpine" not in harness
+    assert "redis:7-alpine" not in live_suite
+    assert "users.acl.template" in harness
+    assert "redis-acl-entrypoint.sh" in harness
+    assert ".secrets/redis" not in harness
+    assert ".secrets/redis" not in live_suite
+
+    # Zero host-published ports in live Docker harness
+    assert '"-p"' not in harness
+    assert '"--publish"' not in harness
+    assert "--internal" in harness
+    assert "cluster.cleanup()" in harness
+    assert "cluster.cleanup()" in live_suite
