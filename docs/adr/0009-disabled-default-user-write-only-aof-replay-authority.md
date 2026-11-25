@@ -27,7 +27,255 @@ implementation remains blocked until the replay rule, static completeness
 gate, fail-closed startup replay-integrity gate, AOF lifecycle tests, and ADR
 0008 partial-supersession annotation are implemented and validated.
 
+## Post-Acceptance Amendment 1: Accepted
+
+**Status: Accepted by human architecture owner after final independent Gemini
+Neon High review and incorporation of all required revisions.**
+The original decision remains recorded below as accepted history. This amendment
+records accepted corrections and additional requirements. Acceptance of this
+amendment does not mean that the requirements are implemented.
+The human architecture owner approved the five required revisions from the
+independent Gemini Neon High review and directed that this be recorded as
+Post-Acceptance Amendment 1 to ADR 0009. The final independent Gemini Neon
+High review returned **ACCEPTABLE WITH REQUIRED REVISIONS**; the human
+architecture owner accepted its five targeted revisions, which are incorporated
+here. The human architecture owner subsequently re-accepted ADR 0009 with this
+amendment after incorporation and review of all required revisions.
+
+Issue #229 Increment 4's static-completeness investigation found that legacy
+dispatch transactionally `RPUSH`es to a runtime-advertised `dispatch_target`
+without an application-level legitimate-queue bound. The broader Orchestrator
+Redis ACL is consequently the effective destination boundary. This is a
+confused-deputy application-security issue, not merely a replay-inventory
+bookkeeping issue. The investigation also found that the intentional
+`task.routing:*` writer is an ordinary non-transactional `SET`, and that Redis
+7.4.12 Lua propagation framing depends on the actual propagated effects rather
+than every Lua write being automatically transactionally framed.
+
+The bounded repository audit established the following accepted amendments to
+the original context and Decisions 2, 4, and 8. The original Decision 2
+hardcoded selector inventory below is retained as historical decision text, not
+an implementation-ready inventory. It must not be copied as the final rule.
+
+### A1. Permanent legacy dispatch security boundary
+
+The Orchestrator must resolve every legacy task-dispatch destination through a
+finite, version-controlled legitimate-destination contract for the governed
+deployment. Runtime-advertised `dispatch_target` is untrusted input; the
+broader Orchestrator Redis ACL must never serve as its application
+authorization or validation boundary.
+
+At the common legacy-dispatch choke point, before constructing or executing the
+transaction, validation must compare the original destination against the
+exact canonical mapping for the Orchestrator's authoritative task/dispatch
+capability, such as authoritative `required_capability`, never a
+runtime-self-advertised capability. Prefix acceptance, regex approximation,
+free-form interpolation, and post-validation transformation are not
+authorization. Upstream conversion or whitespace stripping must not turn a
+malformed advertisement into an accepted value before this check; the
+original value must be preserved or the malformed value rejected before
+normalization. The validated canonical approved value itself, not a reused or
+reread runtime string, must be passed to `RPUSH`.
+
+Unknown, malformed, non-string, empty, whitespace-only, unauthorized, and
+non-queue destinations fail closed before the unsafe transaction is
+constructed or executed. The only exception for a non-string target is an
+omitted or `None` target intentionally supported by a production path; it may
+resolve only to the authoritative capability's canonical approved destination.
+Raw, empty, whitespace-only, or runtime-derived fallback strings must never
+reach `RPUSH`. `task.*`, `agent.events`, `agent.ids`, `agent.state:*`, and
+unrelated hint destinations cannot become legitimate legacy task destinations
+because some Redis identity can access them. A runtime advertising one
+capability must not cause legacy dispatch to another capability's queue merely
+by advertising its name.
+
+This is a permanent Orchestrator confused-deputy defense reinforcing ADR 0008's
+runtime-isolation boundary. It remains required even if the Redis-7.4.12 AOF
+workaround is retired. This amendment does not redesign candidate selection.
+
+### A2. Deployment-aware queue contract
+
+For the fixed local Compose deployment, the role task queues are
+`agent.tasks.general`, `agent.tasks.research`, and `agent.tasks.analysis`.
+The finite local contract must bind general, research, and analysis to their
+respective task queues. Normal HTTP `SubmitTask` routing accepts general and
+research; it does not automatically select analysis. The analysis runtime
+nevertheless advertises and consumes its task queue. `agent.hints.*` are
+wake-up-hint destinations, not legacy `TaskRequested` destinations.
+
+Runtime configuration and existing tests also support custom advertised task
+queues outside the fixed local Compose ACL boundary. This decision does not
+limit all Tiny Agent Lab deployments globally to these three strings. A
+broader deployment that intentionally supports configurable queues must define
+its own finite, version-controlled, governed capability-to-destination
+contract; arbitrary runtime-provided Redis keys and the Orchestrator ACL are
+not such a contract.
+
+Orchestrator production behavior defaults fail closed to the finite governed
+deployment contract; no production switch or mode may disable destination
+validation. Configurable or custom-queue deployments and tests must inject an
+explicit finite capability-to-destination contract. Custom queue names must be
+exact non-glob strings without control characters. The contract must never be
+sourced from runtime-writable Redis state such as `agent.state:*`; arbitrary
+runtime-advertised Redis keys remain invalid.
+
+### A3. Rejected dispatch and existing state
+
+Current `SubmitTask` ordering can write `task.routing:*` and register the root
+task's registration, status, lineage, input, authority, and required-
+capability records before `RedisGateway.dispatch` is invoked. Destination
+rejection at the dispatch choke point therefore does not imply zero earlier
+mutations. It must produce zero mutations from the rejected dispatch
+transaction and must not leave a queued task payload or a falsely dispatched
+status.
+
+Earlier state follows the existing dispatch-failure lifecycle: the caller
+attempts to record `dispatch_failed`; if that update itself fails,
+`pending_dispatch` can remain. Failure behavior must be deterministic and
+tested, including both `dispatch_failed` and the possible `pending_dispatch`
+residual state. The failure must be surfaced, not silently treated as
+successful dispatch. Neither `dispatch_failed` nor residual
+`pending_dispatch` itself grants claimability, assignment proof, or execution
+authority.
+
+Because Issue #229 does not redesign candidate selection, a selected runtime
+advertising an invalid destination can make that attempt fail closed even if
+another healthy peer exists. Registration or candidate filtering of poisoned
+advertisements is a future bounded hardening option, not part of this
+amendment.
+
+### A4. Corrected Redis 7.4.12 framing and replay inventory
+
+Transactional client pipelines require replay authority for their qualifying
+transactionally framed writes. For Redis 7.4.12, Lua/script propagation must
+be classified by the actual propagated execution unit and effects:
+multi-effect propagation can produce `MULTI`/`EXEC` framing subject to
+DefaultUser `EXEC` revalidation; a single propagated effect can instead be an
+ordinary non-transactional AOF command and does not by that path alone justify
+transactional replay authority. If another qualifying transaction or
+multi-effect Lua path writes the same command and key family, that path can
+still justify the selector. Live Redis 7.4.12 AOF lifecycle verification
+remains authoritative for server-emitted framing and artifacts; this
+amendment makes no claim about untested Redis versions.
+
+A Lua script may be treated as single-effect and excluded from default replay
+authority on that basis only if static analysis proves that every reachable
+execution branch propagates at most one mutating command, there is no
+multi-write branch, no mutating loop, no dynamic or unbounded mutating Redis
+command construction, and the script is never invoked inside an outer
+`MULTI`/`EXEC` transaction. Otherwise classify it as requiring qualifying
+transactional replay authority, or fail the completeness gate if its framing
+cannot be established.
+
+The final disabled-default rule must be derived from the complete production
+command, key, and framing audit after the destination boundary is enforced,
+not from the broader Orchestrator ACL or an old manual selector list. Retain
+`SET`, `DEL`, `SADD`, `RPUSH`, and `XADD` selectors only where at least one
+actual production path requires transactional replay authority. An ordinary
+writer or single-effect Lua path alone does not justify such a selector.
+Preserve selectors supported by other qualifying paths even when the same
+family also has ordinary or single-effect writers.
+
+`record_routing_decision` intentionally performs an ordinary non-transactional
+`SET task.routing:*`; under the pinned mechanism this does not justify
+transactional/Lua replay authority. The permanent destination boundary rejects
+the accidental legacy transactional `RPUSH` to `task.routing:*`. After that
+boundary is enforced, no `SET` or `RPUSH` replay selector for `task.routing:*`
+is currently justified. A future qualifying transaction or Lua framing path
+must fail the completeness gate until the architecture and policy are
+deliberately updated.
+
+The disabled default user remains externally disabled, passwordless and
+selector-bound with write-only key permissions. Do not grant read authority,
+`~*`, broad command categories, `+multi`, `+exec`, `+eval`, or runtime ACL
+mutation to make replay work. The bounded fail-closed startup replay-integrity
+gate and the separately justified replay `SELECT` requirement remain in force.
+
+### A5. Non-circular static completeness gate
+
+The 100% gate must be grounded in production code, not in agreement between two
+manually maintained lists. It must identify every production transactional
+pipeline construction and Lua execution site, and detect production code
+outside the audited Redis gateway that constructs a transactional pipeline or
+executes Lua. It must account for indirect or newly introduced command and
+script execution paths rather than silently treating them as absent.
+Static pipeline analysis must treat redis-py `pipeline()` as transactional
+unless `transaction=False` is explicit. The eventual version-controlled audit
+artifact must cross-link this ADR and the governed destination contract; its
+location is to be established when the artifact is created.
+
+For every qualifying transactional or Lua-propagated mutation, the gate must
+establish that the command and key are static or derive from a reviewed finite
+version-controlled contract, and that the generated default replay rule
+covers the command and key family. Conversely, every retained replay selector
+must have at least one qualifying production justification. Ordinary-only
+paths, including the current `task.routing:*` `SET`, must remain excluded.
+New transactional/Lua writes, dynamic transactional keys, or ordinary
+writers moved into qualifying transaction framing must fail the gate until the
+inventory and ADR-governed policy are deliberately updated.
+Adding a second mutation, mutating loop, qualifying branch, or outer
+transaction invocation to a previously single-effect script must likewise
+fail the gate until replay policy is deliberately updated.
+
+Redis-server-generated `SELECT` and framing are distinct from application
+write-site completeness and remain subject to live replay verification.
+
+### A6. Additional required verification
+
+In addition to the original verification requirements, implementation must
+prove:
+
+- every approved local Compose capability-to-task-queue mapping succeeds, and
+  cross-capability advertisement or dispatch fails closed;
+- `task.*`, `agent.events`, `agent.ids`, `agent.state:*`, hint queues,
+  malformed or non-string values, prefix spoofing, whitespace/control-character
+  variants, and other unauthorized destinations do not reach the legacy
+  dispatch transaction;
+- the canonical approved constant, not raw runtime input, reaches `RPUSH`,
+  and rejected dispatch constructs and executes no unsafe transaction;
+- earlier `SubmitTask` state follows the documented dispatch-failure
+  lifecycle, including verified `dispatch_failed` and possible
+  `pending_dispatch` residual behavior;
+- every production command/key family excluded from default replay authority
+  because it is ordinary non-transactional or single-effect Lua is exercised
+  through its real production invocation path and survives a pinned Redis
+  7.4.12 AOF restart without a selector for that excluded family, with zero
+  `CRITICAL` or `NOPERM` replay errors and reconstructed state intact;
+  this includes ordinary `SET task.routing:*`;
+- the complete code-grounded command/framing audit agrees with the generated
+  default replay rule, and production-envelope subtraction tests establish
+  that every retained selector is necessary by exercising actual qualifying
+  production transactional or multi-effect Lua paths;
+- no artificial transactional or multi-effect test wrapper is used to justify
+  a selector for an ordinary or single-effect-only production writer; and
+- the original `BGREWRITEAOF`, incremental-tail, accepted truncation, rotation,
+  stale-credential, rollback, fixture-admin isolation, and fail-closed
+  replay-integrity verification requirements remain satisfied.
+
+### A7. Consequences and resume gate
+
+The accepted boundary closes the live confused-deputy path, preserves
+least-privilege replay authority, and makes static completeness meaningful
+without coupling permanent dispatch security to a temporary Redis workaround.
+Misconfigured or poisoned selected runtimes can cause fail-closed dispatch
+failure; broader configurable-queue deployments must define finite governed
+contracts. Candidate filtering and fallback are not added by Issue #229. The
+replay mechanism remains specifically verified only for the pinned local
+Redis 7.4.12 Compose boundary.
+
+Post-Acceptance Amendment 1 received final independent Gemini Neon High review,
+all blocking review findings were resolved, and the human architecture owner
+explicitly re-accepted ADR 0009 as amended. The architecture resume gate is
+therefore satisfied; Issue #229 Increment 4 may resume subject to the
+implementation and verification requirements of this ADR.
+
 ## Context
+
+**Historical context:** Amendment 1 section A4 proposes a correction to the
+Lua/AOF framing description below. Not every Lua-produced write is necessarily
+wrapped in `MULTI`/`EXEC`. Future retirement described below applies only to
+the Redis-7.4.12 disabled-default AOF replay workaround; the permanent legacy
+dispatch security boundary in Amendment 1 sections A1 and A2 must survive.
 
 ADR 0008 selects per-service Redis identities, deny-by-default ACLs, a disabled
 `default` user, an ACL rendered on tmpfs before Redis accepts connections,
@@ -112,6 +360,15 @@ default ...` must fail for empty, arbitrary, and production-identity
 passwords.
 
 ### 2. Grant only bounded transactional and Lua write-only AOF replay authority
+
+**Historical Decision 2:** Only the original hardcoded selector inventory
+below is historical and not implementation-ready. Amendment 1 section A4
+proposes corrected framing assumptions and a code-grounded inventory,
+including removal of the unsupported `task.routing:*` selector after the
+legacy destination boundary is enforced. The single rendered ACL line,
+write-only `%W~` selectors, prohibition on read authority and `~*`, no-`UNLINK`
+and no-TTL restrictions, `DEL` restricted to `task.claim:*`, and other
+enduring least-privilege restrictions remain in force.
 
 The disabled `default` user receives a bounded production replay envelope of
 write-only command and key selectors projected from the complete audited
@@ -204,6 +461,10 @@ at the ACL layer. Database-0 confinement remains a named-client configuration
 and validation invariant.
 
 ### 4. Enforce replay completeness and fail-closed startup integrity
+
+**Amendment 1 proposal:** Section A5 strengthens the static gate below to
+require non-circular production-code coverage and a justification for every
+retained selector.
 
 The write-only replay rule is an explicit, version-controlled projection of
 the complete audited transactional and Lua-propagated write inventory. It must
@@ -298,6 +559,12 @@ authentication, detached assignment proofs, current fencing epochs, and
 platform recovery governance.
 
 ### 8. Required verification
+
+**Amendment 1 proposal:** Section A6 adds destination-boundary and
+production-framing verification to the original gates below. Subtraction and
+replay fixtures must exercise actual qualifying production transactional or
+multi-effect Lua paths; synthetic transaction wrappers must not manufacture
+justification for a selector.
 
 Implementation is incomplete until deterministic tests prove:
 
