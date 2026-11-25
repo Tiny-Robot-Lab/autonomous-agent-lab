@@ -209,7 +209,7 @@ async def test_retry_with_backoff_does_not_retry_unexpected_defects() -> None:
 
 @pytest.mark.anyio
 async def test_worker_redis_bus_register() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -235,6 +235,10 @@ async def test_worker_redis_bus_register() -> None:
 @pytest.mark.anyio
 async def test_run_worker_registers_capability_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-1")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -346,6 +350,10 @@ async def test_task_processor_requires_completion_client() -> None:
 @pytest.mark.anyio
 async def test_run_worker_wires_completion_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_ID", "worker-1")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
 
     with (
@@ -757,6 +765,10 @@ async def test_run_worker_registers_custom_inference_provider_metadata(
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-cf")
     monkeypatch.setenv("CLOUDFLARE_AI_API_TOKEN", "tok-cf")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
         mock_bus = AsyncMock()
@@ -778,6 +790,10 @@ async def test_run_worker_unsupported_inference_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("INFERENCE_PROVIDER", "unknown-provider")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -798,6 +814,10 @@ async def test_run_worker_multi_provider_startup(
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-multi")
     monkeypatch.setenv("CLOUDFLARE_AI_API_TOKEN", "tok-multi")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
         mock_bus = AsyncMock()
@@ -819,6 +839,10 @@ async def test_run_worker_health_probe_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     # 1. Default when unset is 3.0
     monkeypatch.delenv("HEALTH_PROBE_TIMEOUT_SECONDS", raising=False)
     with patch("worker.main.RedisBus") as mock_bus_cls, patch(
@@ -864,6 +888,10 @@ async def test_run_worker_health_probe_timeout_configuration(
 
     # 4. Invalid env var fails startup cleanly
     monkeypatch.setenv("HEALTH_PROBE_TIMEOUT_SECONDS", "invalid")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
         with pytest.raises(ValueError, match="probe_timeout_seconds must be a positive number"):
             await run_worker()
@@ -878,6 +906,10 @@ async def test_run_worker_missing_secondary_credentials_fails_startup(
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
         from worker.main import run_worker
@@ -895,6 +927,10 @@ async def test_run_worker_unsupported_secondary_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,invalid_vendor")
 
     with patch("worker.main.RedisBus") as mock_bus_cls, patch("worker.main.TaskProcessor"):
@@ -910,7 +946,7 @@ async def test_run_worker_unsupported_secondary_provider_fails_startup(
 
 @pytest.mark.anyio
 async def test_worker_redis_bus_serializes_fallback_transition_as_json() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
@@ -953,7 +989,7 @@ async def test_worker_redis_bus_serializes_fallback_transition_as_json() -> None
 async def test_general_worker_with_inference_provider_submits_canonical_completion() -> None:
     completion_client = FakeCompletionClient()
 
-    worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
+    worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     worker_bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
@@ -992,7 +1028,7 @@ async def test_general_worker_with_inference_provider_submits_canonical_completi
 async def test_general_worker_task_submits_canonical_result_for_platform_persistence() -> None:
     completion_client = FakeCompletionClient()
 
-    worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
+    worker_bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     worker_bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     worker_bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
@@ -1984,6 +2020,10 @@ async def test_worker_initial_wake_up_hint_claims_and_runs(monkeypatch: pytest.M
         mock_hb.return_value.start = MagicMock()
         mock_hb.return_value.stop = AsyncMock()
         monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         with pytest.raises(TimeoutError, match="exit"):
             await run_worker()

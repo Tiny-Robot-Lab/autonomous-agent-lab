@@ -10,6 +10,7 @@ from agent_contracts import (
     AgentExecutionState,
     AgentHeartbeat,
     HeartbeatRunner,
+    RedisConnectionConfig,
     evaluate_agent_record,
     parse_heartbeat_interval,
 )
@@ -151,6 +152,10 @@ async def test_general_worker_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-live-1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0.04")
 
@@ -195,6 +200,10 @@ async def test_research_agent_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-live-1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0.04")
 
@@ -238,6 +247,9 @@ async def test_analysis_agent_registers_and_periodically_refreshes_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.delenv("AGENT_ID", raising=False)
     monkeypatch.delenv("TASK_QUEUE", raising=False)
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
@@ -266,10 +278,13 @@ async def test_analysis_agent_registers_and_periodically_refreshes_liveness(
         with pytest.raises(asyncio.CancelledError):
             await run_analysis_agent()
 
-        mock_bus_cls.assert_called_once_with(
-            "redis://localhost:6379/0",
-            queue_name="agent.tasks.analysis",
-        )
+        mock_bus_cls.assert_called_once()
+        _, bus_kwargs = mock_bus_cls.call_args
+        assert bus_kwargs["queue_name"] == "agent.tasks.analysis"
+        bus_cfg = bus_kwargs["connection_config"]
+        assert isinstance(bus_cfg, RedisConnectionConfig)
+        assert bus_cfg.url == "redis://localhost:6379/0"
+        assert bus_cfg.auth_mode == "unauthenticated_local_test"
         mock_bus.register.assert_awaited_once()
         metadata: AgentCapabilityMetadata = mock_bus.register.call_args[0][0]
         assert metadata.agent_id == "analysis-agent-1"
@@ -351,7 +366,7 @@ def test_heartbeat_does_not_overwrite_error_state() -> None:
 
 @pytest.mark.anyio
 async def test_worker_redis_bus_heartbeat_updates_state_and_preserves_metadata() -> None:
-    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general")
+    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
@@ -385,7 +400,7 @@ async def test_worker_redis_bus_heartbeat_updates_state_and_preserves_metadata()
 
 @pytest.mark.anyio
 async def test_research_redis_bus_heartbeat_refreshes_timestamp_without_overwriting_state() -> None:
-    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
+    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -400,7 +415,7 @@ async def test_research_redis_bus_heartbeat_refreshes_timestamp_without_overwrit
 
 @pytest.mark.anyio
 async def test_analysis_redis_bus_heartbeat_refreshes_timestamp_without_overwriting_state() -> None:
-    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis")
+    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -418,7 +433,7 @@ async def test_older_heartbeat_cannot_overwrite_newer_execution_state_event() ->
 
     a newer execution-state transition (both idle->working and working->idle transitions).
     """
-    bus = WorkerRedisBus("redis://localhost:6379/0")
+    bus = WorkerRedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
 
     # In-memory dictionary simulating the Redis hash agent.state:worker-1
     stored_redis_hash: dict[str, str] = {}

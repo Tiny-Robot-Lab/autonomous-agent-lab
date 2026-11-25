@@ -20,7 +20,7 @@ from worker.infrastructure.redis_bus import RedisBus
 
 @pytest.mark.anyio
 async def test_redis_gateway_routes_general_capability() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -39,7 +39,7 @@ async def test_redis_gateway_routes_general_capability() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_routes_research_capability() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -58,7 +58,7 @@ async def test_redis_gateway_routes_research_capability() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_defaults_to_general() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -77,7 +77,7 @@ async def test_redis_gateway_defaults_to_general() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_invalid_capability_raises_value_error() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.rpush = AsyncMock()
     task = TaskRequested.create("bad capability prompt")
 
@@ -88,23 +88,23 @@ async def test_redis_gateway_invalid_capability_raises_value_error() -> None:
 
 
 def test_redis_bus_defaults_to_general_queue() -> None:
-    bus = RedisBus("redis://localhost:6379/0")
+    bus = RedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     assert bus.queue_name == "agent.tasks.general"
 
 
 def test_redis_bus_custom_queue_configuration() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research", allow_unauthenticated_local_test=True)
     assert bus.queue_name == "agent.tasks.research"
 
 
 def test_analysis_redis_bus_defaults_to_analysis_queue() -> None:
-    bus = AnalysisRedisBus("redis://localhost:6379/0")
+    bus = AnalysisRedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     assert bus.queue_name == "agent.tasks.analysis"
 
 
 @pytest.mark.anyio
 async def test_analysis_redis_bus_consumes_from_configured_queue() -> None:
-    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis")
+    bus = AnalysisRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis", allow_unauthenticated_local_test=True)
     task = TaskRequested.create("Analyze supplied material")
     bus.client.blpop = AsyncMock(return_value=("agent.tasks.analysis", task.to_json()))
 
@@ -117,7 +117,7 @@ async def test_analysis_redis_bus_consumes_from_configured_queue() -> None:
 
 @pytest.mark.anyio
 async def test_analysis_redis_bus_registers_metadata_without_direct_result_write() -> None:
-    bus = AnalysisRedisBus("redis://localhost:6379/0")
+    bus = AnalysisRedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()
     bus.client.hset = AsyncMock()
     bus.client.set = AsyncMock()
@@ -146,7 +146,7 @@ async def test_analysis_redis_bus_registers_metadata_without_direct_result_write
 
 @pytest.mark.anyio
 async def test_redis_bus_consumes_from_default_queue() -> None:
-    bus = RedisBus("redis://localhost:6379/0")
+    bus = RedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     task = TaskRequested.create("general worker prompt")
     bus.client.blpop = AsyncMock(return_value=("agent.tasks.general", task.to_json()))
 
@@ -159,7 +159,7 @@ async def test_redis_bus_consumes_from_default_queue() -> None:
 
 @pytest.mark.anyio
 async def test_redis_bus_consumes_from_configured_queue() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research", allow_unauthenticated_local_test=True)
     task = TaskRequested.create("research worker prompt")
     bus.client.blpop = AsyncMock(return_value=("agent.tasks.research", task.to_json()))
 
@@ -173,6 +173,10 @@ async def test_redis_bus_consumes_from_configured_queue() -> None:
 @pytest.mark.anyio
 async def test_run_worker_uses_task_queue_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.research")
     monkeypatch.setenv("AGENT_ID", "research-worker-1")
 
@@ -186,15 +190,19 @@ async def test_run_worker_uses_task_queue_env_var(monkeypatch: pytest.MonkeyPatc
         with pytest.raises(asyncio.CancelledError):
             await run_worker()
 
-        mock_bus_cls.assert_called_once_with(
-            "redis://localhost:6379/0",
-            queue_name="agent.tasks.research",
-        )
+        mock_bus_cls.assert_called_once()
+        _, bus_kwargs = mock_bus_cls.call_args
+        assert bus_kwargs["queue_name"] == "agent.tasks.research"
+        assert bus_kwargs["connection_config"].url == "redis://localhost:6379/0"
 
 
 @pytest.mark.anyio
 async def test_run_worker_defaults_to_general_queue(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.delenv("TASK_QUEUE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-1")
 
@@ -208,10 +216,10 @@ async def test_run_worker_defaults_to_general_queue(monkeypatch: pytest.MonkeyPa
         with pytest.raises(asyncio.CancelledError):
             await run_worker()
 
-        mock_bus_cls.assert_called_once_with(
-            "redis://localhost:6379/0",
-            queue_name="agent.tasks.general",
-        )
+        mock_bus_cls.assert_called_once()
+        _, bus_kwargs = mock_bus_cls.call_args
+        assert bus_kwargs["queue_name"] == "agent.tasks.general"
+        assert bus_kwargs["connection_config"].url == "redis://localhost:6379/0"
 
 
 @pytest.mark.anyio
@@ -221,7 +229,7 @@ async def test_redis_gateway_get_result_completed() -> None:
         build_terminal_outcome,
     )
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     command = CompletionCommand(
         completion_command_id="cmd-res-1",
         assignment_id="assign-res-1",
@@ -251,7 +259,7 @@ async def test_redis_gateway_get_result_completed() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_pending() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     # Outcome, then legacy result, then status, then claim_deadline
     gateway._client.get = AsyncMock(
         side_effect=[None, None, json.dumps({"task_id": "task-res-2", "status": "pending"}), None]
@@ -273,7 +281,7 @@ async def test_redis_gateway_get_result_failed_outcome_has_no_result() -> None:
         build_terminal_outcome,
     )
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     command = CompletionCommand(
         completion_command_id="cmd-res-fail",
         assignment_id="assign-res-fail",
@@ -301,7 +309,7 @@ async def test_redis_gateway_get_result_failed_outcome_has_no_result() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_legacy_result_remains_readable() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     legacy_data = {
         "task_id": "task-legacy-1",
         "status": "completed",
@@ -319,7 +327,7 @@ async def test_redis_gateway_get_result_legacy_result_remains_readable() -> None
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_result_unknown() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)
     gateway.events = AsyncMock(return_value=[])
 
@@ -356,7 +364,7 @@ def _completed_outcome_and_result(task_id: str = "task-fc-1") -> tuple[str, str]
 async def test_redis_gateway_get_result_completed_missing_result_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     outcome_json, _ = _completed_outcome_and_result()
     gateway._client.get = AsyncMock(side_effect=[outcome_json, None])
 
@@ -368,7 +376,7 @@ async def test_redis_gateway_get_result_completed_missing_result_fails_closed() 
 async def test_redis_gateway_get_result_completed_corrupt_result_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     outcome_json, _ = _completed_outcome_and_result()
     gateway._client.get = AsyncMock(side_effect=[outcome_json, "not-json{{{"])
 
@@ -381,7 +389,7 @@ async def test_redis_gateway_get_result_completed_wrong_task_result_fails_closed
     from agent_contracts import TaskResult
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     outcome_json, _ = _completed_outcome_and_result()
     other = TaskResult(task_id="task-elsewhere", output="canonical output")
     gateway._client.get = AsyncMock(side_effect=[outcome_json, other.to_json()])
@@ -395,7 +403,7 @@ async def test_redis_gateway_get_result_completed_non_completed_result_fails_clo
     from agent_contracts import TaskResult
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     outcome_json, _ = _completed_outcome_and_result()
     non_terminal = TaskResult(task_id="task-fc-1", output="canonical output", status="failed")
     gateway._client.get = AsyncMock(side_effect=[outcome_json, non_terminal.to_json()])
@@ -408,7 +416,7 @@ async def test_redis_gateway_get_result_completed_non_completed_result_fails_clo
 async def test_redis_gateway_get_result_failed_unexpected_result_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     from agent_contracts import CompletionCommand, build_terminal_outcome
 
     command = CompletionCommand(
@@ -437,7 +445,7 @@ async def test_redis_gateway_get_result_failed_unexpected_result_fails_closed() 
 async def test_redis_gateway_get_result_corrupt_outcome_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(side_effect=["not-json{{{"])
 
     with pytest.raises(CorruptAuthoritativeRecordError, match="Corrupt terminal outcome"):
@@ -448,7 +456,7 @@ async def test_redis_gateway_get_result_corrupt_outcome_fails_closed() -> None:
 async def test_redis_gateway_get_result_mismatched_outcome_task_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     outcome_json, _ = _completed_outcome_and_result(task_id="task-other")
     gateway._client.get = AsyncMock(side_effect=[outcome_json])
 
@@ -460,7 +468,7 @@ async def test_redis_gateway_get_result_mismatched_outcome_task_fails_closed() -
 async def test_redis_gateway_get_result_legacy_wrong_task_fails_closed() -> None:
     from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(
         side_effect=[None, json.dumps({"task_id": "task-elsewhere", "output": "x"})]
     )
@@ -471,7 +479,7 @@ async def test_redis_gateway_get_result_legacy_wrong_task_fails_closed() -> None
 
 @pytest.mark.anyio
 async def test_research_redis_bus_exposes_no_direct_result_write() -> None:
-    bus = ResearchRedisBus("redis://localhost:6379/0")
+    bus = ResearchRedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     bus.client.set = AsyncMock()
 
     # Canonical completion flows through the Orchestrator boundary; the bus
@@ -482,7 +490,7 @@ async def test_research_redis_bus_exposes_no_direct_result_write() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_agents_parses_capability_metadata() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.smembers = AsyncMock(return_value={"worker-1", "research-agent-1"})  # type: ignore[method-assign]
 
     async def mock_hgetall(key: str) -> dict[str, str]:
@@ -535,7 +543,7 @@ async def test_redis_gateway_agents_parses_capability_metadata() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_agents_legacy_fallback() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.smembers = AsyncMock(return_value={"legacy-agent"})  # type: ignore[method-assign]
     gateway._client.hgetall = AsyncMock(  # type: ignore[method-assign]
         return_value={
@@ -560,7 +568,7 @@ async def test_redis_gateway_agents_legacy_fallback() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_inference_telemetry_newest_successful() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     telem_cf_failed = InferenceExecutionTelemetry(
         provider_name="cloudflare",
         attempt_index=0,
@@ -610,7 +618,7 @@ async def test_redis_gateway_task_inference_telemetry_newest_successful() -> Non
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_inference_telemetry_surfaces_failed_attempts() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     telem_failed = InferenceExecutionTelemetry(
         provider_name="cloudflare",
@@ -652,7 +660,7 @@ async def test_redis_gateway_task_inference_telemetry_surfaces_failed_attempts()
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_inference_telemetry_ignores_other_tasks() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     telem_success = InferenceExecutionTelemetry(
         provider_name="gemini",
@@ -679,7 +687,7 @@ async def test_redis_gateway_task_inference_telemetry_ignores_other_tasks() -> N
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_inference_telemetry_handles_malformed_and_invalid() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     gateway._client.xrevrange = AsyncMock(  # type: ignore[method-assign]
         return_value=[
@@ -720,7 +728,7 @@ async def test_redis_gateway_task_inference_telemetry_handles_malformed_and_inva
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_inference_telemetry_returns_none_when_empty() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     gateway._client.xrevrange = AsyncMock(return_value=[])  # type: ignore[method-assign]
 
@@ -732,7 +740,7 @@ async def test_redis_gateway_task_inference_telemetry_returns_none_when_empty() 
 async def test_redis_gateway_event_stream_read_failure_raises_telemetry_storage_error() -> None:
     from orchestrator.application.ports import TelemetryStorageError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     gateway._client.xrevrange = AsyncMock(side_effect=redis.ConnectionError("Connection refused"))  # type: ignore[method-assign]
 
@@ -744,7 +752,7 @@ async def test_redis_gateway_event_stream_read_failure_raises_telemetry_storage_
 async def test_redis_gateway_durable_key_read_failure_raises_telemetry_storage_error() -> None:
     from orchestrator.application.ports import TelemetryStorageError
 
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(side_effect=redis.RedisError("Redis cluster error"))  # type: ignore[method-assign]
 
     with pytest.raises(TelemetryStorageError, match="Task durable state storage unavailable"):

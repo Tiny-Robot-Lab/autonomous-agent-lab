@@ -19,6 +19,7 @@ from orchestrator.application import (
     SubmitTask,
     TaskDispatcher,
 )
+from orchestrator.config import Settings
 from orchestrator.domain import (
     AgentCapability,
     CandidateSelectionPolicy,
@@ -158,6 +159,10 @@ async def test_worker_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-worker-queue")
 
@@ -181,6 +186,10 @@ async def test_worker_registers_configured_dispatch_target(
 @pytest.mark.anyio
 async def test_worker_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -204,6 +213,10 @@ async def test_research_agent_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-research-queue")
 
@@ -229,6 +242,10 @@ async def test_research_agent_registers_configured_dispatch_target(
 @pytest.mark.anyio
 async def test_research_agent_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -251,7 +268,7 @@ async def test_research_agent_default_dispatch_target(monkeypatch: pytest.Monkey
 
 @pytest.mark.anyio
 async def test_worker_redis_bus_persists_dispatch_target_in_hash() -> None:
-    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.worker-pool-1")
+    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.worker-pool-1", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -271,7 +288,7 @@ async def test_worker_redis_bus_persists_dispatch_target_in_hash() -> None:
 
 @pytest.mark.anyio
 async def test_research_redis_bus_persists_dispatch_target_in_hash() -> None:
-    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research-alpha")
+    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research-alpha", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -585,7 +602,7 @@ async def test_candidate_with_blank_dispatch_target_fails_explicitly() -> None:
 
 @pytest.mark.anyio
 async def test_production_dynamic_dispatch_via_redis_gateway_never_depends_on_capability_queue_map() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -662,7 +679,7 @@ async def test_legacy_non_dynamic_path_preserves_enqueue_for_isolated_callers() 
 
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -688,7 +705,7 @@ async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target()
 
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_rejects_empty_target() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     task = TaskRequested.create("Some prompt")
 
     with pytest.raises(ValueError, match="Dispatch target must be a non-empty string"):
@@ -697,7 +714,7 @@ async def test_redis_gateway_dispatch_rejects_empty_target() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_result_lifecycle_after_dispatch() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     task_id = "test-task-lifecycle-123"
 
     # 1. While task is pending (written by dispatch)
@@ -744,6 +761,7 @@ async def test_api_create_task_dispatches_to_advertised_target() -> None:
     finder = FakeCandidateFinder({"general": [candidate]})
 
     app = create_app(
+        settings=Settings(),
         task_queue=queue,
         candidate_finder=finder,
         enforce_availability=True,
@@ -775,6 +793,7 @@ async def test_api_create_task_returns_503_when_no_candidates() -> None:
     finder = FakeCandidateFinder({"general": []})
 
     app = create_app(
+        settings=Settings(),
         task_queue=queue,
         candidate_finder=finder,
         enforce_availability=True,

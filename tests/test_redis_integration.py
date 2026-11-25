@@ -144,8 +144,8 @@ async def clean_redis(redis_url: str) -> AsyncGenerator[str, None]:
 
 
 async def test_redis_connection_and_client_lifecycle(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis, queue_name=f"agent.tasks.test_{uuid.uuid4().hex[:8]}")
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
+    bus = WorkerRedisBus(clean_redis, queue_name=f"agent.tasks.test_{uuid.uuid4().hex[:8]}", allow_unauthenticated_local_test=True)
 
     try:
         gateway_pong = await gateway._client.ping()
@@ -160,8 +160,8 @@ async def test_redis_connection_and_client_lifecycle(clean_redis: str) -> None:
 
 async def test_redis_task_dispatch_and_consumption_round_trip(clean_redis: str) -> None:
     queue_name = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis, queue_name=queue_name)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
+    bus = WorkerRedisBus(clean_redis, queue_name=queue_name, allow_unauthenticated_local_test=True)
 
     try:
         task = TaskRequested.create("Perform integration analysis on real Redis wire protocol")
@@ -258,8 +258,8 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
     parent projection with a single Research hint, and that agent events stay
     observational.
     """
-    gateway = RedisGateway(clean_redis)
-    bus = AnalysisRedisBus(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
+    bus = AnalysisRedisBus(clean_redis, allow_unauthenticated_local_test=True)
     agent_id = f"analysis-agent-{uuid.uuid4().hex[:8]}"
     metadata = AgentCapabilityMetadata(
         agent_id=agent_id,
@@ -482,7 +482,7 @@ async def test_redis_completion_persistence_and_canonical_retrieval_round_trip(
     from orchestrator.application.use_cases import AcknowledgeAssignment, ClaimTask
     from orchestrator.domain.principal import RuntimePrincipal
 
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     proof_pepper = "test_completion_redis_proof_pepper_4567890123456789"
     claim_uc = ClaimTask(task_store=gateway, assignment_proof_pepper=proof_pepper, delivery_lease_seconds=30.0)
     ack_uc = AcknowledgeAssignment(task_store=gateway, assignment_proof_pepper=proof_pepper)
@@ -642,8 +642,8 @@ async def test_redis_completion_persistence_and_canonical_retrieval_round_trip(
 
 
 async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
+    bus = WorkerRedisBus(clean_redis, allow_unauthenticated_local_test=True)
 
     try:
         agent_id = f"worker_{uuid.uuid4().hex[:8]}"
@@ -703,7 +703,7 @@ async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:
 async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
     clean_redis: str,
 ) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         root_task = TaskRequested.create("Root task for Redis integration lifecycle")
 
@@ -764,7 +764,7 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
 
 
 async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         root_task = TaskRequested.create("Root task for child atomicity test")
         await gateway.register_root_task(root_task)
@@ -812,7 +812,7 @@ async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
 async def test_redis_deterministic_sorted_get_children_retrieval(
     clean_redis: str,
 ) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         root_task = TaskRequested.create("Root task for sorted children test")
         await gateway.register_root_task(root_task)
@@ -860,7 +860,7 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
 
 
 async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         task_id = f"task_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1006,7 +1006,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
 
 
 async def test_redis_root_registration_marker_concurrency_and_partial_init(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         now = "2026-11-16T12:00:00+00:00"
         task_id = f"root_{uuid.uuid4().hex[:8]}"
@@ -1133,7 +1133,7 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
 
 
 async def test_redis_continuation_latest_pointer_corruption_and_regression(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         p_id = f"parent_{uuid.uuid4().hex[:8]}"
         c_id = f"child_{uuid.uuid4().hex[:8]}"
@@ -1200,7 +1200,7 @@ async def test_redis_continuation_latest_pointer_corruption_and_regression(clean
 
 
 async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1306,7 +1306,7 @@ async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clea
 
 
 async def test_redis_authority_grant_write_once_and_conflict(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         t_id = f"root_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1368,7 +1368,7 @@ async def test_redis_authority_grant_write_once_and_conflict(clean_redis: str) -
 
 
 async def test_redis_atomic_claim_acknowledgement_and_fencing_lifecycle(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         past = "2020-01-01T00:00:00Z"
@@ -1526,7 +1526,7 @@ async def test_redis_atomic_claim_acknowledgement_and_fencing_lifecycle(clean_re
 
 @pytest.mark.anyio
 async def test_redis_concurrent_claim_attempts_atomicity(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1587,7 +1587,7 @@ async def test_redis_concurrent_claim_attempts_atomicity(redis_url: str) -> None
 
 @pytest.mark.anyio
 async def test_redis_proof_digest_state_and_idempotent_replay(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1644,7 +1644,7 @@ async def test_redis_proof_digest_state_and_idempotent_replay(redis_url: str) ->
 
 @pytest.mark.anyio
 async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     client = redis.from_url(redis_url, decode_responses=False)
     try:
         now = datetime.now(UTC).isoformat()
@@ -1697,7 +1697,7 @@ async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) 
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     client = redis.from_url(redis_url, decode_responses=False)
     try:
         now = datetime.now(UTC).isoformat()
@@ -1756,7 +1756,7 @@ async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
 @pytest.mark.anyio
 async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
     # Gateway configured in authenticated_claim mode
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         secret_prompt = "TOP_SECRET_PROMPT_DO_NOT_LEAK_IN_HINT_QUEUE"
@@ -1820,7 +1820,7 @@ async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
         await client.aclose()
         await gateway.aclose()
 async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         t_id = f"root_{uuid.uuid4().hex[:8]}"
@@ -1944,14 +1944,15 @@ async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_
         assert raw_status_before is not None
         res_corrupt_grant = await client.eval(
             CLAIM_TASK_LUA,
-            7,
+            8,
             f"task.status:{t_id}",
             f"task.claim:{t_id}",
             f"task.fence:{t_id}",
-            f"task.authority_grant:{t_id}:some_grant",  # grant key provided
             f"task.required_capability:{t_id}",
             f"task.continuation_latest:{t_id}",
             f"task.authority:{t_id}",
+            f"task.claim_deadline:{t_id}",
+            f"task.authority_grant:{t_id}:some_grant",  # grant key provided at KEYS[8]
             t_id,
             now,
             "principal-research-2",
@@ -2050,7 +2051,7 @@ async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -2163,7 +2164,7 @@ async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -2245,7 +2246,7 @@ async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) ->
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         t_id = f"cont_root_{uuid.uuid4().hex[:8]}"
@@ -2284,10 +2285,10 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
             f"task.status:{t_id}",
             f"task.claim:{t_id}",
             f"task.fence:{t_id}",
-            "",
             f"task.required_capability:{t_id}",
             f"task.continuation_latest:{t_id}",
             f"task.authority:{t_id}",
+            f"task.claim_deadline:{t_id}",
         ]
         res_fractional = await client.eval(
             CLAIM_TASK_LUA,
@@ -2372,7 +2373,7 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_child_registration_atomic_boundary_and_immutability(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         root_id = f"root_{uuid.uuid4().hex[:8]}"
@@ -2461,8 +2462,8 @@ async def test_redis_child_registration_atomic_boundary_and_immutability(clean_r
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean_redis: str) -> None:
-    gateway_claim = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    gateway_legacy = RedisGateway(clean_redis, delivery_mode="legacy_push")
+    gateway_claim = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
+    gateway_legacy = RedisGateway(clean_redis, delivery_mode="legacy_push", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         t_id_1 = f"task_{uuid.uuid4().hex[:8]}"
@@ -2537,7 +2538,7 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
 
 @pytest.mark.anyio
 async def test_redis_registration_capability_validation_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         now = datetime.now(UTC).isoformat()
@@ -2644,7 +2645,7 @@ async def test_redis_registration_capability_validation_and_zero_mutation(clean_
 
 @pytest.mark.anyio
 async def test_redis_delegation_acceptance_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         now = datetime.now(UTC).isoformat()
@@ -2964,7 +2965,7 @@ async def test_redis_delegation_acceptance_and_zero_mutation(clean_redis: str) -
 @pytest.mark.anyio
 async def test_redis_lua_delegation_authority_and_artifact_validations(clean_redis: str) -> None:
     client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_val_{uuid.uuid4().hex[:8]}"
 
@@ -3476,7 +3477,7 @@ async def assert_zero_delegation_mutations(
 @pytest.mark.anyio
 async def test_redis_lua_delegation_zero_mutation_rejection_coverage(clean_redis: str) -> None:
     client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_rej_{uuid.uuid4().hex[:8]}"
     prop_id = "prop-rej-1"
@@ -3854,7 +3855,7 @@ async def test_redis_lua_delegation_zero_mutation_rejection_coverage(clean_redis
 @pytest.mark.anyio
 async def test_redis_concurrent_first_acceptance_atomicity(clean_redis: str) -> None:
     client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    gateway = RedisGateway(clean_redis, allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_conc_{uuid.uuid4().hex[:8]}"
     prop_id = "prop-conc-1"
@@ -4165,7 +4166,7 @@ def _build_test_proposal(
 
 
 async def test_redis_lua_delegation_exact_bounds_enforcement(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
@@ -4278,7 +4279,7 @@ async def test_redis_lua_delegation_exact_bounds_enforcement(clean_redis: str) -
         await gateway.aclose()
 
 async def test_redis_lua_delegation_parent_input_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
@@ -4408,7 +4409,7 @@ async def test_redis_lua_delegation_parent_input_validation(clean_redis: str) ->
         await gateway.aclose()
 
 async def test_redis_lua_delegation_artifact_provenance_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
@@ -4459,7 +4460,7 @@ async def test_redis_lua_delegation_artifact_provenance_validation(clean_redis: 
         await gateway.aclose()
 
 async def test_redis_lua_delegation_bound_agent_id_enforcement(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim", allow_unauthenticated_local_test=True)
     client = redis.from_url(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)

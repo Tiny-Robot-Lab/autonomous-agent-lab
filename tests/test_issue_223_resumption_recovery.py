@@ -1138,7 +1138,7 @@ async def test_redis_bus_bounded_queue_fairness_alternation() -> None:
     from agent_contracts import WakeUpHint
     from research_agent.infrastructure.redis_bus import RedisBus
 
-    bus = RedisBus("redis://fake:6379/0", queue_name="tasks", hint_queue="hints")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="tasks", hint_queue="hints", allow_unauthenticated_local_test=True)
 
     # Simulate client.blpop returning results from whichever queue was prioritized
     call_log: list[list[str]] = []
@@ -1567,7 +1567,7 @@ async def test_redis_adapter_single_get_calls() -> None:
 
     from orchestrator.infrastructure.redis_adapter import RedisGateway
 
-    gw = RedisGateway(url="redis://localhost:6379/0")
+    gw = RedisGateway(url="redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_client = AsyncMock()
     gw._client = mock_client
 
@@ -1607,7 +1607,7 @@ async def test_redis_adapter_eval_executes_exactly_once() -> None:
     from agent_contracts import ActiveClaim, RecoveryDecisionCommand
     from orchestrator.infrastructure.redis_adapter import RedisGateway
 
-    gw = RedisGateway(url="redis://localhost:6379/0")
+    gw = RedisGateway(url="redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_client = AsyncMock()
     gw._client = mock_client
 
@@ -1887,7 +1887,7 @@ async def test_redis_adapter_eval_response_error_handling() -> None:
     from orchestrator.infrastructure.redis_adapter import RedisGateway
     from redis.exceptions import ResponseError
 
-    gw = RedisGateway(url="redis://localhost:6379/0")
+    gw = RedisGateway(url="redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_client = AsyncMock()
     gw._client = mock_client
 
@@ -2134,7 +2134,7 @@ async def test_transition_expired_claim_preserves_explicit_now_and_propagates_ty
     from agent_contracts import ClaimExpiryRecord
     from orchestrator.infrastructure.redis_adapter import RedisGateway
 
-    gw = RedisGateway(url="redis://localhost:6379/0")
+    gw = RedisGateway(url="redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_client = AsyncMock()
     gw._client = mock_client
 

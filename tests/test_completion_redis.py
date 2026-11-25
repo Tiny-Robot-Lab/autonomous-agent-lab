@@ -75,7 +75,7 @@ def redis_url() -> str:
 
 @pytest.fixture
 async def clean_gateway(redis_url: str) -> AsyncGenerator[RedisGateway, None]:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         await asyncio.wait_for(gateway._client.ping(), timeout=1.0)
     except (redis.ConnectionError, OSError) as exc:

@@ -93,7 +93,7 @@ def redis_url() -> str:
 
 @pytest.fixture
 async def clean_gateway(redis_url: str) -> AsyncGenerator[RedisGateway, None]:
-    gateway = RedisGateway(redis_url)
+    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         await asyncio.wait_for(gateway._client.ping(), timeout=1.0)
     except (redis.ConnectionError, OSError) as exc:
@@ -686,7 +686,7 @@ async def test_redis_resumed_research_e2e_flow(clean_gateway: RedisGateway, redi
     assert "battery storage capacity is 85% viable" in ctx.child_result.output
 
     # 8. Run ResearchProcessor for resumed turn
-    bus = RedisBus(redis_url)
+    bus = RedisBus(redis_url, allow_unauthenticated_local_test=True)
     executor = StubResearchExecutor()
     provider = StubInferenceProvider()
     processor = ResearchProcessor(
@@ -964,7 +964,7 @@ async def test_redis_queue_fairness_interleaving(
     queue_name = f"fair.tasks.{uuid4().hex[:6]}"
     hint_queue = f"fair.hints.{uuid4().hex[:6]}"
 
-    bus = RedisBus(redis_url, queue_name=queue_name, hint_queue=hint_queue)
+    bus = RedisBus(redis_url, queue_name=queue_name, hint_queue=hint_queue, allow_unauthenticated_local_test=True)
 
     try:
         # Push 3 hints and 3 tasks
@@ -1416,8 +1416,8 @@ async def test_redis_evaluate_expiry_child_deadline(
 async def test_redis_race_pull_claim_vs_child_timeout(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url)
-    gw2 = RedisGateway(redis_url)
+    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         parent_id = f"parent-race-{uuid4().hex[:8]}"
         child_id = f"child-race-{uuid4().hex[:8]}"
@@ -1493,8 +1493,8 @@ async def test_redis_race_pull_claim_vs_child_timeout(
 async def test_redis_race_completion_vs_acknowledged_expiry(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url)
-    gw2 = RedisGateway(redis_url)
+    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         task_id = f"task-race-comp-{uuid4().hex[:8]}"
         now_dt = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
@@ -1579,8 +1579,8 @@ async def test_redis_race_completion_vs_acknowledged_expiry(
 async def test_redis_race_recovery_resolution_vs_pull_claim(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url)
-    gw2 = RedisGateway(redis_url)
+    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
     try:
         task_id = f"task-race-rec-{uuid4().hex[:8]}"
         now_dt = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)

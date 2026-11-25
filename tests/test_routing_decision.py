@@ -318,7 +318,7 @@ async def test_submit_task_records_routing_decision_on_legacy_fallback() -> None
 
 @pytest.mark.anyio
 async def test_redis_gateway_records_and_reads_routing_decision() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.set = AsyncMock()
     gateway._client.get = AsyncMock()
     gateway._client.xadd = AsyncMock()
@@ -351,7 +351,7 @@ async def test_redis_gateway_records_and_reads_routing_decision() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_routing_decision_falls_back_to_events_stream() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.get = AsyncMock(return_value=None)
     # Stream returns an event with routing_decision
     gateway.events = AsyncMock(

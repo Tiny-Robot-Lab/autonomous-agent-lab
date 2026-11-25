@@ -7,6 +7,7 @@ from agent_contracts import (
     ArtifactReference,
     RecoveryDecisionCommand,
     __version__,
+    sanitize_redis_url,
 )
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -749,10 +750,26 @@ def create_app(
     # is provided), create exactly one RedisGateway used coherently across all ports.
     # When an explicit task_store, dispatcher, or task_queue identifies the backend,
     # do not auto-create an extra RedisGateway.
+    # Fail closed: auto-construction requires a validated authenticated
+    # RedisConnectionConfig. Never auto-create an unauthenticated gateway from
+    # Settings.redis_url. Tests must inject an explicit backend or gateway.
     if gateway is None and task_store is None and dispatcher is None and task_queue is None:
+        connection_config = resolved_settings.redis_connection
+        if connection_config is None or not connection_config.is_authenticated:
+            if connection_config is not None:
+                endpoint = connection_config.sanitized_url
+            else:
+                endpoint = sanitize_redis_url(resolved_settings.redis_url)
+            raise ValueError(
+                "Invalid Redis configuration: create_app requires a validated "
+                "authenticated RedisConnectionConfig to auto-construct RedisGateway "
+                f"(endpoint {endpoint}); configure REDIS_USERNAME/REDIS_PASSWORD_FILE "
+                "via Settings.from_env, or inject an explicit gateway/task_store backend"
+            )
         gateway = RedisGateway(
             resolved_settings.redis_url,
             delivery_mode=resolved_settings.task_delivery_mode,
+            connection_config=connection_config,
         )
 
     # 2. AuthoritativeTaskStore linear resolution
@@ -1001,4 +1018,23 @@ def create_app(
     return app
 
 
-app = create_app()
+# NOTE: The ASGI application is bound lazily (PEP 562 module __getattr__) rather
+# than at module level so that importing this module has no Redis-configuration
+# side effect. create_app() resolves Settings.from_env(), which fails closed
+# without validated REDIS_USERNAME/REDIS_PASSWORD_FILE credentials or an
+# explicit REDIS_AUTH_MODE='unauthenticated_local_test' loopback opt-in; a
+# module-level `app = create_app()` would therefore raise during test
+# collection (and whenever the live DB-15 REDIS_URL fixture is set without
+# credentials). Uvicorn still resolves the "orchestrator.presentation.api:app"
+# attribute path through this hook on first access, and the resolved app is
+# cached for repeated access.
+_default_app: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    if name == "app":
+        global _default_app
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

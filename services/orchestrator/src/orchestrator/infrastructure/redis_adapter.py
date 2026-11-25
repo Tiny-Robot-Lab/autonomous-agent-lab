@@ -19,6 +19,7 @@ from agent_contracts import (
     InferenceExecutionTelemetry,
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
+    RedisConnectionConfig,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     RoutingDecision,
@@ -34,6 +35,7 @@ from agent_contracts import (
     build_terminal_outcome,
     canonical_json_dumps,
     normalize_canonical_utc_timestamp,
+    resolve_client_connection_kwargs,
 )
 from redis.exceptions import ResponseError
 
@@ -396,11 +398,11 @@ CLAIM_TASK_LUA = """
 local status_key = KEYS[1]
 local claim_key = KEYS[2]
 local fence_key = KEYS[3]
-local grant_key = KEYS[4]
-local capability_key = KEYS[5]
-local continuation_latest_key = KEYS[6]
-local authority_key = KEYS[7]
-local deadline_key = KEYS[8]
+local capability_key = KEYS[4]
+local continuation_latest_key = KEYS[5]
+local authority_key = KEYS[6]
+local deadline_key = KEYS[7]
+local grant_key = KEYS[8]
 
 local task_id = ARGV[1]
 local now_iso = ARGV[2]
@@ -591,7 +593,7 @@ if cur_fence + 1 ~= expected_epoch then
 end
 
 -- 9. Grant key and payload pairing: both absent/empty or both present/nonempty
-local has_grant_key = (grant_key ~= nil and grant_key ~= '')
+local has_grant_key = (type(grant_key) == "string" and grant_key ~= "")
 local has_grant_payload = (grant_payload ~= nil and grant_payload ~= '')
 
 if has_grant_key ~= has_grant_payload then
@@ -2146,8 +2148,24 @@ return {'OK', decision_record_json, restored_status}
 
 
 class RedisGateway:
-    def __init__(self, url: str, delivery_mode: str = "legacy_push") -> None:
-        self._client = redis.from_url(url, decode_responses=True)
+    def __init__(
+        self,
+        url: str,
+        delivery_mode: str = "legacy_push",
+        *,
+        connection_config: RedisConnectionConfig | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        allow_unauthenticated_local_test: bool = False,
+    ) -> None:
+        resolved_url, client_kwargs = resolve_client_connection_kwargs(
+            url,
+            connection_config=connection_config,
+            username=username,
+            password=password,
+            allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        )
+        self._client = redis.from_url(resolved_url, **client_kwargs)
         self._delivery_mode = delivery_mode
 
     async def register_root_task(
@@ -2547,24 +2565,26 @@ class RedisGateway:
         index_key = f"task.artifacts:{clean_task_id}"
         claim_key = f"task.claim:{clean_task_id}"
         fence_key = f"task.fence:{clean_task_id}"
-        prior_key = (
-            f"task.artifact:{clean_task_id}:"
-            f"{artifact.artifact_id}:{artifact.artifact_version - 1}"
-            if artifact.artifact_version > 1
-            else ""
-        )
         payload = artifact.to_json()
         index_member = f"{artifact.artifact_id}:{artifact.artifact_version}"
+
+        keys = [
+            target_key,
+            index_key,
+            claim_key,
+            fence_key,
+        ]
+        if artifact.artifact_version > 1:
+            keys.append(
+                f"task.artifact:{clean_task_id}:"
+                f"{artifact.artifact_id}:{artifact.artifact_version - 1}"
+            )
 
         try:
             raw_result = await self._client.eval(
                 SAVE_STAGE_ARTIFACT_LUA,
-                5,
-                target_key,
-                index_key,
-                claim_key,
-                fence_key,
-                prior_key,
+                len(keys),
+                *keys,
                 artifact.artifact_version,
                 payload,
                 index_member,
@@ -2877,7 +2897,6 @@ class RedisGateway:
         status_key = f"task.status:{clean_task_id}"
         claim_key = f"task.claim:{clean_task_id}"
         fence_key = f"task.fence:{clean_task_id}"
-        grant_key = f"task.authority_grant:{claim.root_task_id}:{grant.grant_id}" if grant else ""
         capability_key = f"task.required_capability:{clean_task_id}"
         continuation_latest_key = f"task.continuation_latest:{clean_task_id}"
         authority_key = f"task.authority:{claim.root_task_id}"
@@ -2891,21 +2910,24 @@ class RedisGateway:
             "task_id": clean_task_id,
         })
 
+        # Keep the seven always-required keys at KEYS[1..7]; append the
+        # authority grant key as KEYS[8] only when a grant is supplied.
         keys = [
             status_key,
             claim_key,
             fence_key,
-            grant_key or "",
             capability_key,
             continuation_latest_key,
             authority_key,
             deadline_key,
         ]
+        if grant is not None:
+            keys.append(f"task.authority_grant:{claim.root_task_id}:{grant.grant_id}")
 
         try:
             raw_res = await self._client.eval(
                 CLAIM_TASK_LUA,
-                8,
+                len(keys),
                 *keys,
                 clean_task_id,
                 now_iso,

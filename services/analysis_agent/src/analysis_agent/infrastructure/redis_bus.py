@@ -8,8 +8,10 @@ from agent_contracts import (
     AgentCapabilityMetadata,
     AgentEvent,
     AgentHeartbeat,
+    RedisConnectionConfig,
     TaskRequested,
     WakeUpHint,
+    resolve_client_connection_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,8 +50,20 @@ class RedisBus:
         url: str,
         queue_name: str = "agent.tasks.analysis",
         hint_queue: str = "agent.hints.analysis",
+        *,
+        connection_config: RedisConnectionConfig | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        allow_unauthenticated_local_test: bool = False,
     ) -> None:
-        self.client = redis.from_url(url, decode_responses=True)
+        resolved_url, client_kwargs = resolve_client_connection_kwargs(
+            url,
+            connection_config=connection_config,
+            username=username,
+            password=password,
+            allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        )
+        self.client = redis.from_url(resolved_url, **client_kwargs)
         self.queue_name = queue_name
         self.hint_queue = hint_queue
         self.current_state = "idle"

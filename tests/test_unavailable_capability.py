@@ -16,6 +16,7 @@ from orchestrator.application import (
     FindCandidatesByCapability,
     SubmitTask,
 )
+from orchestrator.config import Settings
 from orchestrator.domain import (
     AgentCapability,
     CapabilityUnavailableError,
@@ -325,6 +326,7 @@ async def test_presentation_layer_returns_http_503_unavailable_response() -> Non
     fake_queue = FakeTaskQueue()
     # Empty state reader -> zero eligible candidates
     app = create_app(
+        settings=Settings(),
         task_queue=fake_queue,
         state_reader=FakeStateReader(agents_data=[]),
         enforce_availability=True,
@@ -359,6 +361,7 @@ async def test_presentation_layer_successful_submission_returns_202_accepted() -
         ]
     )
     app = create_app(
+        settings=Settings(),
         task_queue=fake_queue,
         state_reader=reader,
         enforce_availability=True,
@@ -385,6 +388,7 @@ async def test_malformed_requests_retain_existing_validation_behavior() -> None:
     # 2. Domain Task level validation in create_task
     fake_queue = FakeTaskQueue()
     app = create_app(
+        settings=Settings(),
         task_queue=fake_queue,
         state_reader=FakeStateReader(agents_data=[]),
         enforce_availability=True,
@@ -405,7 +409,7 @@ async def test_malformed_requests_retain_existing_validation_behavior() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_publish_operational_event() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.xadd = AsyncMock()
 
     event = AgentEvent.create(

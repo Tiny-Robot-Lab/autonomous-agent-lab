@@ -224,6 +224,10 @@ async def test_analysis_agent_malformed_hints_never_claim(monkeypatch: pytest.Mo
         mock_hb.return_value.start = MagicMock()
         mock_hb.return_value.stop = AsyncMock()
         monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         with pytest.raises(TimeoutError, match="exit"):
             await run_analysis_agent()
@@ -290,6 +294,10 @@ async def test_analysis_agent_valid_hint_claims_and_runs(monkeypatch: pytest.Mon
         mock_hb.return_value.start = MagicMock()
         mock_hb.return_value.stop = AsyncMock()
         monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         with pytest.raises(TimeoutError, match="exit"):
             await run_analysis_agent()
@@ -365,6 +373,10 @@ async def test_analysis_agent_direct_task_requested_still_processed(monkeypatch:
         mock_hb.return_value.start = MagicMock()
         mock_hb.return_value.stop = AsyncMock()
         monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         with pytest.raises(TimeoutError, match="exit"):
             await run_analysis_agent()
@@ -504,7 +516,7 @@ async def test_analysis_bus_alternation_fairness() -> None:
         mock_client = AsyncMock()
         mock_redis_factory.return_value = mock_client
 
-        bus = RedisBus("redis://fake", queue_name="agent.tasks.analysis", hint_queue="agent.hints.analysis")
+        bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.analysis", hint_queue="agent.hints.analysis", allow_unauthenticated_local_test=True)
 
         # Mock blpop returning hint first, then task
         mock_client.blpop = AsyncMock(
@@ -553,9 +565,10 @@ async def test_analysis_bus_idle_timeout_does_not_toggle_precedence() -> None:
         mock_redis_factory.return_value = mock_client
 
         bus = RedisBus(
-            "redis://fake",
+            "redis://localhost:6379/0",
             queue_name="agent.tasks.analysis",
             hint_queue="agent.hints.analysis",
+            allow_unauthenticated_local_test=True,
         )
 
         # Initial state: hints preferred
@@ -721,6 +734,10 @@ async def test_analysis_agent_initial_wake_up_hint_claims_and_runs(monkeypatch: 
         mock_hb.return_value.start = MagicMock()
         mock_hb.return_value.stop = AsyncMock()
         monkeypatch.setenv("RUNTIME_TOKEN", "valid-token")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         with pytest.raises(TimeoutError, match="exit"):
             await run_analysis_agent()

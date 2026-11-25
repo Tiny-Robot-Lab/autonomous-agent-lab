@@ -25,6 +25,10 @@ from tests.test_application import (
     FakeStateReader,
     FakeTaskQueue,
 )
+from tests.test_authoritative_task_store import (
+    InMemoryAuthoritativeTaskStore,
+    MockAtomicDispatcher,
+)
 
 
 def test_task_input_rejects_empty_prompt() -> None:
@@ -84,7 +88,8 @@ async def test_dashboard_displays_primary_logo() -> None:
 async def test_static_logo_endpoint_serves_image() -> None:
     import httpx
 
-    app = create_app()
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=Settings(), task_store=store, dispatcher=MockAtomicDispatcher(store))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -107,7 +112,8 @@ async def test_dashboard_references_favicon() -> None:
 async def test_favicon_endpoints_serve_assets() -> None:
     import httpx
 
-    app = create_app()
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=Settings(), task_store=store, dispatcher=MockAtomicDispatcher(store))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -190,8 +196,11 @@ async def test_events_endpoint_preserves_inference_telemetry() -> None:
             }
         ]
     )
+    telemetry_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=telemetry_store,
+        dispatcher=MockAtomicDispatcher(telemetry_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -261,8 +270,11 @@ async def test_get_task_result_endpoint_completed() -> None:
             }
         }
     )
+    result_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=result_store,
+        dispatcher=MockAtomicDispatcher(result_store),
         result_reader=fake_results,
     )
     req = Request({"type": "http", "app": app})
@@ -278,8 +290,11 @@ async def test_get_task_result_endpoint_completed() -> None:
 @pytest.mark.anyio
 async def test_get_task_result_endpoint_pending() -> None:
     fake_results = FakeResultReader(pending={"task-waiting-1"})
+    result_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=result_store,
+        dispatcher=MockAtomicDispatcher(result_store),
         result_reader=fake_results,
     )
     req = Request({"type": "http", "app": app})
@@ -295,8 +310,11 @@ async def test_get_task_result_endpoint_pending() -> None:
 @pytest.mark.anyio
 async def test_get_task_result_endpoint_not_found() -> None:
     fake_results = FakeResultReader()
+    result_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=result_store,
+        dispatcher=MockAtomicDispatcher(result_store),
         result_reader=fake_results,
     )
     req = Request({"type": "http", "app": app})
@@ -335,8 +353,11 @@ async def test_agents_endpoint_returns_capability_metadata() -> None:
             },
         ]
     )
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -474,6 +495,7 @@ async def test_dashboard_html_contains_routing_progression_elements() -> None:
 async def test_unavailable_capability_503_response_includes_task_id() -> None:
     fake_queue = FakeTaskQueue()
     app = create_app(
+        settings=Settings(),
         task_queue=fake_queue,
         state_reader=FakeStateReader(agents_data=[]),
         enforce_availability=True,
@@ -528,8 +550,11 @@ async def test_presentation_task_routing_endpoint_serves_routing_decision() -> N
         routing_decisions={"task-route-1": decision_payload}
     )
 
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -550,8 +575,11 @@ async def test_presentation_task_routing_endpoint_not_found() -> None:
     from orchestrator.presentation.api import task_routing
 
     fake_reader = FakeStateReader()
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -981,8 +1009,11 @@ async def test_api_tasks_telemetry_success() -> None:
             }
         ]
     )
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -999,8 +1030,11 @@ async def test_api_tasks_telemetry_success() -> None:
 @pytest.mark.anyio
 async def test_api_tasks_telemetry_not_found() -> None:
     fake_reader = FakeStateReader(events_data=[])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -1013,8 +1047,11 @@ async def test_api_tasks_telemetry_not_found() -> None:
 @pytest.mark.anyio
 async def test_api_tasks_telemetry_empty_task_id_rejected() -> None:
     fake_reader = FakeStateReader(events_data=[])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -1065,8 +1102,11 @@ async def test_api_events_serves_task_correlated_inference_telemetry() -> None:
         inference_telemetry=telem,
     )
     fake_reader = FakeStateReader(events_data=[event.to_dict()])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -1369,8 +1409,11 @@ async def test_api_events_serves_fallback_transition() -> None:
         fallback_transition=transition,
     )
     fake_reader = FakeStateReader(events_data=[event.to_dict()])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -1866,8 +1909,11 @@ async def test_api_events_serves_tool_execution_telemetry_success() -> None:
         tool_execution_telemetry=telemetry,
     )
     fake_reader = FakeStateReader(events_data=[event.to_dict()])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})
@@ -1915,8 +1961,11 @@ async def test_api_events_serves_tool_execution_telemetry_failure_with_error_cod
         tool_execution_telemetry=telemetry,
     )
     fake_reader = FakeStateReader(events_data=[event.to_dict()])
+    injected_store = InMemoryAuthoritativeTaskStore()
     app = create_app(
         settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=injected_store,
+        dispatcher=MockAtomicDispatcher(injected_store),
         state_reader=fake_reader,
     )
     req = Request({"type": "http", "app": app})

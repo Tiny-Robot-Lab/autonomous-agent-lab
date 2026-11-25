@@ -13,6 +13,7 @@ from agent_contracts import (
     CompletionCommand,
     FallbackEligibleInferenceError,
     FallbackTransition,
+    RedisConnectionConfig,
     ResumedContinuationContext,
     StageArtifact,
     TaskContinuation,
@@ -325,18 +326,22 @@ async def test_orchestrator_state_reader_and_dashboard_compatibility() -> None:
 
 
 def test_research_agent_redis_bus_default_queue() -> None:
-    bus = RedisBus("redis://localhost:6379/0")
+    bus = RedisBus("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     assert bus.queue_name == "agent.tasks.research"
 
 
 def test_research_agent_redis_bus_custom_queue() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="custom.research.queue")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="custom.research.queue", allow_unauthenticated_local_test=True)
     assert bus.queue_name == "custom.research.queue"
 
 
 @pytest.mark.anyio
 async def test_run_research_agent_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.delenv("AGENT_ID", raising=False)
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -353,15 +358,22 @@ async def test_run_research_agent_defaults(monkeypatch: pytest.MonkeyPatch) -> N
         with pytest.raises(asyncio.CancelledError):
             await run_research_agent()
 
-        mock_bus_cls.assert_called_once_with(
-            "redis://localhost:6379/0",
-            queue_name="agent.tasks.research",
-        )
+        mock_bus_cls.assert_called_once()
+        _, bus_kwargs = mock_bus_cls.call_args
+        assert bus_kwargs["queue_name"] == "agent.tasks.research"
+        bus_cfg = bus_kwargs["connection_config"]
+        assert isinstance(bus_cfg, RedisConnectionConfig)
+        assert bus_cfg.url == "redis://localhost:6379/0"
+        assert bus_cfg.auth_mode == "unauthenticated_local_test"
 
 
 @pytest.mark.anyio
 async def test_run_research_agent_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "custom-research-agent")
     monkeypatch.setenv("TASK_QUEUE", "custom.tasks.research")
 
@@ -378,10 +390,13 @@ async def test_run_research_agent_env_overrides(monkeypatch: pytest.MonkeyPatch)
         with pytest.raises(asyncio.CancelledError):
             await run_research_agent()
 
-        mock_bus_cls.assert_called_once_with(
-            "redis://localhost:6379/0",
-            queue_name="custom.tasks.research",
-        )
+        mock_bus_cls.assert_called_once()
+        _, bus_kwargs = mock_bus_cls.call_args
+        assert bus_kwargs["queue_name"] == "custom.tasks.research"
+        bus_cfg = bus_kwargs["connection_config"]
+        assert isinstance(bus_cfg, RedisConnectionConfig)
+        assert bus_cfg.url == "redis://localhost:6379/0"
+        assert bus_cfg.auth_mode == "unauthenticated_local_test"
 
 
 # --- ResearchExecutor Factory & Selection Tests ---
@@ -431,6 +446,10 @@ async def test_run_research_agent_creates_stub_executor_by_default(
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.delenv("RESEARCH_EXECUTOR", raising=False)
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with (
         patch("research_agent.main.RedisBus") as mock_bus_cls,
@@ -455,6 +474,10 @@ async def test_run_research_agent_explicit_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
 
     with (
@@ -480,7 +503,15 @@ async def test_run_research_agent_unsupported_executor_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "unsupported_model")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls:
         from research_agent.main import run_research_agent
@@ -540,6 +571,10 @@ async def test_run_research_agent_tavily_missing_key_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "tavily")
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
@@ -560,6 +595,10 @@ async def test_run_research_agent_tavily_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "tavily")
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-12345")
 
@@ -819,6 +858,10 @@ async def test_run_research_agent_wires_completion_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
 
     with (
@@ -1034,6 +1077,10 @@ async def test_run_research_agent_wires_inference_provider(
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with (
         patch("research_agent.main.RedisBus") as mock_bus_cls,
@@ -1059,6 +1106,10 @@ async def test_run_research_agent_unsupported_inference_provider_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("INFERENCE_PROVIDER", "unsupported_llm")
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls:
@@ -1075,6 +1126,10 @@ async def test_run_research_agent_multi_provider_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-multi")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-multi")
@@ -1100,6 +1155,10 @@ async def test_run_research_agent_health_probe_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     # 1. Default when unset is 3.0
     monkeypatch.delenv("HEALTH_PROBE_TIMEOUT_SECONDS", raising=False)
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch(
@@ -1118,6 +1177,10 @@ async def test_run_research_agent_health_probe_timeout_configuration(
 
     # 2. Configured valid env var
     monkeypatch.setenv("HEALTH_PROBE_TIMEOUT_SECONDS", "4.5")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch(
         "research_agent.main.ResearchFallbackCoordinator"
     ) as mock_coord_cls, patch("research_agent.main.ResearchProcessor"):
@@ -1158,9 +1221,17 @@ async def test_run_research_agent_missing_secondary_credentials_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch("research_agent.main.ResearchProcessor"):
         from research_agent.main import run_research_agent
@@ -1179,6 +1250,10 @@ async def test_run_research_agent_unsupported_secondary_provider_fails_startup(
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub,unknown_vendor")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch("research_agent.main.ResearchProcessor"):
         from research_agent.main import run_research_agent
@@ -1193,7 +1268,7 @@ async def test_run_research_agent_unsupported_secondary_provider_fails_startup(
 
 @pytest.mark.anyio
 async def test_research_agent_redis_bus_serializes_fallback_transition_as_json() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
     bus.client.xadd = AsyncMock()  # type: ignore[method-assign]
@@ -2336,6 +2411,10 @@ async def test_run_research_agent_cloudflare_missing_credentials_fails_startup(
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.delenv("CLOUDFLARE_AI_API_TOKEN", raising=False)
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls:
         from research_agent.main import run_research_agent
@@ -2353,6 +2432,10 @@ async def test_run_research_agent_cloudflare_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "cloudflare")
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc-main-test")
@@ -2386,7 +2469,7 @@ async def test_run_research_agent_cloudflare_success(
 
 @pytest.mark.anyio
 async def test_research_agent_redis_bus_register() -> None:
-    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research")
+    bus = RedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -2416,9 +2499,17 @@ async def test_run_research_agent_registers_capability_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-agent-custom")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     with patch("research_agent.main.RedisBus") as mock_bus_cls, patch(
         "research_agent.main.ResearchProcessor"
@@ -2452,6 +2543,10 @@ async def test_research_agent_metadata_does_not_expose_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     secret_tavily = "tvly-secret-key-12345"
     secret_cf_token = "cf-token-secret-67890"
     secret_cf_acc = "cf-account-id-abcdef"
@@ -3816,6 +3911,10 @@ async def test_run_research_agent_hint_handling_rejects_malformed_hints(
     monkeypatch.setenv("AGENT_ID", "research-agent-test")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     ordinary_task = TaskRequested(
         task_id="task-ordinary",
@@ -3895,9 +3994,17 @@ async def test_run_research_agent_hint_handling_valid_control_proceeds_to_resume
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-agent-test")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     now_iso = "2026-11-22T00:00:00Z"
     valid_hint = WakeUpHint(
@@ -4021,9 +4128,17 @@ async def test_run_research_agent_initial_wake_up_hint_claims_and_runs(
     - WakeUpHint(execution_kind='initial') -> claim -> ack -> get input -> processor.run_once -> complete.
     """
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-agent-test")
     monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
     monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
     now_iso = "2026-11-22T00:00:00Z"
     initial_hint = WakeUpHint(

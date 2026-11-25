@@ -21,6 +21,10 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
 from tests.test_application import FakeStateReader
+from tests.test_authoritative_task_store import (
+    InMemoryAuthoritativeTaskStore,
+    MockAtomicDispatcher,
+)
 
 # ==============================================================================
 # Helper Factories
@@ -584,7 +588,12 @@ def test_projection_security_boundary_no_detail_accepted() -> None:
 
 @pytest.mark.anyio
 async def test_api_telemetry_returns_200_with_attempts_on_terminal_failure() -> None:
-    app = create_app(Settings())
+    fallback_store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        Settings(),
+        task_store=fallback_store,
+        dispatcher=MockAtomicDispatcher(fallback_store),
+    )
     task_id = "task-api-fail"
     telem_cf = InferenceExecutionTelemetry(
         provider_name="cloudflare",
@@ -648,7 +657,12 @@ async def test_api_telemetry_returns_200_with_attempts_on_terminal_failure() -> 
 
 @pytest.mark.anyio
 async def test_api_telemetry_returns_404_for_unknown_task() -> None:
-    app = create_app(Settings())
+    fallback_store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        Settings(),
+        task_store=fallback_store,
+        dispatcher=MockAtomicDispatcher(fallback_store),
+    )
     reader = FakeStateReader(events_data=[])
     scope = {"type": "http", "app": app}
     request = Request(scope)
@@ -664,7 +678,12 @@ async def test_api_telemetry_returns_404_for_unknown_task() -> None:
 
 @pytest.mark.anyio
 async def test_api_telemetry_event_stream_read_failure_raises_503() -> None:
-    app = create_app(Settings())
+    fallback_store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        Settings(),
+        task_store=fallback_store,
+        dispatcher=MockAtomicDispatcher(fallback_store),
+    )
     scope = {"type": "http", "app": app}
     request = Request(scope)
     request.app.state.get_task_inference_telemetry = AsyncMock()
@@ -680,7 +699,12 @@ async def test_api_telemetry_event_stream_read_failure_raises_503() -> None:
 
 @pytest.mark.anyio
 async def test_api_telemetry_durable_key_read_failure_raises_503() -> None:
-    app = create_app(Settings())
+    fallback_store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        Settings(),
+        task_store=fallback_store,
+        dispatcher=MockAtomicDispatcher(fallback_store),
+    )
     scope = {"type": "http", "app": app}
     request = Request(scope)
     request.app.state.get_task_inference_telemetry = AsyncMock()
@@ -696,7 +720,12 @@ async def test_api_telemetry_durable_key_read_failure_raises_503() -> None:
 
 @pytest.mark.anyio
 async def test_api_telemetry_backward_compatible_winning_telemetry() -> None:
-    app = create_app(Settings())
+    fallback_store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        Settings(),
+        task_store=fallback_store,
+        dispatcher=MockAtomicDispatcher(fallback_store),
+    )
     task_id = "task-compat"
     telem = InferenceExecutionTelemetry(
         provider_name="gemini",

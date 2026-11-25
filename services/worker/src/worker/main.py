@@ -14,6 +14,7 @@ from agent_contracts import (
     WakeUpHint,
     parse_health_probe_timeout,
     parse_heartbeat_interval,
+    resolve_redis_connection_from_env,
 )
 from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
 from agent_policy import parse_provider_priority
@@ -38,7 +39,8 @@ async def run_worker(
     max_signals: int | None = None,
 ) -> None:
     agent_id = os.getenv("AGENT_ID", "worker-1")
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_connection = resolve_redis_connection_from_env()
+    redis_url = redis_connection.url
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.general")
     hint_queue = os.getenv("HINT_QUEUE")
     inference_provider_name = os.getenv("INFERENCE_PROVIDER", "stub")
@@ -65,7 +67,10 @@ async def run_worker(
         name: create_inference_provider(name) for name in preferences
     }
 
-    bus_kwargs: dict[str, Any] = {"queue_name": task_queue}
+    bus_kwargs: dict[str, Any] = {
+        "queue_name": task_queue,
+        "connection_config": redis_connection,
+    }
     if hint_queue:
         bus_kwargs["hint_queue"] = hint_queue
     bus = RedisBus(redis_url, **bus_kwargs)

@@ -582,18 +582,24 @@ async def test_expired_assignment_preserves_immutable_grants_and_advances_fencin
 
 
 def test_settings_startup_validation_and_cryptographic_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 1. legacy_push starts cleanly with default Settings() (no secrets or principals required)
+    # from_env() blocks below exercise non-Redis validation; give them an explicit
+    # loopback test-mode Redis configuration so fail-closed Redis resolution passes.
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    for _var in ("REDIS_URL", "REDIS_USERNAME", "REDIS_PASSWORD_FILE"):
+        monkeypatch.delenv(_var, raising=False)
+    # 1. legacy_push Settings() defaults still construct without secrets or principals
     default_settings = Settings()
     assert default_settings.task_delivery_mode == "legacy_push"
     assert default_settings.runtime_credential_pepper == ""
     assert default_settings.assignment_proof_pepper == ""
     assert len(default_settings.runtime_principals) == 0
 
-    # app starts cleanly under legacy_push with empty secrets
-    app = create_app(settings=default_settings)
-    assert app.state.claim_task is None
-    assert app.state.acknowledge_assignment is None
-    assert app.state.stage_artifact is None
+    # ... but app auto-construction fails closed without a validated connection:
+    # it must never silently build an unauthenticated RedisGateway.
+    with pytest.raises(
+        ValueError, match="requires a validated authenticated RedisConnectionConfig"
+    ):
+        create_app(settings=default_settings)
 
     # 2. authenticated_claim fails startup for missing runtime_credential_pepper
     with pytest.raises(ValueError) as exc_info:
