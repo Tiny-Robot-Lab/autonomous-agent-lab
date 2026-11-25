@@ -86,11 +86,21 @@ Two consecutive passes (Run 1 and Run 2) over the 17-case corpus succeeded (`exe
 - **Latency & reproducibility**: Client elapsed latency (`latency_ns` via `time.perf_counter_ns()`) and server-reported `latency_ms` are recorded separately. In live Runs 1 and 2, all 17 cases produced identical raw choices, effective decisions, and comparison classifications (`0` diffs), with Run 1 client latency `90.446–2008.822 ms` (`89.05–1987.59 ms` server) and Run 2 client latency `104.606–201.641 ms` (`103.22–200.29 ms` server).
 - **Confidence & abstention observations**: Under the frozen `0.70` threshold, Decider agreed with the deterministic router on 5 clear `research` cases (`eval-006`, `eval-007`, `val-005`, `val-012`, plus ambiguous `eval-013`) and 1 clear `general` case (`eval-001`), while 10 cases fell below `0.70` (including `eval-011` and `val-015` where raw choice was `research` below threshold, and `shadow-none-001`/`shadow-none-002` where raw choice was `general` at `0.3940`/`0.5957` confidence) and `val-001` returned deliberate `none` (`0.3454` confidence).
 
-## 8. Relationship to Prior Routing v2/v3 Evidence
+## 8. Post-Evaluation `home-core` CPU Feasibility Test
+
+- **Environment**: `home-core` (AMD Ryzen 5 3500U, 4 cores / 8 threads, 14 GiB physical RAM, 4 GiB swap), with Tiny Agent Lab running (`strands-decider 0.4.0`, checkpoint `StrandsAgents/strands-decider-E2B-gemma4-v2-2611`, device `cpu`).
+- **Observed result**: Model download completed (~10.3 GB reconstructed) and weight loading began, at which point the Linux kernel invoked the global OOM killer and terminated `strands-decider` before weight loading completed (kernel evidence reported approximately 14,239,748 kB anonymous RSS at termination; `systemd-oomd` had no corresponding event). Tiny Agent Lab services remained running, Orchestrator and Redis remained healthy, and both local health and public `https://agents.tinyrobotlab.com/health` returned `{"status":"ok"}`.
+- **Coexistence & test boundaries**: No Tiny Agent Lab services were stopped to make the experiment pass, and no retry with additional swap or reduced workload was attempted. Because the process was killed before weight loading completed, the model was not fully loaded and no CPU inference latency is claimed.
+- **Feasibility summary**:
+  - Mac MPS evaluation: **viable**;
+  - Current `home-core` CPU feasibility: **no-go**.
+- **Bounded conclusion**: The current E2B Gemma 4 v2 checkpoint is not viable on the existing 14 GiB CPU-only `home-core` under the tested coexistence conditions. This does not imply that Strands Decider is generally unsuitable, that additional RAM would necessarily make CPU inference practical, or that any specific RAM upgrade would be sufficient. Any future `home-core` feasibility work requires materially different hardware or a materially smaller suitable current-generation decision model.
+
+## 9. Relationship to Prior Routing v2/v3 Evidence
 
 Historical Routing v2 and Routing v3/Ollama benchmarks in [docs/routing_evaluation.md](routing_evaluation.md) remain unchanged. This harness complements that baseline by isolating a typed, thresholded 3-way shadow interface (`general`, `research`, `none`) that does not require modifying production routing or `RoutingDecision` lifecycle contracts.
 
-## 9. Advisory Recommendation
+## 10. Advisory Recommendation
 
-- **Disposition (advisory)**: **Continue shadow** — keep `LocalStrandsDeciderHttpAdapter` strictly shadow-only; while live inference succeeded cleanly and reproducibly across both runs with zero failures, 10/17 cases fell below the provisional `0.70` threshold (and `val-001` abstained with `none`), warranting further shadow-only analysis before any maintainer decision on assisted routing.
+- **Disposition (advisory)**: **Continue shadow** — keep `LocalStrandsDeciderHttpAdapter` strictly shadow-only; while Mac MPS live inference succeeded cleanly and reproducibly across both runs with zero failures, 10/17 cases fell below the provisional `0.70` threshold (and `val-001` abstained with `none`), and `home-core` CPU execution is a no-go on current hardware, warranting further shadow-only evaluation before any maintainer decision on assisted routing.
 - The human maintainer retains sole acceptance and decision authority (`no-go`, `continue shadow`, or `candidate for later assisted-routing issue`).
