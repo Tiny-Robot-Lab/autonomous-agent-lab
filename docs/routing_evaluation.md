@@ -564,11 +564,115 @@ Initial testing of Phase B against unseen prompts revealed that high development
 
 ---
 
-## 13. Non-Blocking Architectural Follow-ups
+## 13. Follow-up Experiment: Small Supervised Decision Classifier
+
+### 13.1 Motivation and Experimental Boundary
+
+Following the Phase C2 local generative-model experiments (Section 10), a follow-up research experiment investigated whether a much smaller non-generative decision/classification model could provide useful semantic routing assistance within `home-core`'s CPU and memory constraints.
+
+- **External / disposable boundary**: This experiment remained strictly external and disposable. It did **not** modify production routing, `SubmitTask`, or repository dependency manifests, and no disposable model artifact was committed to Git.
+- **Authoritative router unchanged**: Deterministic routing (`DeterministicCapabilityRouter` / `RoutingAssessment`) remains authoritative for all task submissions.
+
+### 13.2 Zero-Shot ModernBERT Baseline
+
+- **Model**: `tasksource/ModernBERT-base-nli` (~149.6M parameters; source model artifact ~598 MB).
+- **Purpose**: Evaluate whether a small NLI zero-shot classifier could classify Tiny Agent Lab routing intent without project-specific training.
+- **Apple Silicon Mac CPU resource observations**:
+  - Initial single-routing experiment completed successfully at ~0.1–0.2 s per short decision, ~0.8 GB peak RSS in the tested FP32 process, with no swap observed.
+  - An exploratory six-case smoke check indicated that descriptive capability definitions mattered substantially; this smoke check was exploratory only and is not a benchmark.
+- **13-case ambiguous Routing v3 evaluation** (frozen descriptive labels, Apple Silicon Mac CPU):
+  - **Accuracy**: **4/13** (**30.8%**)
+  - **Latency**: mean ~0.111 s, min ~0.100 s, max ~0.146 s
+  - **Memory**: ~0.85 GB maximum resident set, no swap observed
+- **Interpretation**: Although dramatically faster and smaller than the previously evaluated local generative models, the zero-shot classifier did not learn Tiny Agent Lab's project-specific routing policy. Its errors frequently treated requests that could plausibly benefit from external information as `RESEARCH` even when the repository's routing policy classified them as `GENERAL`. This result is frozen as the zero-shot baseline without further label tuning against historical evaluation results.
+
+### 13.3 SetFit Training Design
+
+- **Software stack**: Python 3.12.16, `SetFit` 1.2.0, `datasets` 5.2.0, `sentence-transformers` 6.3.0, `scikit-learn` 1.9.1, `Transformers` 5.24.1, `PyTorch` 2.15.0 (Mac) / `PyTorch` 2.15.0+cpu (`home-core`).
+- **Base embedding model & head**: `BAAI/bge-small-en-v1.5` with SetFit's default lightweight classification head.
+- **Training corpus**: [`evaluation/routing/dataset.json`](../evaluation/routing/dataset.json) — 46 development cases (`26` `GENERAL`, `20` `RESEARCH`), generating 1,122 contrastive training pairs in the observed run.
+- **Withheld validation corpus**: [`evaluation/routing/validation_dataset.json`](../evaluation/routing/validation_dataset.json) — 36 validation cases (`19` `GENERAL`, `17` `RESEARCH`).
+- **Experimental discipline**:
+  - Validation cases were withheld from training; no validation case was moved into the training set.
+  - No validation-driven threshold or hyperparameter tuning was performed (treated as an initial frozen baseline).
+  - Training used batch size 16 for 1 epoch on Mac (~20–28 s in observed runs).
+
+### 13.4 Withheld Validation Results
+
+Evaluated against all 36 withheld validation cases on Mac:
+
+- **Overall withheld validation accuracy**: **32/36** (**88.9%**) *(diagnostic validation-set result, not unbiased production accuracy)*.
+
+| Class | Precision | Recall | F1 | Support |
+|---|---:|---:|---:|---:|
+| `GENERAL` | 0.941 | 0.842 | 0.889 | 19 |
+| `RESEARCH` | 0.842 | 0.941 | 0.889 | 17 |
+
+- **Confusion matrix**:
+  - Expected `GENERAL` → predicted `GENERAL`: **16**
+  - Expected `GENERAL` → predicted `RESEARCH`: **3**
+  - Expected `RESEARCH` → predicted `GENERAL`: **1**
+  - Expected `RESEARCH` → predicted `RESEARCH`: **16**
+- **Four misclassified validation cases**:
+  - `val-015` (*"Explain key advances in database indexing theory over the last several decades."*): expected `GENERAL`, predicted `RESEARCH`.
+  - `val-025` (*"Evaluate our current database configuration against recent cloud vendor benchmark recommendations:\n[postgres]\nmax_connections = 100\nshared_buffers = 128MB"*): expected `RESEARCH`, predicted `GENERAL`.
+  - `val-030` (*"Analyze data portability options across multiple cloud providers."*): expected `GENERAL`, predicted `RESEARCH`.
+  - `val-036` (*"Review this research code repository."*): expected `GENERAL`, predicted `RESEARCH`.
+- **Mac inference-only measurement** (fresh process loading only the frozen artifact, CPU execution, calling both `predict()` and `predict_proba()` per decision):
+  - Model load: ~0.234 s; cold inference: ~0.163 s; warm median: ~0.0166 s (range ~0.0160–0.0190 s); peak RSS: ~590 MB; zero swap observed.
+  - *Note*: Classifier probabilities are raw model outputs, not independently calibrated confidence scores.
+
+### 13.5 Frozen Artifact and Cross-Architecture Reproducibility
+
+The trained SetFit model was saved as a disposable frozen artifact (not committed to Git; artifact directory ~128–129 MB):
+
+- `model.safetensors` (~127–128 MB), SHA-256: `f11808d09a607db06f9d73affb17102f93bbe95320227e51df6e676004b09cf9`
+- `model_head.pkl` (~2.3–2.4 KB), SHA-256: `d8270e31dde2b07119baddfda19ef8542bc03c7a125cabb8e51ed429bea651`
+
+Copying the frozen artifact from Mac (ARM64) to `home-core` (x86_64) yielded identical SHA-256 digests for both files and reproduced the exact 32/36 (88.9%) validation result, identical confusion matrix, identical four failures (`val-015`, `val-025`, `val-030`, `val-036`), and displayed probabilities identical to four decimal places across both architectures.
+
+### 13.6 home-core Resource and Latency Results
+
+- **Runtime environment**: Ubuntu 26.04.1 LTS (`x86_64`), Python 3.12.16 isolated via `uv`, CPU-only `PyTorch` 2.15.0+cpu, 4 PyTorch threads.
+- **Operational dependency-selection lesson**: An initial Linux environment accidentally resolved CUDA-enabled PyTorch (~5.8 GB on disk). Rebuilding the disposable environment explicitly with the CPU-only wheel (`PyTorch` 2.15.0+cpu, CUDA unavailable, no NVIDIA/CUDA packages) reduced the environment footprint to ~1.5 GB. This is an operational packaging lesson, not model memory consumption.
+- **Sanity measurement** (`predict()` + `predict_proba()` per decision): model load ~0.378 s, cold inference ~0.067 s, warm median ~0.0498 s (range ~0.0468–0.0532 s), peak RSS ~702 MB, zero swaps.
+- **Full 36-case withheld validation on `home-core`** (`predict()` + `predict_proba()` per case):
+  - Model load: 0.266 s
+  - Latency: median 0.0515 s, mean 0.0546 s, p95 0.0887 s, min 0.0429 s, max 0.1031 s
+  - Memory & exit: peak RSS 727.4 MB (`/usr/bin/time` max resident set: 746,568 KB), zero swaps, exit status 0.
+
+### 13.7 Interpretation and Architectural Decision
+
+These observations represent promising experimental evidence, **not** a production-routing decision:
+
+1. **Deterministic routing remains authoritative**; this experiment does not justify replacing Routing v2 / deterministic `RoutingAssessment`.
+2. Unlike the previous generic generative-model experiments, a small supervised classifier learned a substantial portion of Tiny Agent Lab's project-specific `GENERAL`-vs-`RESEARCH` policy.
+3. For this bounded classification problem, task-specific labeled data mattered more than using a larger generic generative model.
+4. The frozen artifact reproduced its validation behavior across Mac ARM64 and `home-core` x86_64 in the observed experiment.
+5. The classifier remains imperfect, including confidently incorrect predictions (especially `val-025`), and its probabilities must not be used as authoritative confidence until calibration is evaluated separately.
+6. No permission, recovery, lifecycle, evidence-authority, or other security-sensitive decision should be delegated to this classifier based on this experiment.
+7. Future evaluation should retain deterministic fallback/authority and use shadow or advisory comparison before any stronger role is considered.
+
+### 13.8 Experimental Hygiene and Next Research Gate
+
+Because [`evaluation/routing/validation_dataset.json`](../evaluation/routing/validation_dataset.json) has now been repeatedly inspected during this experiment, it is **retired as a future independent lockbox** and must not be treated as a fresh unbiased evaluation set in future model development.
+
+The next research gate requires:
+- creating a larger, deliberately designed training/development corpus covering routing-policy boundaries;
+- creating a new, truly independent lockbox dataset never used for training, label design, threshold selection, model selection, or hyperparameter tuning;
+- evaluating probability calibration and abstention explicitly;
+- evaluating multiple seeds and configurations only against development/tuning data before opening the lockbox;
+- considering future GPU-assisted training on capable development hardware while keeping `home-core` as a small CPU inference target;
+- preserving frozen model provenance, configuration, hashes, dataset versions, and runtime measurements; and
+- verifying whether additional high-quality policy-boundary examples improve generalization rather than assuming more training epochs suffice.
+
+---
+
+## 14. Non-Blocking Architectural Follow-ups
 
 The following improvements remain documented for future evaluation cycles:
 1. **Persist RoutingAssessment Diagnostics**: Extend `RoutingDecision` (or add a companion `RoutingAssessmentRecord`) to persist assessment clarity, typed signals, and signal-backed reasoning alongside the dispatch decision, exposing them to the observatory and debugging APIs.
 2. **Decompose Freshness Regex**: Decompose the large monolithic `FRESHNESS_OR_CURRENT_INFO` pattern into a collection of smaller named semantic sub-patterns (e.g., `supported_versions`, `pricing_queries`, `service_status`, `demographic_counts`) compiled at router initialization.
 3. **Invert Freshness Whitelisting**: Replace the current term-based whitelist in `_is_false_freshness` with positively matched context guards, ensuring that new freshness qualifiers are not inadvertently suppressed.
 4. **Independent Lockbox Dataset**: Create a third, truly independent lockbox evaluation dataset authored by an external contributor or at a later date after deterministic rules are completely frozen, establishing an unbiased production-accuracy estimate.
-5. **Future Model Architecture Evaluations**: Retain the evaluation-only Ollama and benchmark harness infrastructure to evaluate future small language models (e.g., specialized routing SLMs or fine-tuned classifiers) or alternative execution backends if dedicated GPU hardware becomes available.
+5. **Future Model Architecture Evaluations**: Retain the evaluation-only harness infrastructure to evaluate future small language models or supervised classifiers; the small supervised-classifier path (Section 13) has now produced promising experimental evidence, while still requiring a new independent lockbox and governed evaluation before any stronger integration.
