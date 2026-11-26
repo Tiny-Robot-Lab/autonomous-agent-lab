@@ -50,10 +50,10 @@ jobs:
       - name: Validate container image packaging
         run: |
           docker build -f services/orchestrator/Dockerfile -t test-orchestrator .
-          docker run --rm test-orchestrator python -c "import orchestrator.presentation.api"
+          docker run --rm --entrypoint python test-orchestrator -c "import orchestrator.presentation.api"
           docker build -f services/worker/Dockerfile -t test-worker .
-          docker run --rm test-worker python -c "import agent_policy, worker.main"
+          docker run --rm --entrypoint python test-worker -c "import agent_policy, worker.main"
           docker build -f services/research_agent/Dockerfile -t test-research-agent .
-          docker run --rm test-research-agent python -c "import agent_policy, research_agent.main"
+          docker run --rm --entrypoint python test-research-agent -c "import agent_policy, research_agent.main"
           docker build -f services/analysis_agent/Dockerfile -t test-analysis-agent .
-          docker run --rm test-analysis-agent python -c "import analysis_agent.main"
+          docker run --rm --entrypoint python test-analysis-agent -c "import analysis_agent.main"
