@@ -1,8 +1,9 @@
-"""Dedicated live Redis 7 integration tests for Issue #224.
+"""Dedicated live Redis integration tests for Issue #224.
 
 Governed by ADR-0005, ADR-0006, ADR-0007, and Issue #224:
-- Dedicated to database 15 (REDIS_URL=redis://127.0.0.1:6379/15);
-- Never runs FLUSHALL (flushes only DB 15);
+- Uses an isolated disposable Redis 7.4.12 container and database 0;
+- Uses fixture-admin only for test setup, cleanup, and assertion;
+- Uses production identities for gateway operations;
 - Exercises complete Research -> Analysis -> Research delegation and continuation flow on real Redis 7;
 - Exercises cross-instance Research reference topology: research-agent-1 yields, research-agent-2 resumes;
 - Verifies parent executor-slot invariant on real Redis (waiting parent has NO active claim; worker processes unrelated task);
@@ -18,23 +19,18 @@ Governed by ADR-0005, ADR-0006, ADR-0007, and Issue #224:
   - non-root / depth > 1 delegation rejected at authoritative missing-grant boundary by real Redis (ADR-0006 Items 8, 19; ADR-0007 Decision 8);
   - unauthorized capability rejected by real Redis;
 - Proves multi-turn telemetry records distinct turn IDs and execution kinds without collision;
-- Performs full DB 15 key/value scan asserting zero bearer tokens, peppers, or plaintext proofs exist in any key or stream.
+- Performs a full DB 0 key/value scan asserting zero bearer tokens, peppers, or plaintext proofs exist in any key or stream.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
 import pytest
-import redis.asyncio as redis
 from agent_contracts import (
     AgentEvent,
     CompletionCommand,
@@ -56,7 +52,6 @@ from orchestrator.presentation.api import create_app
 
 pytestmark = [pytest.mark.anyio, pytest.mark.redis]
 
-REQUIRED_TEST_DB = "15"
 PEPPER = "test_issue_224_redis_pepper_1234567890"
 PROOF_PEPPER = "test_issue_224_redis_proof_pepper_0987654321"
 
@@ -95,49 +90,6 @@ PRINCIPALS_CONFIG: dict[str, dict[str, Any]] = {
         "active": True,
     },
 }
-
-
-def _validate_test_redis_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("redis", "rediss"):
-        raise ValueError(
-            f"Redis integration tests require a redis:// URL, got scheme '{parsed.scheme}'"
-        )
-    if parsed.path.strip("/") != REQUIRED_TEST_DB:
-        raise ValueError(
-            "Redis integration tests require database 15 to prevent accidental data loss, "
-            f"got '{parsed.path}'"
-        )
-
-
-@pytest.fixture
-def redis_url() -> str:
-    url = os.getenv("REDIS_URL", "").strip()
-    if not url:
-        pytest.skip("Redis integration tests disabled: REDIS_URL environment variable is not set")
-    try:
-        _validate_test_redis_url(url)
-    except ValueError as exc:
-        pytest.fail(str(exc))
-    return url
-
-
-@pytest.fixture
-async def clean_gateway(redis_url: str) -> AsyncGenerator[RedisGateway, None]:
-    gateway = RedisGateway(redis_url)
-    try:
-        await asyncio.wait_for(gateway._client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError) as exc:
-        await gateway.aclose()
-        pytest.fail(f"Configured Redis endpoint is unreachable within 1.0s timeout: {exc}")
-    await gateway._client.flushdb()
-    try:
-        yield gateway
-    finally:
-        try:
-            await gateway._client.flushdb()
-        finally:
-            await gateway.aclose()
 
 
 def _build_test_settings(redis_url: str) -> Settings:

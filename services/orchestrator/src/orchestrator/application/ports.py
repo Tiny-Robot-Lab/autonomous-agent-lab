@@ -137,7 +137,8 @@ class WakeUpHintDispatcher(Protocol):
     async def dispatch_hint(
         self,
         hint: WakeUpHint,
-        target: str,
+        target: str | None = None,
+        capability: str | None = None,
     ) -> None: ...
 
 

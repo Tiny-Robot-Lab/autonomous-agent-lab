@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 import pytest
 
 _PROVIDER_ENVIRONMENT_VARIABLES = (
@@ -64,3 +67,61 @@ def isolate_provider_environment(
 @pytest.fixture
 def provider_environment_variables() -> tuple[str, ...]:
     return _PROVIDER_ENVIRONMENT_VARIABLES
+
+
+@pytest.fixture(scope="session")
+def redis_test_environment():
+    if shutil.which("docker") is None:
+        pytest.skip("Redis-marked tests require Docker; Docker is not installed")
+    docker_info = subprocess.run(
+        ["docker", "info"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if docker_info.returncode != 0:
+        pytest.skip("Redis-marked tests require an available Docker daemon")
+
+    from scripts.redis_acl_live_harness import LiveRedisAclCluster
+    from scripts.redis_test_support import register_cluster, unregister_cluster
+
+    cluster = LiveRedisAclCluster.start(
+        build_service_images=False,
+        publish_host_port=True,
+    )
+    register_cluster(cluster)
+    try:
+        yield cluster
+    finally:
+        unregister_cluster(cluster)
+        cluster.cleanup()
+
+
+@pytest.fixture(autouse=True)
+def require_disposable_redis_for_marked_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    if request.node.get_closest_marker("redis") is not None:
+        request.getfixturevalue("redis_test_environment")
+
+
+@pytest.fixture
+def redis_url(redis_test_environment) -> str:
+    return redis_test_environment.redis_url
+
+
+@pytest.fixture
+async def clean_gateway(redis_test_environment):
+    from scripts.redis_test_support import make_test_gateway
+
+    gateway = make_test_gateway(redis_test_environment.redis_url)
+    try:
+        await gateway._client.ping()
+        await gateway._client.flushdb()
+        yield gateway
+    finally:
+        try:
+            await gateway._client.flushdb()
+        finally:
+            await gateway.aclose()

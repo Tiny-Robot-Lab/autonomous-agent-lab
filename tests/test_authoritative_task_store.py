@@ -1583,8 +1583,8 @@ async def test_production_composition_wires_redis_gateway_as_authoritative_store
 
     A normal root submission invokes authoritative root registration (pending_dispatch).
     """
-    settings = Settings(redis_url="redis://fake:6379/0", app_env="test")
-    gateway = RedisGateway(settings.redis_url)
+    settings = Settings(redis_url="redis://localhost:6379/0", app_env="test")
+    gateway = RedisGateway(settings.redis_url, allow_unauthenticated_local_test=True)
 
     # Mock client and pipeline on gateway
     mock_pipe = MagicMock()
@@ -1630,19 +1630,19 @@ async def test_production_composition_wires_redis_gateway_as_authoritative_store
 
 
 def test_create_app_fails_fast_when_task_store_provided_without_dispatch_path() -> None:
-    """create_app(task_store=store) must fail fast if no dispatch path exists.
+    """create_app(settings=Settings(), task_store=store) must fail fast if no dispatch path exists.
 
     It must not create a zombie app that registers tasks but cannot dispatch them.
     """
     store = InMemoryAuthoritativeTaskStore()
     with pytest.raises(TypeError, match="create_app requires a dispatch path"):
-        create_app(task_store=store)
+        create_app(settings=Settings(), task_store=store)
 
 
 def test_create_app_fails_fast_when_no_authoritative_task_store_can_be_resolved() -> None:
     """create_app must fail fast if no AuthoritativeTaskStore can be resolved."""
     with pytest.raises(TypeError, match="create_app requires an AuthoritativeTaskStore"):
-        create_app(task_store=None, gateway=None, task_queue=MagicMock())
+        create_app(settings=Settings(), task_store=None, gateway=None, task_queue=MagicMock())
 
 
 # ==============================================================================
@@ -1891,7 +1891,7 @@ async def test_register_child_validates_and_normalizes_prompt() -> None:
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_uses_atomic_pipeline_with_transaction_true() -> None:
     """Verifies that RedisGateway.dispatch executes RPUSH and status:pending inside a transaction=True pipeline."""
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
 
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
@@ -1903,9 +1903,9 @@ async def test_redis_gateway_dispatch_uses_atomic_pipeline_with_transaction_true
     gateway._client.pipeline = MagicMock(return_value=mock_pipe)
 
     task = TaskRequested.create("Execute runtime task")
-    target = "agent.tasks.custom-executor-1"
+    target = "agent.tasks.general"
 
-    await gateway.dispatch(task, target=target)
+    await gateway.dispatch(task, target=target, capability="general")
 
     # Verified that pipeline was requested with transaction=True
     gateway._client.pipeline.assert_called_once_with(transaction=True)
@@ -1922,7 +1922,7 @@ async def test_redis_gateway_dispatch_uses_atomic_pipeline_with_transaction_true
 @pytest.mark.anyio
 async def test_redis_gateway_register_child_uses_atomic_lua_script() -> None:
     """Verifies that RedisGateway.register_child_task executes REGISTER_CHILD_TASK_LUA atomically across keys."""
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.eval = AsyncMock(return_value="OK")
 
     child = TaskRequested(
@@ -1948,7 +1948,7 @@ async def test_redis_gateway_register_child_uses_atomic_lua_script() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_get_children_determinism() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.smembers = AsyncMock(return_value={b"c-3", b"c-1", b"c-2"})
 
     children = await gateway.get_children("parent-1")
@@ -1958,7 +1958,7 @@ async def test_redis_gateway_get_children_determinism() -> None:
 @pytest.mark.anyio
 async def test_redis_gateway_register_root_executes_atomic_lua_script() -> None:
     """Verifies that RedisGateway.register_root_task executes atomic Lua script across all 4 keys."""
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     gateway._client.eval = AsyncMock(return_value="OK")
 
     task = TaskRequested.create("Root task prompt")
@@ -1985,7 +1985,7 @@ async def test_redis_gateway_register_root_executes_atomic_lua_script() -> None:
 @pytest.mark.anyio
 async def test_simulated_dispatch_pipeline_failure_does_not_expose_queued_task_or_pending_status() -> None:
     """Simulated pipeline execute failure during dispatch does not expose enqueued task or pending status."""
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
 
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
@@ -1999,7 +1999,7 @@ async def test_simulated_dispatch_pipeline_failure_does_not_expose_queued_task_o
     task = TaskRequested.create("Root task")
 
     with pytest.raises(RuntimeError, match="Simulated pipeline commit failure"):
-        await gateway.dispatch(task, target="agent.tasks.general")
+        await gateway.dispatch(task, target="agent.tasks.general", capability="general")
 
     # Gateway client pipeline was invoked with transaction=True
     gateway._client.pipeline.assert_called_once_with(transaction=True)
@@ -2202,7 +2202,7 @@ async def test_submit_task_root_ingestion_persists_durable_input_and_authority()
 
 @pytest.mark.anyio
 async def test_redis_gateway_task_input_roundtrip_and_conflict() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     record = TaskInput(
         task_id="t-1",
@@ -2255,7 +2255,7 @@ async def test_redis_gateway_task_input_roundtrip_and_conflict() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     art = StageArtifact(
         artifact_id="art-1",
@@ -2314,7 +2314,7 @@ async def test_redis_gateway_stage_artifact_roundtrip_and_conflict() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_continuation_roundtrip_and_conflict() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     cont = TaskContinuation(
         parent_task_id="p-1",
@@ -2381,7 +2381,7 @@ async def test_redis_gateway_continuation_roundtrip_and_conflict() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_root_authority_roundtrip_and_conflict() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     auth = RootAuthorityRecord.create_default("root-abc", created_at=now)
 
@@ -2757,7 +2757,7 @@ async def test_in_memory_delivery_lease_expiry_restores_claimability() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_authority_grant_roundtrip_and_conflict() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     grant = DelegationGrant(
         grant_id="grant-001",
@@ -2805,7 +2805,7 @@ async def test_redis_gateway_authority_grant_roundtrip_and_conflict() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_claim_and_acknowledgement_lua_branches() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now = datetime.now(UTC).isoformat()
     claim = ActiveClaim(
         task_id="task-001",
@@ -2919,7 +2919,7 @@ async def test_redis_gateway_claim_and_acknowledgement_lua_branches() -> None:
         execution_kind="initial",
         task_id="task-001",
     )
-    await gateway.dispatch_hint(hint, "agent.hints.research")
+    await gateway.dispatch_hint(hint, "agent.hints.research", capability="research")
     gateway._client.rpush.assert_awaited_once_with("agent.hints.research", hint.to_json())
 
 
@@ -3571,7 +3571,7 @@ def test_consolidated_exception_class_identity():
 
 @pytest.mark.anyio
 async def test_redis_gateway_materialize_claim_timeout_branches() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now_iso = "2026-11-22T12:00:01.000000Z"
     deadline_iso = "2026-11-22T12:00:00.000000Z"
     outcome = build_claim_timed_out_terminal_outcome(
@@ -3629,7 +3629,7 @@ async def test_redis_gateway_materialize_claim_timeout_branches() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_transition_expired_claim_branches() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now_iso = "2026-11-22T12:00:01.000000Z"
     claim = ActiveClaim(
         task_id="task-1",
@@ -3701,7 +3701,7 @@ async def test_redis_gateway_transition_expired_claim_branches() -> None:
 
 @pytest.mark.anyio
 async def test_redis_gateway_resolve_expired_claim_branches() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     now_iso = "2026-11-22T12:00:01.000000Z"
     cmd = RecoveryDecisionCommand(
         recovery_decision_id="rec-1",

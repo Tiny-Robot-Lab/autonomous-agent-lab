@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any
 from unittest.mock import DEFAULT
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from agent_contracts import (
     TaskRequested,
     WakeUpHint,
     parse_heartbeat_interval,
+    resolve_redis_connection_from_env,
 )
 from agent_infrastructure import CompletionSubmissionError, OrchestratorClient
 
@@ -34,7 +36,8 @@ async def run_analysis_agent(
     max_signals: int | None = None,
 ) -> None:
     agent_id = os.getenv("AGENT_ID", "analysis-agent-1")
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_connection = resolve_redis_connection_from_env()
+    redis_url = redis_connection.url
     task_queue = os.getenv("TASK_QUEUE", "agent.tasks.analysis")
     hint_queue = os.getenv("HINT_QUEUE")
     orchestrator_base_url = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8080")
@@ -50,7 +53,10 @@ async def run_analysis_agent(
         else parse_heartbeat_interval(os.getenv("HEARTBEAT_INTERVAL_SECONDS"))
     )
 
-    bus_kwargs: dict[str, str] = {"queue_name": task_queue}
+    bus_kwargs: dict[str, Any] = {
+        "queue_name": task_queue,
+        "connection_config": redis_connection,
+    }
     if hint_queue:
         bus_kwargs["hint_queue"] = hint_queue
     bus = RedisBus(redis_url, **bus_kwargs)

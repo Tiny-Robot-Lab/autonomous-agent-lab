@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
+from agent_contracts import (
+    RedisConnectionConfig,
+    resolve_redis_connection_from_env,
+    validate_redis_url,
+)
+
 from .domain.principal import parse_master_secret, validate_principal_config_registry
 
 logger = logging.getLogger(__name__)
@@ -23,8 +29,16 @@ class Settings:
     runtime_credential_pepper: str = ""
     assignment_proof_pepper: str = ""
     runtime_principals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    redis_connection: RedisConnectionConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.redis_connection is not None:
+            if not isinstance(self.redis_connection, RedisConnectionConfig):
+                raise TypeError("redis_connection must be a RedisConnectionConfig instance")
+            if self.redis_url != self.redis_connection.url:
+                raise ValueError("redis_url must match redis_connection.url")
+        else:
+            validate_redis_url(self.redis_url, allow_nonzero_db=True)
         if self.task_delivery_mode not in ALLOWED_DELIVERY_MODES:
             raise ValueError(
                 f"Invalid task_delivery_mode: '{self.task_delivery_mode}'. Allowed: {sorted(ALLOWED_DELIVERY_MODES)}"
@@ -239,8 +253,11 @@ class Settings:
             else:
                 raise ValueError("Unsupported RUNTIME_PRINCIPALS_JSON structure")
 
+        redis_connection = resolve_redis_connection_from_env()
+
         return cls(
-            redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            redis_url=redis_connection.url,
+            redis_connection=redis_connection,
             app_env=os.getenv("APP_ENV", "development"),
             task_delivery_mode=raw_mode,
             claim_delivery_lease_seconds=lease_seconds,

@@ -13,12 +13,14 @@ from agent_contracts import (
     AgentEvent,
     AgentExecutionState,
     TaskRequested,
+    WakeUpHint,
 )
 from orchestrator.application import (
     FindCandidatesByCapability,
     SubmitTask,
     TaskDispatcher,
 )
+from orchestrator.config import Settings
 from orchestrator.domain import (
     AgentCapability,
     CandidateSelectionPolicy,
@@ -158,6 +160,10 @@ async def test_worker_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-worker-queue")
 
@@ -181,6 +187,10 @@ async def test_worker_registers_configured_dispatch_target(
 @pytest.mark.anyio
 async def test_worker_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "worker-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -204,6 +214,10 @@ async def test_research_agent_registers_configured_dispatch_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-prod-1")
     monkeypatch.setenv("TASK_QUEUE", "agent.tasks.custom-research-queue")
 
@@ -229,6 +243,10 @@ async def test_research_agent_registers_configured_dispatch_target(
 @pytest.mark.anyio
 async def test_research_agent_default_dispatch_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
     monkeypatch.setenv("AGENT_ID", "research-default")
     monkeypatch.delenv("TASK_QUEUE", raising=False)
 
@@ -251,7 +269,7 @@ async def test_research_agent_default_dispatch_target(monkeypatch: pytest.Monkey
 
 @pytest.mark.anyio
 async def test_worker_redis_bus_persists_dispatch_target_in_hash() -> None:
-    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.worker-pool-1")
+    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.worker-pool-1", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -271,7 +289,7 @@ async def test_worker_redis_bus_persists_dispatch_target_in_hash() -> None:
 
 @pytest.mark.anyio
 async def test_research_redis_bus_persists_dispatch_target_in_hash() -> None:
-    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research-alpha")
+    bus = ResearchRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.research-alpha", allow_unauthenticated_local_test=True)
     bus.client.sadd = AsyncMock()  # type: ignore[method-assign]
     bus.client.hset = AsyncMock()  # type: ignore[method-assign]
 
@@ -585,7 +603,12 @@ async def test_candidate_with_blank_dispatch_target_fails_explicitly() -> None:
 
 @pytest.mark.anyio
 async def test_production_dynamic_dispatch_via_redis_gateway_never_depends_on_capability_queue_map() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    custom_target = "agent.tasks.production-custom-node"
+    gateway = RedisGateway(
+        "redis://localhost:6379/0",
+        allow_unauthenticated_local_test=True,
+        capability_queue_contract={"general": custom_target},
+    )
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -595,7 +618,6 @@ async def test_production_dynamic_dispatch_via_redis_gateway_never_depends_on_ca
     gateway._client.pipeline = MagicMock(return_value=mock_pipe)
     gateway._client.eval = AsyncMock(return_value="OK")
 
-    custom_target = "agent.tasks.production-custom-node"
     candidate = make_candidate("worker-prod", capability="general", dispatch_target=custom_target)
     finder = FakeCandidateFinder({"general": [candidate]})
 
@@ -662,7 +684,7 @@ async def test_legacy_non_dynamic_path_preserves_enqueue_for_isolated_callers() 
 
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     mock_pipe = MagicMock()
     mock_pipe.set = MagicMock()
     mock_pipe.rpush = MagicMock()
@@ -673,31 +695,90 @@ async def test_redis_gateway_dispatch_sets_pending_status_and_pushes_to_target()
     gateway._client.eval = AsyncMock(return_value="OK")
 
     task = TaskRequested.create("Execute runtime task")
-    target = "agent.tasks.custom-executor-1"
+    target = "agent.tasks.general"
 
-    await gateway.dispatch(task, target=target)
+    await gateway.dispatch(task, target=target, capability="general")
 
     # Sets status: pending and pushes to target via atomic pipeline
     mock_pipe.set.assert_called_once_with(
         f"task.status:{task.task_id}",
         json.dumps({"task_id": task.task_id, "status": "pending"}),
     )
-    mock_pipe.rpush.assert_called_once_with(target, task.to_json())
+    mock_pipe.rpush.assert_called_once_with("agent.tasks.general", task.to_json())
     mock_pipe.execute.assert_awaited_once()
 
 
 @pytest.mark.anyio
 async def test_redis_gateway_dispatch_rejects_empty_target() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     task = TaskRequested.create("Some prompt")
 
-    with pytest.raises(ValueError, match="Dispatch target must be a non-empty string"):
+    with pytest.raises(ValueError, match="Authoritative dispatch capability is required"):
         await gateway.dispatch(task, target="   ")
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "target",
+    [
+        "",
+        " ",
+        "\n",
+        "agent.tasks.general ",
+        "agent.tasks.general-extra",
+        "task.status:task-1",
+        "agent.events",
+        "agent.ids",
+        "agent.state:worker-1",
+        "agent.hints.general",
+        "agent.tasks.research",
+        "agent.tasks.*",
+    ],
+)
+async def test_redis_gateway_dispatch_rejects_malformed_or_cross_capability_target(
+    target: object,
+) -> None:
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
+    task = TaskRequested.create("Execute general task")
+
+    gateway._client.pipeline = MagicMock(
+        side_effect=AssertionError("invalid destination must not construct a pipeline")
+    )
+    with pytest.raises(ValueError):
+        await gateway.dispatch(task, target=target, capability="general")  # type: ignore[arg-type]
+
+
+@pytest.mark.anyio
+async def test_redis_gateway_dispatch_accepts_injected_finite_custom_contract() -> None:
+    gateway = RedisGateway(
+        "redis://localhost:6379/0",
+        allow_unauthenticated_local_test=True,
+        capability_queue_contract={"general": "agent.tasks.custom-general"},
+    )
+    mock_pipe = MagicMock()
+    mock_pipe.set = MagicMock()
+    mock_pipe.rpush = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=None)
+    gateway._client.pipeline = MagicMock(return_value=mock_pipe)
+
+    task = TaskRequested.create("Execute custom task")
+    await gateway.dispatch(
+        task,
+        target="agent.tasks.custom-general",
+        capability="general",
+    )
+
+    mock_pipe.rpush.assert_called_once_with(
+        "agent.tasks.custom-general",
+        task.to_json(),
+    )
+
+
+@pytest.mark.anyio
 async def test_redis_gateway_result_lifecycle_after_dispatch() -> None:
-    gateway = RedisGateway("redis://localhost:6379/0")
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
     task_id = "test-task-lifecycle-123"
 
     # 1. While task is pending (written by dispatch)
@@ -744,6 +825,7 @@ async def test_api_create_task_dispatches_to_advertised_target() -> None:
     finder = FakeCandidateFinder({"general": [candidate]})
 
     app = create_app(
+        settings=Settings(),
         task_queue=queue,
         candidate_finder=finder,
         enforce_availability=True,
@@ -775,6 +857,7 @@ async def test_api_create_task_returns_503_when_no_candidates() -> None:
     finder = FakeCandidateFinder({"general": []})
 
     app = create_app(
+        settings=Settings(),
         task_queue=queue,
         candidate_finder=finder,
         enforce_availability=True,
@@ -798,3 +881,301 @@ async def test_api_create_task_returns_503_when_no_candidates() -> None:
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["error"] == "capability_unavailable"
     assert exc_info.value.detail["capability"] == "general"
+
+
+# ==============================================================================
+# 8. Governed dispatch_hint finite capability-to-hint contract (Issue #229 1C/B2)
+# ==============================================================================
+
+
+def _make_hint(capability: str = "general") -> WakeUpHint:
+    return WakeUpHint(
+        hint_id="hint-1",
+        capability=capability,
+        created_at="2026-11-24T00:00:00Z",
+        execution_kind="initial",
+        task_id="task-1",
+    )
+
+
+def _hint_gateway(**kwargs: object) -> RedisGateway:
+    return RedisGateway(
+        "redis://localhost:6379/0",
+        allow_unauthenticated_local_test=True,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("capability", "destination"),
+    [
+        ("general", "agent.hints.general"),
+        ("research", "agent.hints.research"),
+        ("analysis", "agent.hints.analysis"),
+    ],
+)
+async def test_dispatch_hint_canonical_mappings_succeed(
+    capability: str, destination: str
+) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+    hint = _make_hint(capability)
+
+    await gateway.dispatch_hint(hint, destination, capability=capability)
+
+    gateway._client.rpush.assert_awaited_once_with(destination, hint.to_json())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("capability", "destination"),
+    [
+        ("general", "agent.hints.general"),
+        ("research", "agent.hints.research"),
+        ("analysis", "agent.hints.analysis"),
+    ],
+)
+async def test_dispatch_hint_none_target_resolves_from_capability(
+    capability: str, destination: str
+) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+    hint = _make_hint(capability)
+
+    await gateway.dispatch_hint(hint, None, capability=capability)
+
+    gateway._client.rpush.assert_awaited_once_with(destination, hint.to_json())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("capability", "destination"),
+    [
+        ("general", "agent.hints.research"),
+        ("general", "agent.hints.analysis"),
+        ("research", "agent.hints.general"),
+        ("research", "agent.hints.analysis"),
+        ("analysis", "agent.hints.general"),
+        ("analysis", "agent.hints.research"),
+    ],
+)
+async def test_dispatch_hint_rejects_cross_capability_pair(
+    capability: str, destination: str
+) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+
+    with pytest.raises(ValueError, match="does not match authoritative capability"):
+        await gateway.dispatch_hint(_make_hint(capability), destination, capability=capability)
+
+    gateway._client.rpush.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("capability", [None, "", "unknown", 123, ["general"]])
+async def test_dispatch_hint_rejects_missing_or_unknown_capability(
+    capability: object,
+) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+
+    with pytest.raises(ValueError, match="[Aa]uthoritative hint capability|Unrecognized"):
+        await gateway.dispatch_hint(
+            _make_hint(), "agent.hints.general", capability=capability  # type: ignore[arg-type]
+        )
+
+    gateway._client.rpush.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "target",
+    [
+        "",
+        "   ",
+        "\n",
+        "\t",
+        " agent.hints.general",
+        "agent.hints.general ",
+        " agent.hints.general ",
+        "agent.hints.general\n",
+        "agent.hints.gener*",
+        "agent.hints.*",
+        "agent.hints.general?",
+        "agent.hints",
+        "agent.hints.generalx",
+        "xagent.hints.general",
+        "agent.hints.general/extra",
+        "agent.tasks.general",
+        "agent.tasks.research",
+        "task.status:task-1",
+        "task.routing:task-1",
+        "task.*",
+        "agent.events",
+        "agent.ids",
+        "agent.state:worker-1",
+        "agent.state:*",
+        "agent\\.hints\\.general",
+        "AGENT.HINTS.GENERAL",
+        "Agent.Hints.General",
+    ],
+)
+async def test_dispatch_hint_rejects_untrusted_target_variants(target: object) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+
+    with pytest.raises(ValueError):
+        await gateway.dispatch_hint(
+            _make_hint("general"), target, capability="general"  # type: ignore[arg-type]
+        )
+
+    gateway._client.rpush.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("target", [123, 4.5, b"agent.hints.general", ["agent.hints.general"]])
+async def test_dispatch_hint_rejects_non_string_target(target: object) -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+
+    with pytest.raises(ValueError, match="must be a string or omitted"):
+        await gateway.dispatch_hint(
+            _make_hint("general"), target, capability="general"  # type: ignore[arg-type]
+        )
+
+    gateway._client.rpush.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_dispatch_hint_control_character_target_fails_closed() -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+
+    with pytest.raises(ValueError):
+        await gateway.dispatch_hint(
+            _make_hint("general"), "agent.hints.general\x00", capability="general"
+        )
+    with pytest.raises(ValueError):
+        await gateway.dispatch_hint(
+            _make_hint("general"), "agent.hints.general\x07", capability="general"
+        )
+
+    gateway._client.rpush.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_dispatch_hint_sends_canonical_constant_not_raw_input() -> None:
+    gateway = _hint_gateway()
+    gateway._client.rpush = AsyncMock()
+    hint = _make_hint("research")
+    raw = "agent.hints." + "research"
+    assert raw == "agent.hints.research"
+    assert raw is not gateway._capability_hint_contract["research"]
+
+    await gateway.dispatch_hint(hint, raw, capability="research")
+
+    (destination, _payload), _kwargs = gateway._client.rpush.call_args
+    assert destination == "agent.hints.research"
+    assert destination is gateway._capability_hint_contract["research"]
+
+
+@pytest.mark.anyio
+async def test_dispatch_hint_accepts_injected_finite_custom_contract() -> None:
+    gateway = _hint_gateway(
+        capability_hint_contract={"custom": "agent.hints.custom"},
+    )
+    gateway._client.rpush = AsyncMock()
+    hint = _make_hint("general")
+
+    await gateway.dispatch_hint(hint, "agent.hints.custom", capability="custom")
+
+    gateway._client.rpush.assert_awaited_once_with("agent.hints.custom", hint.to_json())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "contract",
+    [
+        {},
+        {"": "agent.hints.empty-capability"},
+        {"custom": ""},
+        {"custom": "agent.hints.*"},
+        {"custom": "agent.hints.custom*"},
+        {"custom": "agent.hints.custom\x00"},
+        {"custom": "agent.hints.custom\n"},
+    ],
+)
+async def test_dispatch_hint_rejects_invalid_custom_contract(
+    contract: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        _hint_gateway(capability_hint_contract=contract)
+
+
+@pytest.mark.anyio
+async def test_submit_task_preserves_raw_whitespace_padded_target_and_fails_closed() -> None:
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
+    gateway._client.eval = AsyncMock(return_value="OK")
+    gateway._client.set = AsyncMock(return_value=True)
+    gateway._client.pipeline = MagicMock(
+        side_effect=AssertionError("whitespace-padded target must never construct a pipeline")
+    )
+
+    candidate = make_candidate(
+        "worker-padded",
+        capability="general",
+        dispatch_target=" agent.tasks.general ",
+    )
+    finder = FakeCandidateFinder({"general": [candidate]})
+    submit_task = SubmitTask(task_store=gateway, dispatcher=gateway, candidate_finder=finder)
+
+    with pytest.raises(ValueError, match="does not match authoritative capability"):
+        await submit_task.execute("Execute general task")
+
+    gateway._client.set.assert_awaited_once()
+    set_key, set_val = gateway._client.set.call_args.args
+    assert set_key.startswith("task.status:")
+    assert json.loads(set_val)["status"] == "dispatch_failed"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: __import__("redis.exceptions", fromlist=["NoPermissionError"]).NoPermissionError(
+            "NOPERM this user has no permissions"
+        ),
+        lambda: __import__(
+            "redis.exceptions", fromlist=["AuthenticationError"]
+        ).AuthenticationError("WRONGPASS invalid username-password pair"),
+    ],
+)
+async def test_redis_gateway_preserves_nopermission_and_authentication_errors(
+    exc_factory: Any,
+) -> None:
+    from orchestrator.domain.task import CorruptAuthoritativeRecordError
+
+    exc_type = type(exc_factory())
+    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
+    gateway._client.eval = AsyncMock(side_effect=exc_factory())
+    gateway._client.get = AsyncMock(side_effect=exc_factory())
+
+    task = TaskRequested.create("Test auth exception preservation")
+    with pytest.raises(exc_type):
+        await gateway.register_root_task(task, required_capability="general")
+
+    for method in (
+        gateway.get_status,
+        gateway.get_lineage,
+        gateway.get_required_capability,
+        gateway.get_result,
+        gateway.get_claim_expiry,
+    ):
+        with pytest.raises(exc_type):
+            await method("task-auth-exc-1")
+
+    # Malformed payload still maps to CorruptAuthoritativeRecordError
+    gateway._client.get = AsyncMock(return_value="{not-valid-json")
+    with pytest.raises(CorruptAuthoritativeRecordError):
+        await gateway.get_status("task-corrupt-1")

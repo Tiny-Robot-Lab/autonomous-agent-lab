@@ -1211,6 +1211,12 @@ def test_lifecycle_env_whitespace_and_absent_matrix(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # from_env() scenarios below exercise non-Redis validation; resolve Redis
+    # explicitly in loopback test mode so fail-closed resolution passes.
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    for _var in ("REDIS_URL", "REDIS_USERNAME", "REDIS_PASSWORD_FILE"):
+        monkeypatch.delenv(_var, raising=False)
+
     # Helper to clean environment before each scenario
     def clear_lifecycle_env() -> None:
         monkeypatch.delenv("RUNTIME_CREDENTIAL_PEPPER", raising=False)
@@ -1400,6 +1406,9 @@ def test_never_normalize_cryptographic_pepper_bytes(
         Settings(assignment_proof_pepper=PROOF_PEPPER + " ")
 
     # 3. Environment loading rejects leading, trailing, surrounding whitespace without leaking secrets
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    for _var in ("REDIS_URL", "REDIS_USERNAME", "REDIS_PASSWORD_FILE"):
+        monkeypatch.delenv(_var, raising=False)
     secret_candidate = "secret_with_trailing_space_test_12345"
     monkeypatch.setenv("TASK_DELIVERY_MODE", "legacy_push")
     monkeypatch.setenv("RUNTIME_CREDENTIAL_PEPPER", secret_candidate + " ")

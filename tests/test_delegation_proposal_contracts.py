@@ -247,7 +247,12 @@ def test_delegation_proposal_response_roundtrip():
     assert DelegationProposalResponse.from_json(resp.to_json()) == resp
 
 
-def test_settings_child_claim_deadline():
+def test_settings_child_claim_deadline(monkeypatch: pytest.MonkeyPatch):
+    # from_env() blocks below exercise non-Redis validation; resolve Redis in
+    # explicit loopback test mode so fail-closed resolution passes.
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    for _var in ("REDIS_URL", "REDIS_USERNAME", "REDIS_PASSWORD_FILE"):
+        monkeypatch.delenv(_var, raising=False)
     s = Settings()
     assert s.child_claim_deadline_seconds == 120.0
 

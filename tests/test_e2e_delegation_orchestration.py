@@ -904,6 +904,10 @@ async def test_e2e_production_loop_full_delegation_flow(monkeypatch: pytest.Monk
         monkeypatch.setenv("RUNTIME_TOKEN", RESEARCH_1_TOKEN)
         monkeypatch.setenv("RESEARCH_DELEGATION_MODE", "delegate_analysis")
         monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+        monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_USERNAME", raising=False)
+        monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
 
         bus_1 = MockEventBus([initial_hint])
         with (

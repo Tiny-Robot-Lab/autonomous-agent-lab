@@ -1,10 +1,7 @@
 import asyncio
 import json
-import os
 import uuid
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
-from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -66,73 +63,18 @@ from orchestrator.presentation.api import create_app
 from research_agent.domain.evidence import AuthorityTier, EvaluatedEvidence, SourceType
 from worker.infrastructure.redis_bus import RedisBus as WorkerRedisBus
 
+from scripts.redis_test_support import (
+    fixture_admin_client,
+    make_test_bus,
+    make_test_gateway,
+)
+
 pytestmark = [pytest.mark.anyio, pytest.mark.redis]
 
-REQUIRED_TEST_DB = "15"
-
-
-def _sanitize_redis_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        if parsed.password:
-            user = parsed.username or ""
-            host = parsed.hostname or ""
-            port = f":{parsed.port}" if parsed.port else ""
-            userinfo = f"{user}:***@" if user else ":***@"
-            masked_netloc = f"{userinfo}{host}{port}"
-            return parsed._replace(netloc=masked_netloc).geturl()
-        return url
-    except ValueError:
-        return "<invalid-url>"
-
-
-def validate_test_redis_url(url: str) -> None:
-    try:
-        parsed = urlparse(url)
-    except ValueError as exc:
-        raise ValueError(f"Invalid REDIS_URL format: {exc}") from exc
-
-    if parsed.scheme not in ("redis", "rediss"):
-        sanitized = _sanitize_redis_url(url)
-        raise ValueError(
-            f"Safety check failed: REDIS_URL scheme must be 'redis' or 'rediss', got endpoint: {sanitized}"
-        )
-
-    db_segment = parsed.path.strip("/")
-    if db_segment != REQUIRED_TEST_DB:
-        sanitized = _sanitize_redis_url(url)
-        raise ValueError(
-            f"Safety check failed: Redis integration tests require database {REQUIRED_TEST_DB} "
-            f"to prevent accidental data loss, got endpoint: {sanitized}"
-        )
-
 
 @pytest.fixture
-def redis_url() -> str:
-    url = os.getenv("REDIS_URL", "").strip()
-    if not url:
-        pytest.skip("Redis integration tests disabled: REDIS_URL environment variable is not set")
-    try:
-        validate_test_redis_url(url)
-    except ValueError as exc:
-        pytest.fail(str(exc))
-    return url
-
-
-@pytest.fixture
-async def clean_redis(redis_url: str) -> AsyncGenerator[str, None]:
-    validate_test_redis_url(redis_url)
-    client = redis.from_url(redis_url, decode_responses=True)
-    sanitized_url = _sanitize_redis_url(redis_url)
-    try:
-        await asyncio.wait_for(client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError) as exc:
-        await client.aclose()
-        pytest.fail(
-            f"Configured Redis endpoint is unreachable at {sanitized_url} within 1.0s timeout: {exc}"
-        )
-
-    # Clean before test
+async def clean_redis(redis_url: str):
+    client = fixture_admin_client(redis_url)
     await client.flushdb()
     try:
         yield redis_url
@@ -144,31 +86,39 @@ async def clean_redis(redis_url: str) -> AsyncGenerator[str, None]:
 
 
 async def test_redis_connection_and_client_lifecycle(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis, queue_name=f"agent.tasks.test_{uuid.uuid4().hex[:8]}")
+    gateway = make_test_gateway(clean_redis)
+    bus = make_test_bus(WorkerRedisBus, clean_redis, "worker-1")
 
     try:
         gateway_pong = await gateway._client.ping()
         assert gateway_pong is True
 
-        bus_pong = await bus.client.ping()
-        assert bus_pong is True
+        worker_state_write = await bus.client.hset(
+            "agent.state:worker-1",
+            mapping={"status": "idle"},
+        )
+        assert worker_state_write == 1
     finally:
         await gateway.aclose()
         await bus.aclose()
 
 
 async def test_redis_task_dispatch_and_consumption_round_trip(clean_redis: str) -> None:
-    queue_name = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis, queue_name=queue_name)
+    queue_name = "agent.tasks.general"
+    gateway = make_test_gateway(clean_redis)
+    bus = make_test_bus(
+        WorkerRedisBus,
+        clean_redis,
+        "worker-1",
+        queue_name=queue_name,
+    )
 
     try:
         task = TaskRequested.create("Perform integration analysis on real Redis wire protocol")
         task_id = task.task_id
 
         # 1. Dispatch through RedisGateway (sets task.status:{task_id} and rpush to queue)
-        await gateway.dispatch(task, target=queue_name)
+        await gateway.dispatch(task, target=queue_name, capability="general")
 
         # 2. Verify persisted pending status directly in Redis
         raw_status = await gateway._client.get(f"task.status:{task_id}")
@@ -258,9 +208,9 @@ async def test_analysis_agent_dispatch_lifecycle_and_result_round_trip(
     parent projection with a single Research hint, and that agent events stay
     observational.
     """
-    gateway = RedisGateway(clean_redis)
-    bus = AnalysisRedisBus(clean_redis)
-    agent_id = f"analysis-agent-{uuid.uuid4().hex[:8]}"
+    gateway = make_test_gateway(clean_redis)
+    bus = make_test_bus(AnalysisRedisBus, clean_redis, "analysis-agent-1")
+    agent_id = "analysis-agent-1"
     metadata = AgentCapabilityMetadata(
         agent_id=agent_id,
         agent_type="analysis-agent",
@@ -482,7 +432,7 @@ async def test_redis_completion_persistence_and_canonical_retrieval_round_trip(
     from orchestrator.application.use_cases import AcknowledgeAssignment, ClaimTask
     from orchestrator.domain.principal import RuntimePrincipal
 
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     proof_pepper = "test_completion_redis_proof_pepper_4567890123456789"
     claim_uc = ClaimTask(task_store=gateway, assignment_proof_pepper=proof_pepper, delivery_lease_seconds=30.0)
     ack_uc = AcknowledgeAssignment(task_store=gateway, assignment_proof_pepper=proof_pepper)
@@ -642,11 +592,11 @@ async def test_redis_completion_persistence_and_canonical_retrieval_round_trip(
 
 
 async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    bus = WorkerRedisBus(clean_redis)
+    gateway = make_test_gateway(clean_redis)
+    bus = make_test_bus(WorkerRedisBus, clean_redis, "worker-1")
 
     try:
-        agent_id = f"worker_{uuid.uuid4().hex[:8]}"
+        agent_id = "worker-1"
         task_id = f"task_{uuid.uuid4().hex[:8]}"
 
         telemetry = InferenceExecutionTelemetry(
@@ -703,7 +653,7 @@ async def test_redis_event_and_telemetry_round_trip(clean_redis: str) -> None:
 async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
     clean_redis: str,
 ) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         root_task = TaskRequested.create("Root task for Redis integration lifecycle")
 
@@ -740,8 +690,8 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
         assert await gateway._client.ttl(f"task.authority:{root_task.task_id}") == -1
 
         # 2. Atomic dispatch pushes to target queue and sets status to pending
-        dispatch_target = f"agent.tasks.test_{uuid.uuid4().hex[:8]}"
-        await gateway.dispatch(root_task, dispatch_target)
+        dispatch_target = "agent.tasks.general"
+        await gateway.dispatch(root_task, dispatch_target, capability="general")
 
         dispatched_status = await gateway.get_status(root_task.task_id)
         assert dispatched_status == "pending"
@@ -764,7 +714,7 @@ async def test_redis_root_registration_and_atomic_dispatch_lifecycle(
 
 
 async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         root_task = TaskRequested.create("Root task for child atomicity test")
         await gateway.register_root_task(root_task)
@@ -812,7 +762,7 @@ async def test_redis_child_registration_atomicity(clean_redis: str) -> None:
 async def test_redis_deterministic_sorted_get_children_retrieval(
     clean_redis: str,
 ) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         root_task = TaskRequested.create("Root task for sorted children test")
         await gateway.register_root_task(root_task)
@@ -860,7 +810,7 @@ async def test_redis_deterministic_sorted_get_children_retrieval(
 
 
 async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         task_id = f"task_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1006,7 +956,7 @@ async def test_redis_durable_storage_and_reference_safety(clean_redis: str) -> N
 
 
 async def test_redis_root_registration_marker_concurrency_and_partial_init(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         now = "2026-11-16T12:00:00+00:00"
         task_id = f"root_{uuid.uuid4().hex[:8]}"
@@ -1133,7 +1083,7 @@ async def test_redis_root_registration_marker_concurrency_and_partial_init(clean
 
 
 async def test_redis_continuation_latest_pointer_corruption_and_regression(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         p_id = f"parent_{uuid.uuid4().hex[:8]}"
         c_id = f"child_{uuid.uuid4().hex[:8]}"
@@ -1200,7 +1150,7 @@ async def test_redis_continuation_latest_pointer_corruption_and_regression(clean
 
 
 async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1306,7 +1256,7 @@ async def test_redis_version_gaps_concurrency_and_corrupt_payload_retrieval(clea
 
 
 async def test_redis_authority_grant_write_once_and_conflict(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         t_id = f"root_{uuid.uuid4().hex[:8]}"
         now = "2026-11-16T12:00:00+00:00"
@@ -1368,7 +1318,7 @@ async def test_redis_authority_grant_write_once_and_conflict(clean_redis: str) -
 
 
 async def test_redis_atomic_claim_acknowledgement_and_fencing_lifecycle(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
+    gateway = make_test_gateway(clean_redis)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         past = "2020-01-01T00:00:00Z"
@@ -1526,7 +1476,7 @@ async def test_redis_atomic_claim_acknowledgement_and_fencing_lifecycle(clean_re
 
 @pytest.mark.anyio
 async def test_redis_concurrent_claim_attempts_atomicity(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = make_test_gateway(redis_url)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1587,7 +1537,7 @@ async def test_redis_concurrent_claim_attempts_atomicity(redis_url: str) -> None
 
 @pytest.mark.anyio
 async def test_redis_proof_digest_state_and_idempotent_replay(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
+    gateway = make_test_gateway(redis_url)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1644,8 +1594,8 @@ async def test_redis_proof_digest_state_and_idempotent_replay(redis_url: str) ->
 
 @pytest.mark.anyio
 async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
-    client = redis.from_url(redis_url, decode_responses=False)
+    gateway = make_test_gateway(redis_url)
+    client = fixture_admin_client(redis_url, decode_responses=False)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1697,8 +1647,8 @@ async def test_redis_corrupt_claim_and_fence_state_fails_closed(redis_url: str) 
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
-    gateway = RedisGateway(redis_url)
-    client = redis.from_url(redis_url, decode_responses=False)
+    gateway = make_test_gateway(redis_url)
+    client = fixture_admin_client(redis_url, decode_responses=False)
     try:
         now = datetime.now(UTC).isoformat()
         future = "2099-01-01T00:00:00Z"
@@ -1756,8 +1706,8 @@ async def test_redis_authoritative_records_have_no_ttl(redis_url: str) -> None:
 @pytest.mark.anyio
 async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
     # Gateway configured in authenticated_claim mode
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         secret_prompt = "TOP_SECRET_PROMPT_DO_NOT_LEAK_IN_HINT_QUEUE"
         root = TaskRequested.create(secret_prompt)
@@ -1767,7 +1717,7 @@ async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
         authoritative_hint_queue = "agent.hints.research"
 
         # Dispatch via gateway under authenticated_claim mode targeting legacy queue
-        await gateway.dispatch(root, legacy_target)
+        await gateway.dispatch(root, legacy_target, capability="research")
 
         # 1. Exactly one hint in the actual authoritative hint queue
         raw_hints = await client.lrange(authoritative_hint_queue, 0, -1)
@@ -1820,8 +1770,8 @@ async def test_redis_hint_payload_secrecy(clean_redis: str) -> None:
         await client.aclose()
         await gateway.aclose()
 async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         t_id = f"root_{uuid.uuid4().hex[:8]}"
         past = "2020-01-01T00:00:00Z"
@@ -1944,14 +1894,15 @@ async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_
         assert raw_status_before is not None
         res_corrupt_grant = await client.eval(
             CLAIM_TASK_LUA,
-            7,
+            8,
             f"task.status:{t_id}",
             f"task.claim:{t_id}",
             f"task.fence:{t_id}",
-            f"task.authority_grant:{t_id}:some_grant",  # grant key provided
             f"task.required_capability:{t_id}",
             f"task.continuation_latest:{t_id}",
             f"task.authority:{t_id}",
+            f"task.claim_deadline:{t_id}",
+            f"task.authority_grant:{t_id}:some_grant",  # grant key provided at KEYS[8]
             t_id,
             now,
             "principal-research-2",
@@ -2050,8 +2001,8 @@ async def test_redis_atomic_claim_lua_two_phase_zero_mutation_on_conflict(clean_
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         now = datetime.now(UTC).isoformat()
@@ -2163,8 +2114,8 @@ async def test_redis_capability_and_lifecycle_atomic_validation(clean_redis: str
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         t_id = f"task_{uuid.uuid4().hex[:8]}"
         now = datetime.now(UTC).isoformat()
@@ -2245,8 +2196,8 @@ async def test_redis_stage_artifact_atomic_claim_validation(clean_redis: str) ->
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         t_id = f"cont_root_{uuid.uuid4().hex[:8]}"
         now = "2026-11-17T12:00:00Z"
@@ -2284,10 +2235,10 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
             f"task.status:{t_id}",
             f"task.claim:{t_id}",
             f"task.fence:{t_id}",
-            "",
             f"task.required_capability:{t_id}",
             f"task.continuation_latest:{t_id}",
             f"task.authority:{t_id}",
+            f"task.claim_deadline:{t_id}",
         ]
         res_fractional = await client.eval(
             CLAIM_TASK_LUA,
@@ -2372,8 +2323,8 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_child_registration_atomic_boundary_and_immutability(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         root_id = f"root_{uuid.uuid4().hex[:8]}"
         child_id = f"child_{uuid.uuid4().hex[:8]}"
@@ -2461,9 +2412,9 @@ async def test_redis_child_registration_atomic_boundary_and_immutability(clean_r
         await gateway.aclose()
 @pytest.mark.anyio
 async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean_redis: str) -> None:
-    gateway_claim = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    gateway_legacy = RedisGateway(clean_redis, delivery_mode="legacy_push")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway_claim = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    gateway_legacy = make_test_gateway(clean_redis, delivery_mode="legacy_push")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         t_id_1 = f"task_{uuid.uuid4().hex[:8]}"
         task_1 = TaskRequested.create("Hint routing task 1")
@@ -2471,7 +2422,7 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
         object.__setattr__(task_1, "root_task_id", t_id_1)
 
         # 1. Explicit research capability plus a custom target routes to agent.hints.research
-        await gateway_claim.dispatch(task_1, target="custom.legacy.target", capability="research")
+        await gateway_claim.dispatch(task_1, target="agent.tasks.research", capability="research")
         hints_research = await client.lrange("agent.hints.research", 0, -1)
         assert len(hints_research) == 1
         raw_hint_1 = hints_research[0]
@@ -2487,7 +2438,7 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
         task_2 = TaskRequested.create("Hint routing task 2")
         object.__setattr__(task_2, "task_id", t_id_2)
         object.__setattr__(task_2, "root_task_id", t_id_2)
-        await gateway_claim.dispatch(task_2, target="agent.tasks.general")
+        await gateway_claim.dispatch(task_2, target="agent.tasks.general", capability="general")
         hints_general = await client.lrange("agent.hints.general", 0, -1)
         assert len(hints_general) == 1
         raw_hint_2 = hints_general[0]
@@ -2503,8 +2454,8 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
         task_3 = TaskRequested.create("Hint routing task 3")
         object.__setattr__(task_3, "task_id", t_id_3)
         object.__setattr__(task_3, "root_task_id", t_id_3)
-        with pytest.raises(ValueError, match="Cannot derive recognized canonical capability"):
-            await gateway_claim.dispatch(task_3, target="custom.arbitrary.queue")
+        with pytest.raises(ValueError, match="Dispatch target does not match authoritative capability"):
+            await gateway_claim.dispatch(task_3, target="custom.arbitrary.queue", capability="general")
         assert await client.exists(f"task.status:{t_id_3}") == 0
         assert await client.exists("custom.arbitrary.queue") == 0
 
@@ -2513,7 +2464,7 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
         task_4 = TaskRequested.create("Hint routing task 4")
         object.__setattr__(task_4, "task_id", t_id_4)
         object.__setattr__(task_4, "root_task_id", t_id_4)
-        with pytest.raises(ValueError, match="Unrecognized canonical capability"):
+        with pytest.raises(ValueError, match="Unrecognized authoritative dispatch capability"):
             await gateway_claim.dispatch(task_4, target="agent.tasks.general", capability="unrecognized_specialty")
         assert await client.exists(f"task.status:{t_id_4}") == 0
 
@@ -2522,7 +2473,7 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
         task_5 = TaskRequested.create("Legacy push task")
         object.__setattr__(task_5, "task_id", t_id_5)
         object.__setattr__(task_5, "root_task_id", t_id_5)
-        await gateway_legacy.dispatch(task_5, target="agent.tasks.general")
+        await gateway_legacy.dispatch(task_5, target="agent.tasks.general", capability="general")
         legacy_items = await client.lrange("agent.tasks.general", 0, -1)
         assert len(legacy_items) == 1
         raw_pushed = legacy_items[0]
@@ -2537,8 +2488,8 @@ async def test_redis_authenticated_claim_hint_routing_and_legacy_isolation(clean
 
 @pytest.mark.anyio
 async def test_redis_registration_capability_validation_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis)
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         now = datetime.now(UTC).isoformat()
         root_id = f"root_{uuid.uuid4().hex[:8]}"
@@ -2644,8 +2595,8 @@ async def test_redis_registration_capability_validation_and_zero_mutation(clean_
 
 @pytest.mark.anyio
 async def test_redis_delegation_acceptance_and_zero_mutation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         now = datetime.now(UTC).isoformat()
         parent_id = f"parent_{uuid.uuid4().hex[:8]}"
@@ -2963,8 +2914,8 @@ async def test_redis_delegation_acceptance_and_zero_mutation(clean_redis: str) -
 
 @pytest.mark.anyio
 async def test_redis_lua_delegation_authority_and_artifact_validations(clean_redis: str) -> None:
-    client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_val_{uuid.uuid4().hex[:8]}"
 
@@ -3475,8 +3426,8 @@ async def assert_zero_delegation_mutations(
 
 @pytest.mark.anyio
 async def test_redis_lua_delegation_zero_mutation_rejection_coverage(clean_redis: str) -> None:
-    client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_rej_{uuid.uuid4().hex[:8]}"
     prop_id = "prop-rej-1"
@@ -3853,8 +3804,8 @@ async def test_redis_lua_delegation_zero_mutation_rejection_coverage(clean_redis
 
 @pytest.mark.anyio
 async def test_redis_concurrent_first_acceptance_atomicity(clean_redis: str) -> None:
-    client = redis.from_url(clean_redis, decode_responses=True)
-    gateway = RedisGateway(clean_redis)
+    client = fixture_admin_client(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis)
     now = datetime.now(UTC).isoformat()
     parent_id = f"parent_conc_{uuid.uuid4().hex[:8]}"
     prop_id = "prop-conc-1"
@@ -4165,8 +4116,8 @@ def _build_test_proposal(
 
 
 async def test_redis_lua_delegation_exact_bounds_enforcement(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
 
@@ -4278,8 +4229,8 @@ async def test_redis_lua_delegation_exact_bounds_enforcement(clean_redis: str) -
         await gateway.aclose()
 
 async def test_redis_lua_delegation_parent_input_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
         input_key = f"task.input:{parent_id}:1"
@@ -4408,8 +4359,8 @@ async def test_redis_lua_delegation_parent_input_validation(clean_redis: str) ->
         await gateway.aclose()
 
 async def test_redis_lua_delegation_artifact_provenance_validation(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
         artifact_key = f"task.artifact:{parent_id}:{art_ref.artifact_id}:{art_ref.artifact_version}"
@@ -4459,8 +4410,8 @@ async def test_redis_lua_delegation_artifact_provenance_validation(clean_redis: 
         await gateway.aclose()
 
 async def test_redis_lua_delegation_bound_agent_id_enforcement(clean_redis: str) -> None:
-    gateway = RedisGateway(clean_redis, delivery_mode="authenticated_claim")
-    client = redis.from_url(clean_redis, decode_responses=True)
+    gateway = make_test_gateway(clean_redis, delivery_mode="authenticated_claim")
+    client = fixture_admin_client(clean_redis, decode_responses=True)
     try:
         parent_id, asgn_id, grant, _claim, art_ref, now = await _setup_claimed_parent(gateway)
 

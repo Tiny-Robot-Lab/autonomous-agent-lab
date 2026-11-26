@@ -206,6 +206,9 @@ def test_settings_execution_claim_timeout_bounds(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(ValueError, match="execution_claim_timeout_seconds must be a number between 60.0 and 7200.0"):
         Settings(execution_claim_timeout_seconds=7201.0)
 
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    for _var in ("REDIS_URL", "REDIS_USERNAME", "REDIS_PASSWORD_FILE"):
+        monkeypatch.delenv(_var, raising=False)
     monkeypatch.setenv("EXECUTION_CLAIM_TIMEOUT_SECONDS", "300")
     s_env = Settings.from_env()
     assert s_env.execution_claim_timeout_seconds == 300.0

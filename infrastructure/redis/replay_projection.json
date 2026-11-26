@@ -1,0 +1,1245 @@
+{
+  "adr_reference": "docs/adr/0009-disabled-default-user-write-only-aof-replay-authority.md",
+  "audit_version": 3,
+  "copies_agree": {
+    "entrypoint_canonical": true,
+    "template": true
+  },
+  "default_rule": "user default off resetpass resetkeys resetchannels -@all +select (+set %W~task.registration:* %W~task.status:* %W~task.lineage:* %W~task.input:* %W~task.authority:* %W~task.authority_grant:* %W~task.required_capability:* %W~task.artifact:* %W~task.continuation:* %W~task.continuation_latest:* %W~task.claim:* %W~task.claim_deadline:* %W~task.claim_expiry:* %W~task.fence:* %W~task.delegation_proposal:* %W~task.assignment_yield:* %W~task.completion:* %W~task.outcome:* %W~task.result:* %W~task.assignment_completion:* %W~task.child_completion:* %W~task.recovery_decision:*) (+del %W~task.claim:*) (+sadd %W~task.children:* %W~task.artifacts:* %W~task.consumed_waves:* %W~task.consumed_grants:* %W~task.delegation_decisions:*) (+rpush %W~agent.hints.general %W~agent.hints.research %W~agent.hints.analysis %W~agent.tasks.general %W~agent.tasks.research %W~agent.tasks.analysis) (+xadd %W~agent.events)",
+  "excluded_pairs": [
+    {
+      "pair": [
+        "RPUSH",
+        "agent.hints.analysis"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "RPUSH",
+        "agent.hints.general"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "RPUSH",
+        "agent.hints.research"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.claim:*"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.routing:*"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.status:*"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "XADD",
+        "agent.events"
+      ],
+      "reason": "ordinary direct write"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.authority:*"
+      ],
+      "reason": "single-effect Lua",
+      "script": "SAVE_ROOT_AUTHORITY_LUA"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.authority_grant:*"
+      ],
+      "reason": "single-effect Lua",
+      "script": "SAVE_AUTHORITY_GRANT_LUA"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.claim:*"
+      ],
+      "reason": "single-effect Lua",
+      "script": "ACKNOWLEDGE_CLAIM_LUA"
+    },
+    {
+      "pair": [
+        "SET",
+        "task.input:*"
+      ],
+      "reason": "single-effect Lua",
+      "script": "SAVE_TASK_INPUT_LUA"
+    }
+  ],
+  "governed_contract": {
+    "analysis": "agent.tasks.analysis",
+    "general": "agent.tasks.general",
+    "research": "agent.tasks.research"
+  },
+  "governed_destination_contract_source": "services/orchestrator/src/orchestrator/infrastructure/redis_adapter.py",
+  "governed_hint_contract": {
+    "analysis": "agent.hints.analysis",
+    "general": "agent.hints.general",
+    "research": "agent.hints.research"
+  },
+  "lua_scripts": {
+    "ACCEPT_DELEGATION_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 0,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.delegation_proposal:*"
+        ],
+        "10": [
+          "task.delegation_decisions:*"
+        ],
+        "11": [
+          "task.assignment_yield:*"
+        ],
+        "12": [
+          "task.continuation:*"
+        ],
+        "13": [
+          "task.continuation_latest:*"
+        ],
+        "14": [
+          "task.artifact:*"
+        ],
+        "15": [
+          "task.input:*"
+        ],
+        "16": [
+          "task.children:*"
+        ],
+        "17": [
+          "task.status:*"
+        ],
+        "18": [
+          "task.lineage:*"
+        ],
+        "19": [
+          "task.required_capability:*"
+        ],
+        "2": [
+          "task.status:*"
+        ],
+        "20": [
+          "task.input:*"
+        ],
+        "21": [
+          "task.claim_deadline:*"
+        ],
+        "22": [
+          "task.fence:*"
+        ],
+        "23": [
+          "agent.hints.analysis"
+        ],
+        "3": [
+          "task.claim:*"
+        ],
+        "4": [
+          "task.fence:*"
+        ],
+        "5": [
+          "task.lineage:*"
+        ],
+        "6": [
+          "task.authority:*"
+        ],
+        "7": [
+          "task.authority_grant:*"
+        ],
+        "8": [
+          "task.consumed_waves:*"
+        ],
+        "9": [
+          "task.consumed_grants:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.delegation_proposal:*"
+          ],
+          "key": "proposal_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "child_status_key",
+          "keys_index": 17
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.lineage:*"
+          ],
+          "key": "child_lineage_key",
+          "keys_index": 18
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.required_capability:*"
+          ],
+          "key": "child_capability_key",
+          "keys_index": 19
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.input:*"
+          ],
+          "key": "child_input_key",
+          "keys_index": 20
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.claim_deadline:*"
+          ],
+          "key": "child_deadline_key",
+          "keys_index": 21
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.fence:*"
+          ],
+          "key": "child_fence_key",
+          "keys_index": 22
+        },
+        {
+          "command": "SADD",
+          "conditional": false,
+          "families": [
+            "task.children:*"
+          ],
+          "key": "parent_children_key",
+          "keys_index": 16
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.continuation:*"
+          ],
+          "key": "continuation_key",
+          "keys_index": 12
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.continuation_latest:*"
+          ],
+          "key": "continuation_latest_key",
+          "keys_index": 13
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "parent_status_key",
+          "keys_index": 2
+        },
+        {
+          "command": "DEL",
+          "conditional": false,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "parent_claim_key",
+          "keys_index": 3
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.assignment_yield:*"
+          ],
+          "key": "yield_key",
+          "keys_index": 11
+        },
+        {
+          "command": "SADD",
+          "conditional": false,
+          "families": [
+            "task.consumed_waves:*"
+          ],
+          "key": "waves_key",
+          "keys_index": 8
+        },
+        {
+          "command": "SADD",
+          "conditional": false,
+          "families": [
+            "task.consumed_grants:*"
+          ],
+          "key": "grants_key",
+          "keys_index": 9
+        },
+        {
+          "command": "SADD",
+          "conditional": false,
+          "families": [
+            "task.delegation_decisions:*"
+          ],
+          "key": "decisions_key",
+          "keys_index": 10
+        },
+        {
+          "command": "RPUSH",
+          "conditional": false,
+          "families": [
+            "agent.hints.analysis"
+          ],
+          "key": "hint_queue_key",
+          "keys_index": 23
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 17
+    },
+    "ACKNOWLEDGE_CLAIM_LUA": {
+      "classification": "single-effect",
+      "conditional_sites": 0,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.claim:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "claim_key",
+          "keys_index": 1
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 1
+    },
+    "CLAIM_TASK_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.status:*"
+        ],
+        "2": [
+          "task.claim:*"
+        ],
+        "3": [
+          "task.fence:*"
+        ],
+        "4": [
+          "task.required_capability:*"
+        ],
+        "5": [
+          "task.continuation_latest:*"
+        ],
+        "6": [
+          "task.authority:*"
+        ],
+        "7": [
+          "task.claim_deadline:*"
+        ],
+        "8": [
+          "task.authority_grant:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.fence:*"
+          ],
+          "key": "fence_key",
+          "keys_index": 3
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "claim_key",
+          "keys_index": 2
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.authority_grant:*"
+          ],
+          "key": "grant_key",
+          "keys_index": 8
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 4
+    },
+    "COMPLETE_TURN_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 4,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.completion:*"
+        ],
+        "10": [
+          "task.children:*"
+        ],
+        "11": [
+          "task.continuation:*"
+        ],
+        "12": [
+          "task.continuation_latest:*"
+        ],
+        "13": [
+          "task.child_completion:*"
+        ],
+        "14": [
+          "agent.hints.research"
+        ],
+        "2": [
+          "task.status:*"
+        ],
+        "3": [
+          "task.claim:*"
+        ],
+        "4": [
+          "task.fence:*"
+        ],
+        "5": [
+          "task.outcome:*"
+        ],
+        "6": [
+          "task.result:*"
+        ],
+        "7": [
+          "task.assignment_completion:*"
+        ],
+        "8": [
+          "task.lineage:*"
+        ],
+        "9": [
+          "task.status:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.completion:*"
+          ],
+          "key": "completion_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.outcome:*"
+          ],
+          "key": "outcome_key",
+          "keys_index": 5
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.result:*"
+          ],
+          "key": "result_key",
+          "keys_index": 6
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.assignment_completion:*"
+          ],
+          "key": "audit_key",
+          "keys_index": 7
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 2
+        },
+        {
+          "command": "DEL",
+          "conditional": false,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "claim_key",
+          "keys_index": 3
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.child_completion:*"
+          ],
+          "key": "child_marker_key",
+          "keys_index": 13
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "parent_status_key",
+          "keys_index": 9
+        },
+        {
+          "command": "RPUSH",
+          "conditional": true,
+          "families": [
+            "agent.hints.research"
+          ],
+          "key": "hint_queue_key",
+          "keys_index": 14
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 9
+    },
+    "EXPIRE_DELIVERY_LEASE_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 2,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.claim:*"
+        ],
+        "2": [
+          "task.status:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "DEL",
+          "conditional": true,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "claim_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 2
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 2
+    },
+    "MATERIALIZE_CLAIM_TIMEOUT_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 0,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.status:*"
+        ],
+        "10": [
+          "task.continuation_latest:*"
+        ],
+        "11": [
+          "task.child_completion:*"
+        ],
+        "12": [
+          "agent.hints.research"
+        ],
+        "2": [
+          "task.claim:*"
+        ],
+        "3": [
+          "task.claim_deadline:*"
+        ],
+        "4": [
+          "task.outcome:*"
+        ],
+        "5": [
+          "task.result:*"
+        ],
+        "6": [
+          "task.lineage:*"
+        ],
+        "7": [
+          "task.status:*"
+        ],
+        "8": [
+          "task.children:*"
+        ],
+        "9": [
+          "task.continuation:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.outcome:*"
+          ],
+          "key": "child_outcome_key",
+          "keys_index": 4
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "child_status_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.child_completion:*"
+          ],
+          "key": "child_marker_key",
+          "keys_index": 11
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "parent_status_key",
+          "keys_index": 7
+        },
+        {
+          "command": "RPUSH",
+          "conditional": false,
+          "families": [
+            "agent.hints.research"
+          ],
+          "key": "hint_queue_key",
+          "keys_index": 12
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 5
+    },
+    "REGISTER_CHILD_TASK_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 4,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.status:*"
+        ],
+        "2": [
+          "task.lineage:*"
+        ],
+        "3": [
+          "task.required_capability:*"
+        ],
+        "4": [
+          "task.children:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.lineage:*"
+          ],
+          "key": "lineage_key",
+          "keys_index": 2
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.required_capability:*"
+          ],
+          "key": "capability_key",
+          "keys_index": 3
+        },
+        {
+          "command": "SADD",
+          "conditional": true,
+          "families": [
+            "task.children:*"
+          ],
+          "key": "parent_children_key",
+          "keys_index": 4
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 4
+    },
+    "REGISTER_ROOT_TASK_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 6,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.registration:*"
+        ],
+        "2": [
+          "task.status:*"
+        ],
+        "3": [
+          "task.lineage:*"
+        ],
+        "4": [
+          "task.input:*"
+        ],
+        "5": [
+          "task.authority:*"
+        ],
+        "6": [
+          "task.required_capability:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.registration:*"
+          ],
+          "key": "marker_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 2
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.lineage:*"
+          ],
+          "key": "lineage_key",
+          "keys_index": 3
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.input:*"
+          ],
+          "key": "input_key",
+          "keys_index": 4
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.authority:*"
+          ],
+          "key": "authority_key",
+          "keys_index": 5
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.required_capability:*"
+          ],
+          "key": "capability_key",
+          "keys_index": 6
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 6
+    },
+    "RESOLVE_EXPIRED_CLAIM_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 0,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.status:*"
+        ],
+        "2": [
+          "task.claim:*"
+        ],
+        "3": [
+          "task.fence:*"
+        ],
+        "4": [
+          "task.claim_expiry:*"
+        ],
+        "5": [
+          "task.recovery_decision:*"
+        ],
+        "6": [
+          "task.outcome:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.recovery_decision:*"
+          ],
+          "key": "decision_key",
+          "keys_index": 5
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 1
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 2
+    },
+    "SAVE_AUTHORITY_GRANT_LUA": {
+      "classification": "single-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.authority_grant:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.authority_grant:*"
+          ],
+          "key": "key",
+          "keys_index": 1
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 1
+    },
+    "SAVE_CONTINUATION_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 2,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.continuation:*"
+        ],
+        "2": [
+          "task.continuation_latest:*"
+        ],
+        "3": [
+          "task.continuation:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.continuation:*"
+          ],
+          "key": "target_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.continuation_latest:*"
+          ],
+          "key": "latest_key",
+          "keys_index": 2
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 2
+    },
+    "SAVE_ROOT_AUTHORITY_LUA": {
+      "classification": "single-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.authority:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.authority:*"
+          ],
+          "key": "key",
+          "keys_index": 1
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 1
+    },
+    "SAVE_STAGE_ARTIFACT_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.artifact:*"
+        ],
+        "2": [
+          "task.artifacts:*"
+        ],
+        "3": [
+          "task.claim:*"
+        ],
+        "4": [
+          "task.fence:*"
+        ],
+        "5": [
+          "task.artifact:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SADD",
+          "conditional": true,
+          "families": [
+            "task.artifacts:*"
+          ],
+          "key": "index_key",
+          "keys_index": 2
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.artifact:*"
+          ],
+          "key": "target_key",
+          "keys_index": 1
+        },
+        {
+          "command": "SADD",
+          "conditional": false,
+          "families": [
+            "task.artifacts:*"
+          ],
+          "key": "index_key",
+          "keys_index": 2
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 2
+    },
+    "SAVE_TASK_INPUT_LUA": {
+      "classification": "single-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.input:*"
+        ],
+        "2": [
+          "task.input:*"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "SET",
+          "conditional": true,
+          "families": [
+            "task.input:*"
+          ],
+          "key": "target_key",
+          "keys_index": 1
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 1
+    },
+    "TRANSITION_EXPIRED_CLAIM_LUA": {
+      "classification": "multi-effect",
+      "conditional_sites": 1,
+      "has_dynamic_mutation": false,
+      "has_mutating_loop": false,
+      "invocation_families": {
+        "1": [
+          "task.status:*"
+        ],
+        "2": [
+          "task.claim:*"
+        ],
+        "3": [
+          "task.fence:*"
+        ],
+        "4": [
+          "task.claim_expiry:*"
+        ],
+        "5": [
+          "task.outcome:*"
+        ],
+        "6": [
+          "task.result:*"
+        ],
+        "7": [
+          "agent.events"
+        ]
+      },
+      "invoked_in_outer_transaction": false,
+      "mutations": [
+        {
+          "command": "DEL",
+          "conditional": false,
+          "families": [
+            "task.claim:*"
+          ],
+          "key": "claim_key",
+          "keys_index": 2
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.claim_expiry:*"
+          ],
+          "key": "expiry_key",
+          "keys_index": 4
+        },
+        {
+          "command": "SET",
+          "conditional": false,
+          "families": [
+            "task.status:*"
+          ],
+          "key": "status_key",
+          "keys_index": 1
+        },
+        {
+          "command": "XADD",
+          "conditional": true,
+          "families": [
+            "agent.events"
+          ],
+          "key": "events_key",
+          "keys_index": 7
+        }
+      ],
+      "path_sensitive": true,
+      "worst_case_mutations": 4
+    }
+  },
+  "notes": "Semantic proof is re-derived from production code on every run; artifact equality only detects drift. worst_case_mutations is the path-sensitive maximum: sequential statements accumulate, each if contributes its largest reachable branch (implicit zero branch without else), and early return terminates its path. mutations is the pair union over every reachable site, so a script can remain single-effect per path while justifying several command/family pairs.",
+  "ordinary_dynamic_sites": [],
+  "pipeline_writes": [
+    "RPUSH:agent.hints.analysis",
+    "RPUSH:agent.hints.general",
+    "RPUSH:agent.hints.research",
+    "RPUSH:agent.tasks.analysis",
+    "RPUSH:agent.tasks.general",
+    "RPUSH:agent.tasks.research",
+    "SET:task.status:*"
+  ],
+  "qualifying_pairs": [
+    "DEL:task.claim:*",
+    "RPUSH:agent.hints.analysis",
+    "RPUSH:agent.hints.general",
+    "RPUSH:agent.hints.research",
+    "RPUSH:agent.tasks.analysis",
+    "RPUSH:agent.tasks.general",
+    "RPUSH:agent.tasks.research",
+    "SADD:task.artifacts:*",
+    "SADD:task.children:*",
+    "SADD:task.consumed_grants:*",
+    "SADD:task.consumed_waves:*",
+    "SADD:task.delegation_decisions:*",
+    "SET:task.artifact:*",
+    "SET:task.assignment_completion:*",
+    "SET:task.assignment_yield:*",
+    "SET:task.authority:*",
+    "SET:task.authority_grant:*",
+    "SET:task.child_completion:*",
+    "SET:task.claim:*",
+    "SET:task.claim_deadline:*",
+    "SET:task.claim_expiry:*",
+    "SET:task.completion:*",
+    "SET:task.continuation:*",
+    "SET:task.continuation_latest:*",
+    "SET:task.delegation_proposal:*",
+    "SET:task.fence:*",
+    "SET:task.input:*",
+    "SET:task.lineage:*",
+    "SET:task.outcome:*",
+    "SET:task.recovery_decision:*",
+    "SET:task.registration:*",
+    "SET:task.required_capability:*",
+    "SET:task.result:*",
+    "SET:task.status:*",
+    "XADD:agent.events"
+  ],
+  "rule_model": {
+    "has_select": true,
+    "selectors": {
+      "DEL": [
+        "task.claim:*"
+      ],
+      "RPUSH": [
+        "agent.hints.analysis",
+        "agent.hints.general",
+        "agent.hints.research",
+        "agent.tasks.analysis",
+        "agent.tasks.general",
+        "agent.tasks.research"
+      ],
+      "SADD": [
+        "task.artifacts:*",
+        "task.children:*",
+        "task.consumed_grants:*",
+        "task.consumed_waves:*",
+        "task.delegation_decisions:*"
+      ],
+      "SET": [
+        "task.artifact:*",
+        "task.assignment_completion:*",
+        "task.assignment_yield:*",
+        "task.authority:*",
+        "task.authority_grant:*",
+        "task.child_completion:*",
+        "task.claim:*",
+        "task.claim_deadline:*",
+        "task.claim_expiry:*",
+        "task.completion:*",
+        "task.continuation:*",
+        "task.continuation_latest:*",
+        "task.delegation_proposal:*",
+        "task.fence:*",
+        "task.input:*",
+        "task.lineage:*",
+        "task.outcome:*",
+        "task.recovery_decision:*",
+        "task.registration:*",
+        "task.required_capability:*",
+        "task.result:*",
+        "task.status:*"
+      ],
+      "XADD": [
+        "agent.events"
+      ]
+    }
+  },
+  "select_justification": "server-generated SELECT during AOF replay of qualifying transactional and multi-effect Lua writes",
+  "transactional_pipelines": [
+    "dispatch"
+  ]
+}

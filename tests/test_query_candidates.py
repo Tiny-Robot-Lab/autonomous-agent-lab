@@ -11,6 +11,7 @@ from orchestrator.application import (
     FindCandidatesByCapability,
     QueryAgentsByCapability,
 )
+from orchestrator.config import Settings
 from orchestrator.domain import AgentCapability
 from orchestrator.presentation.api import candidates as candidates_endpoint
 from orchestrator.presentation.api import create_app
@@ -473,6 +474,7 @@ async def test_api_candidates_endpoint() -> None:
         ]
     )
     app = create_app(
+        settings=Settings(),
         task_queue=FakeTaskQueue(),
         state_reader=fake_reader,
     )

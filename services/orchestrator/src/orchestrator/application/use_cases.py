@@ -299,7 +299,6 @@ class SubmitTask:
                     f"Selected candidate '{selected_candidate.agent_id}' does not have a valid dispatch target advertised"
                 )
 
-            clean_target = target.strip()
             message = TaskRequested.create(task.prompt)
 
             evaluated_candidates = [
@@ -328,7 +327,7 @@ class SubmitTask:
             ).__name__
             override_provenance = " (explicit capability override)" if is_explicit_override else ""
             rationale = (
-                f"Selected agent '{selected_candidate.agent_id}' targeting '{clean_target}' "
+                f"Selected agent '{selected_candidate.agent_id}' targeting '{target}' "
                 f"from {len(candidates)} candidate(s) using {policy_name} for capability '{resolved_capability.value}'"
                 f"{override_provenance}"
             )
@@ -339,7 +338,7 @@ class SubmitTask:
                 required_capabilities=[resolved_capability.value],
                 candidates_evaluated=evaluated_candidates,
                 selected_agent_id=selected_candidate.agent_id,
-                dispatch_target=clean_target,
+                dispatch_target=target,
                 rationale=rationale,
                 provenance=provenance.to_dict(),
             )
@@ -362,7 +361,7 @@ class SubmitTask:
                 try:
                     await self._dispatcher.dispatch(
                         message,
-                        clean_target,
+                        target,
                         capability=resolved_cap_str,
                     )
                     return message
@@ -374,7 +373,7 @@ class SubmitTask:
             # that implement TaskQueue but not TaskDispatcher
             if self._queue is not None:
                 try:
-                    await self._queue.enqueue(message, resolved_capability, target=clean_target)
+                    await self._queue.enqueue(message, resolved_capability, target=target)
                 except Exception:
                     await self._task_store.update_status(message.task_id, "dispatch_failed")
                     raise
