@@ -270,10 +270,17 @@ class InMemoryPipeline:
         pass
 
 
-def make_test_environment() -> tuple[Any, InMemoryRedis]:
+def make_test_environment(
+    *,
+    capability_queue_contract: dict[str, str] | None = None,
+) -> tuple[Any, InMemoryRedis]:
     """Instantiate the production FastAPI orchestrator wired to an in-memory Redis store."""
     store = InMemoryRedis()
-    gateway = RedisGateway("redis://localhost:6379/0", allow_unauthenticated_local_test=True)
+    gateway = RedisGateway(
+        "redis://localhost:6379/0",
+        allow_unauthenticated_local_test=True,
+        capability_queue_contract=capability_queue_contract,
+    )
     gateway._client = store
     app = create_app(settings=Settings(), gateway=gateway, enforce_availability=True)
     return app, store
@@ -355,7 +362,7 @@ async def test_e2e_runtime_registration_and_dynamic_routing() -> None:
     app, store = make_test_environment()
 
     # Agent uses custom non-default dispatch queue
-    target_queue = "agent.tasks.custom-worker-1"
+    target_queue = "agent.tasks.general"
     agent_bus = WorkerRedisBus("redis://localhost:6379/0", queue_name=target_queue, allow_unauthenticated_local_test=True)
     agent_bus.client = store
 
@@ -442,11 +449,11 @@ async def test_e2e_specialized_research_agent_dynamic_routing(
     """Verifies prompt classification dynamically routes research tasks to specialized research agents."""
     app, store = make_test_environment()
 
-    worker_queue = "agent.tasks.general-worker"
+    worker_queue = "agent.tasks.general"
     worker_bus = WorkerRedisBus("redis://localhost:6379/0", queue_name=worker_queue, allow_unauthenticated_local_test=True)
     worker_bus.client = store
 
-    research_queue = "agent.tasks.deep-research"
+    research_queue = "agent.tasks.research"
     research_bus = ResearchRedisBus("redis://localhost:6379/0", queue_name=research_queue, allow_unauthenticated_local_test=True)
     research_bus.client = store
 
@@ -505,13 +512,15 @@ async def test_e2e_specialized_research_agent_dynamic_routing(
 @pytest.mark.anyio
 async def test_e2e_multiple_candidates_evaluated_and_selected_deterministically() -> None:
     """Verifies when multiple eligible agents exist, all are evaluated and one is deterministically selected."""
-    app, store = make_test_environment()
+    app, store = make_test_environment(
+        capability_queue_contract={"general": "agent.tasks.alpha-queue"},
+    )
 
-    # Register three eligible agents with distinct alphabetical IDs
+    # Register three eligible agents with distinct alphabetical IDs and distinct queues
     agents_info = [
-        ("worker-charlie", "agent.tasks.charlie"),
-        ("worker-alpha", "agent.tasks.alpha"),
-        ("worker-bravo", "agent.tasks.bravo"),
+        ("worker-charlie", "agent.tasks.charlie-queue"),
+        ("worker-alpha", "agent.tasks.alpha-queue"),
+        ("worker-bravo", "agent.tasks.bravo-queue"),
     ]
 
     for agent_id, target in agents_info:
@@ -550,18 +559,16 @@ async def test_e2e_multiple_candidates_evaluated_and_selected_deterministically(
 
         # Deterministic selection policy selects worker-alpha (lexicographical leader)
         assert decision["selected_agent_id"] == "worker-alpha"
-        assert decision["dispatch_target"] == "agent.tasks.alpha"
+        assert decision["dispatch_target"] == "agent.tasks.alpha-queue"
 
         # Verify task is on alpha's queue, and not on bravo or charlie
-        alpha_bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.alpha", allow_unauthenticated_local_test=True)
+        alpha_bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.alpha-queue", allow_unauthenticated_local_test=True)
         alpha_bus.client = store
         dispatched_task = await alpha_bus.next_task()
         assert dispatched_task.task_id == task_id
 
-        bravo_bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.bravo", allow_unauthenticated_local_test=True)
-        bravo_bus.client = store
-        bravo_item = await store.blpop("agent.tasks.bravo", timeout=0)
-        assert bravo_item is None
+        assert await store.blpop("agent.tasks.bravo-queue", timeout=0) is None
+        assert await store.blpop("agent.tasks.charlie-queue", timeout=0) is None
 
 
 # ==============================================================================
@@ -637,7 +644,7 @@ async def test_e2e_failover_to_secondary_candidate_when_primary_fails() -> None:
         mapping={
             "agent_id": "worker-alpha",
             "capabilities": json.dumps(["general"]),
-            "dispatch_target": "agent.tasks.alpha",
+            "dispatch_target": "agent.tasks.general",
             "state": "offline",
             "updated_at": now_str,
         },
@@ -649,7 +656,7 @@ async def test_e2e_failover_to_secondary_candidate_when_primary_fails() -> None:
         mapping={
             "agent_id": "worker-beta",
             "capabilities": json.dumps(["general"]),
-            "dispatch_target": "agent.tasks.beta",
+            "dispatch_target": "agent.tasks.general",
             "state": "idle",
             "updated_at": now_str,
         },
@@ -668,10 +675,10 @@ async def test_e2e_failover_to_secondary_candidate_when_primary_fails() -> None:
 
         # worker-beta selected because worker-alpha is offline
         assert decision["selected_agent_id"] == "worker-beta"
-        assert decision["dispatch_target"] == "agent.tasks.beta"
+        assert decision["dispatch_target"] == "agent.tasks.general"
 
         # Verify task is enqueued to beta's queue
-        beta_item = await store.blpop("agent.tasks.beta", timeout=0)
+        beta_item = await store.blpop("agent.tasks.general", timeout=0)
         assert beta_item is not None
         assert task_id in beta_item[1]
 
@@ -685,7 +692,7 @@ async def test_e2e_failover_to_secondary_candidate_when_primary_fails() -> None:
 async def test_e2e_runtime_lifecycle_transitions_without_orchestrator_reconfiguration() -> None:
     """Verifies that the orchestrator adapts dynamically as an agent transitions states over time."""
     app, store = make_test_environment()
-    target_queue = "agent.tasks.lifecycle-worker"
+    target_queue = "agent.tasks.general"
     bus = WorkerRedisBus("redis://localhost:6379/0", queue_name=target_queue, allow_unauthenticated_local_test=True)
     bus.client = store
 
@@ -735,7 +742,7 @@ async def test_e2e_runtime_lifecycle_transitions_without_orchestrator_reconfigur
 async def test_e2e_observability_endpoints_and_secret_redaction() -> None:
     """Verifies that agents, candidates, routing decisions, and events are fully queryable and sanitize secrets."""
     app, store = make_test_environment()
-    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.obs", allow_unauthenticated_local_test=True)
+    bus = WorkerRedisBus("redis://localhost:6379/0", queue_name="agent.tasks.general", allow_unauthenticated_local_test=True)
     bus.client = store
 
     # 0. Verify contracts actively reject sensitive credentials at creation time
@@ -744,7 +751,7 @@ async def test_e2e_observability_endpoints_and_secret_redaction() -> None:
             agent_id="worker-obs-1",
             agent_type="worker",
             capabilities=["general"],
-            dispatch_target="agent.tasks.obs",
+            dispatch_target="agent.tasks.general",
             providers={
                 "api_key": "disallowed_secret_token",
             },
@@ -756,7 +763,7 @@ async def test_e2e_observability_endpoints_and_secret_redaction() -> None:
             agent_id="worker-obs-1",
             agent_type="worker",
             capabilities=["general"],
-            dispatch_target="agent.tasks.obs",
+            dispatch_target="agent.tasks.general",
             providers={
                 "inference_provider": "stub",
                 "model_family": "open-weights",
@@ -798,7 +805,7 @@ async def test_e2e_observability_endpoints_and_secret_redaction() -> None:
         assert decision["task_id"] == task_id
         assert decision["prompt_classification"] == "general"
         assert decision["selected_agent_id"] == "worker-obs-1"
-        assert decision["dispatch_target"] == "agent.tasks.obs"
+        assert decision["dispatch_target"] == "agent.tasks.general"
 
         # 4. GET /api/events
         e_res = await client.get("/api/events")

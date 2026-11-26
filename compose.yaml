@@ -13,6 +13,8 @@ services:
     tmpfs:
       - /run/redis:rw,noexec,nosuid,nodev,size=16m,mode=0750
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_orchestrator
         target: orchestrator
       - source: redis_worker_1
@@ -53,6 +55,8 @@ services:
       ASSIGNMENT_PROOF_PEPPER:
       RUNTIME_PRINCIPALS_JSON:
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_orchestrator
         target: redis_password
     depends_on:
@@ -91,6 +95,8 @@ services:
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_worker_1
         target: redis_password
     depends_on:
@@ -126,6 +132,8 @@ services:
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_research_agent_1
         target: redis_password
     depends_on:
@@ -161,6 +169,8 @@ services:
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10.0}
       HEALTH_PROBE_TIMEOUT_SECONDS: ${HEALTH_PROBE_TIMEOUT_SECONDS:-3.0}
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_research_agent_2
         target: redis_password
     depends_on:
@@ -185,6 +195,8 @@ services:
       ORCHESTRATOR_BASE_URL: ${ORCHESTRATOR_BASE_URL:-http://orchestrator:8080}
       RUNTIME_TOKEN: ${RUNTIME_TOKEN_ANALYSIS_1:-${RUNTIME_TOKEN_ANALYSIS:-}}
     secrets:
+      - source: redis_generation
+        target: redis_generation
       - source: redis_analysis_agent_1
         target: redis_password
     depends_on:
@@ -208,15 +220,17 @@ networks:
 volumes:
   redis_data:
 secrets:
+  redis_generation:
+    file: .secrets/redis/current/generation.json
   redis_orchestrator:
-    file: .secrets/redis/orchestrator
+    file: .secrets/redis/current/orchestrator
   redis_worker_1:
-    file: .secrets/redis/worker-1
+    file: .secrets/redis/current/worker-1
   redis_research_agent_1:
-    file: .secrets/redis/research-agent-1
+    file: .secrets/redis/current/research-agent-1
   redis_research_agent_2:
-    file: .secrets/redis/research-agent-2
+    file: .secrets/redis/current/research-agent-2
   redis_analysis_agent_1:
-    file: .secrets/redis/analysis-agent-1
+    file: .secrets/redis/current/analysis-agent-1
   redis_healthcheck:
-    file: .secrets/redis/healthcheck
+    file: .secrets/redis/current/healthcheck

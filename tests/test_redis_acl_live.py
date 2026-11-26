@@ -19,6 +19,7 @@ from scripts.redis_acl_live_harness import (
     RUNTIME_IDENTITIES,
     TEST_ADMIN_IDENTITY,
     LiveRedisAclCluster,
+    _run_docker,
 )
 
 pytestmark = [pytest.mark.live_redis_acl]
@@ -171,8 +172,81 @@ def test_healthcheck_identity_allow_deny_and_injected_mismatch_unhealthy(
     )
 
 
+def test_redis_image_uses_setpriv_and_keeps_acl_on_root_owned_tmpfs(
+    acl_cluster: LiveRedisAclCluster,
+) -> None:
+    setpriv = _run_docker(
+        [
+            "docker",
+            "exec",
+            acl_cluster.redis_container,
+            "/bin/sh",
+            "-c",
+            "command -v setpriv >/dev/null && setpriv --version",
+        ],
+        check=False,
+    )
+    assert setpriv.returncode == 0
+    assert "setpriv" in setpriv.stdout.lower()
+
+    pid_status = _run_docker(
+        [
+            "docker",
+            "exec",
+            acl_cluster.redis_container,
+            "/bin/sh",
+            "-c",
+            (
+                "awk '$1 == \"Name:\" {name=$2} $1 == \"Uid:\" {uid=$2} "
+                "$1 == \"Gid:\" {gid=$2} END {print name, uid, gid}' /proc/1/status"
+            ),
+        ],
+        check=False,
+    )
+    assert pid_status.returncode == 0
+    process_name, process_uid, process_gid = pid_status.stdout.split()
+    redis_uid = _run_docker(
+        ["docker", "exec", acl_cluster.redis_container, "id", "-u", "redis"]
+    ).stdout.strip()
+    redis_gid = _run_docker(
+        ["docker", "exec", acl_cluster.redis_container, "id", "-g", "redis"]
+    ).stdout.strip()
+    assert process_name == "redis-server"
+    assert process_uid == redis_uid != "0"
+    assert process_gid == redis_gid != "0"
+
+    acl_mode = _run_docker(
+        [
+            "docker",
+            "exec",
+            acl_cluster.redis_container,
+            "stat",
+            "-c",
+            "%U:%G %a",
+            "/run/redis/users.acl",
+        ]
+    )
+    assert acl_mode.stdout.strip() == "root:redis 440"
+
+    tmpfs_mount = _run_docker(
+        [
+            "docker",
+            "exec",
+            acl_cluster.redis_container,
+            "/bin/sh",
+            "-c",
+            (
+                '. /usr/local/bin/redis-mountinfo.sh; '
+                'redis_mountinfo_is_tmpfs /proc/self/mountinfo /run/redis'
+            ),
+        ],
+        check=False,
+    )
+    assert tmpfs_mount.returncode == 0
+
+
 # ---------------------------------------------------------------------------
-# 3. Per-runtime positive commands + real non-root RedisBus reconnect
+# 4. Per-runtime positive commands + real non-root RedisBus reconnect
 # ---------------------------------------------------------------------------
 
 
@@ -313,7 +387,7 @@ asyncio.run(main())
 
 
 # ---------------------------------------------------------------------------
-# 4. Per-runtime negative command, task.*, cross-role & cross-instance denials
+# 5. Per-runtime negative command, task.*, cross-role & cross-instance denials
 # ---------------------------------------------------------------------------
 
 
@@ -418,7 +492,7 @@ def test_runtime_identities_negative_commands_and_task_isolation(
 
 
 # ---------------------------------------------------------------------------
-# 5. Cross-key type-poisoning (drained list attack + absent shared keys)
+# 6. Cross-key type-poisoning (drained list attack + absent shared keys)
 # ---------------------------------------------------------------------------
 
 
@@ -470,7 +544,7 @@ def test_runtime_cross_key_type_poisoning_drained_queues_and_shared_keys(
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-key BLPOP atomicity
+# 7. Multi-key BLPOP atomicity
 # ---------------------------------------------------------------------------
 
 
@@ -511,7 +585,7 @@ def test_runtime_multikey_blpop_atomicity(
 
 
 # ---------------------------------------------------------------------------
-# 7. Orchestrator positive direct, transaction, and all-15-Lua contract
+# 8. Orchestrator positive direct, transaction, and all-15-Lua contract
 # ---------------------------------------------------------------------------
 
 
@@ -661,8 +735,8 @@ async def main() -> None:
         t_res = TaskRequested(task_id=parent_id, root_task_id=parent_id, parent_task_id=None, prompt="Research ACL", created_at=t0, version=2)
         await gw.register_root_task(t_res, required_capability="research")
         await gw.dispatch(t_res, "agent.tasks.research", capability="research")  # authenticated_claim MULTI/RPUSH agent.hints.research/SET/EXEC
-        await gw.dispatch_hint(WakeUpHint(hint_id="hint-extra", capability="general", created_at=t0, execution_kind="initial", task_id="task-acl-gen"), "agent.hints.general")
-        await gw.dispatch_hint(WakeUpHint(hint_id="hint-extra-a", capability="analysis", created_at=t0, execution_kind="initial", task_id="task-acl-gen"), "agent.hints.analysis")
+        await gw.dispatch_hint(WakeUpHint(hint_id="hint-extra", capability="general", created_at=t0, execution_kind="initial", task_id="task-acl-gen"), "agent.hints.general", capability="general")
+        await gw.dispatch_hint(WakeUpHint(hint_id="hint-extra-a", capability="analysis", created_at=t0, execution_kind="initial", task_id="task-acl-gen"), "agent.hints.analysis", capability="analysis")
 
         # Routing + telemetry + events + agents
         routing = RoutingDecision(

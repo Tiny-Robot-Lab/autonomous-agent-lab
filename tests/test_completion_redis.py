@@ -1,7 +1,8 @@
-"""Real-Redis atomicity tests for fenced turn completion (Issue #222).
+"""Disposable-Redis atomicity tests for fenced turn completion (Issue #222).
 
-Requires REDIS_URL pointing at database 15 (e.g. redis://localhost:6379/15).
-Without REDIS_URL these tests skip; they never touch any other database.
+Uses the session-scoped disposable Redis 7.4.12 ACL container on database 0.
+Fixture setup and inspection use its isolated test-only fixture-admin identity;
+RedisGateway operations use the production Orchestrator identity.
 
 Exercises COMPLETE_TURN_LUA through RedisGateway.complete_turn: first
 completed/failed commits, exact replay with zero writes, conflicting replay,
@@ -13,14 +14,10 @@ branch.
 
 import asyncio
 import json
-import os
 import uuid
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
-from urllib.parse import urlparse
 
 import pytest
-import redis.asyncio as redis
 from agent_contracts import (
     ArtifactReference,
     CompletionCommand,
@@ -46,49 +43,7 @@ from orchestrator.infrastructure.redis_adapter import (
 
 pytestmark = [pytest.mark.anyio, pytest.mark.redis]
 
-REQUIRED_TEST_DB = "15"
 PROOF_PEPPER = "test_completion_redis_proof_pepper_4567890123456789"
-
-
-def _validate_test_redis_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("redis", "rediss"):
-        raise ValueError(f"Redis integration tests require a redis:// URL, got scheme '{parsed.scheme}'")
-    if parsed.path.strip("/") != REQUIRED_TEST_DB:
-        raise ValueError(
-            "Redis integration tests require database 15 to prevent accidental data loss, "
-            f"got '{parsed.path}'"
-        )
-
-
-@pytest.fixture
-def redis_url() -> str:
-    url = os.getenv("REDIS_URL", "").strip()
-    if not url:
-        pytest.skip("Redis integration tests disabled: REDIS_URL environment variable is not set")
-    try:
-        _validate_test_redis_url(url)
-    except ValueError as exc:
-        pytest.fail(str(exc))
-    return url
-
-
-@pytest.fixture
-async def clean_gateway(redis_url: str) -> AsyncGenerator[RedisGateway, None]:
-    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
-    try:
-        await asyncio.wait_for(gateway._client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError) as exc:
-        await gateway.aclose()
-        pytest.fail(f"Configured Redis endpoint is unreachable within 1.0s timeout: {exc}")
-    await gateway._client.flushdb()
-    try:
-        yield gateway
-    finally:
-        try:
-            await gateway._client.flushdb()
-        finally:
-            await gateway.aclose()
 
 
 def _research_principal() -> RuntimePrincipal:
@@ -726,7 +681,12 @@ async def _eval_complete_turn_raw(
         status_json,
         "",
     ]
-    raw = await gateway._client.eval(COMPLETE_TURN_LUA, len(keys), *keys, *argv)
+    raw = await gateway.production_client.eval(
+        COMPLETE_TURN_LUA,
+        len(keys),
+        *keys,
+        *argv,
+    )
     return [r if isinstance(r, str) else r.decode("utf-8") for r in raw]
 
 

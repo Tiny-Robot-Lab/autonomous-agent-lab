@@ -2,11 +2,19 @@
 set -eu
 
 secret_dir=${REDIS_ACL_SECRET_DIR:-/run/secrets}
+generation_file=${REDIS_ACL_GENERATION_FILE:-$secret_dir/redis_generation}
 template=${REDIS_ACL_TEMPLATE:-/usr/local/bin/users.acl.template}
 runtime_dir=${REDIS_ACL_RUNTIME_DIR:-/run/redis}
-canonical_default='user default off resetpass resetkeys resetchannels -@all'
+replay_log=${REDIS_REPLAY_LOG:-$runtime_dir/replay-integrity.log}
+startup_marker=${REDIS_STARTUP_MARKER:-$runtime_dir/startup.json}
+seal_file=${REDIS_REPLAY_SEAL:-$runtime_dir/replay-sealed.json}
+startup_evidence=${REDIS_REPLAY_EVIDENCE:-$runtime_dir/replay-startup.evidence}
+replay_log_level=${REDIS_REPLAY_LOG_LEVEL:-notice}
+canonical_default='user default off resetpass resetkeys resetchannels -@all +select (+set %W~task.registration:* %W~task.status:* %W~task.lineage:* %W~task.input:* %W~task.authority:* %W~task.authority_grant:* %W~task.required_capability:* %W~task.artifact:* %W~task.continuation:* %W~task.continuation_latest:* %W~task.claim:* %W~task.claim_deadline:* %W~task.claim_expiry:* %W~task.fence:* %W~task.delegation_proposal:* %W~task.assignment_yield:* %W~task.completion:* %W~task.outcome:* %W~task.result:* %W~task.assignment_completion:* %W~task.child_completion:* %W~task.recovery_decision:*) (+del %W~task.claim:*) (+sadd %W~task.children:* %W~task.artifacts:* %W~task.consumed_waves:* %W~task.consumed_grants:* %W~task.delegation_decisions:*) (+rpush %W~agent.hints.general %W~agent.hints.research %W~agent.hints.analysis %W~agent.tasks.general %W~agent.tasks.research %W~agent.tasks.analysis) (+xadd %W~agent.events)'
 acl_temporary=
 health_temporary=
+generation_temporary=
+marker_temporary=
 startup_ready=0
 runtime_tmpfs_verified=0
 
@@ -22,8 +30,18 @@ cleanup() {
     if [ -n "$health_temporary" ]; then
         rm -f "$health_temporary"
     fi
+    if [ -n "$generation_temporary" ]; then
+        rm -f "$generation_temporary"
+    fi
+    if [ -n "$marker_temporary" ]; then
+        rm -f "$marker_temporary"
+    fi
     if [ "$startup_ready" -ne 1 ] && [ "$runtime_tmpfs_verified" -eq 1 ]; then
         rm -f "$runtime_dir/healthcheck.password"
+        rm -f "$runtime_dir/credential-generation.json"
+        rm -f "$startup_marker"
+        rm -f "$seal_file"
+        rm -f "$startup_evidence"
     fi
 }
 
@@ -39,6 +57,10 @@ if ! redis_mountinfo_is_tmpfs /proc/self/mountinfo "$runtime_dir"; then
     fail "Redis runtime directory is not an exact tmpfs mount"
 fi
 runtime_tmpfs_verified=1
+
+if [ ! -f "$generation_file" ] || [ -L "$generation_file" ] || [ ! -r "$generation_file" ]; then
+    fail "missing or unreadable Redis credential generation metadata"
+fi
 
 validate_secret() {
     identity=$1
@@ -184,8 +206,77 @@ chmod 0400 "$health_temporary"
 mv -f "$health_temporary" "$runtime_dir/healthcheck.password" || fail "cannot install health-check secret copy"
 health_temporary=
 
+generation_temporary=$(mktemp "$runtime_dir/.credential-generation.XXXXXX") || fail "cannot create Redis credential generation copy"
+cp "$generation_file" "$generation_temporary" || fail "cannot copy Redis credential generation metadata"
+chown root:redis "$generation_temporary"
+chmod 0440 "$generation_temporary"
+mv -f "$generation_temporary" "$runtime_dir/credential-generation.json" || fail "cannot install Redis credential generation metadata"
+generation_temporary=
+
 mv -f "$acl_temporary" "$runtime_dir/users.acl" || fail "cannot install rendered Redis ACL"
 acl_temporary=
+
+# Initialize bounded current-startup replay evidence on the verified tmpfs.
+# The log is truncated here so it can only contain the current startup's
+# output; a stale denial can never poison a later healthy start, and a
+# missing marker fails the health gate closed.
+case "$replay_log" in
+    "$runtime_dir"/*) ;;
+    *) fail "Redis replay log must reside in the runtime directory" ;;
+esac
+case "$startup_marker" in
+    "$runtime_dir"/*) ;;
+    *) fail "Redis startup marker must reside in the runtime directory" ;;
+esac
+case "$seal_file" in
+    "$runtime_dir"/*) ;;
+    *) fail "Redis sealed evidence must reside in the runtime directory" ;;
+esac
+case "$startup_evidence" in
+    "$runtime_dir"/*) ;;
+    *) fail "Redis startup evidence must reside in the runtime directory" ;;
+esac
+if [ -L "$replay_log" ] || [ -L "$startup_marker" ]; then
+    fail "Redis replay evidence path must not be a symlink"
+fi
+# Every entrypoint execution starts unsealed: a sealed verdict or retained
+# startup evidence from a previous start (visible across `docker restart`,
+# which preserves the tmpfs) must never satisfy the new startup. Only the
+# health gate seals, and only after observing readiness in the freshly
+# truncated log.
+rm -f "$seal_file" "$startup_evidence" || fail "cannot clear stale sealed replay verdict"
+: > "$replay_log" || fail "cannot truncate Redis replay log"
+# Ownership model: root owns every runtime file so the redis user can never
+# replace evidence, but the replay log itself must be appendable by the redis
+# process, so the redis group holds write permission. The ACL file and the
+# startup marker stay read-only (0440/0640): only the log is group-writable.
+chown root:redis "$replay_log"
+chmod 0660 "$replay_log"
+
+# The startup marker carries no identity beyond the active generation digest:
+# this is an exec-bound fresh-log proof, not a process-ID binding. The tmpfs
+# is verified, the log was just truncated, and this marker is recorded
+# immediately before exec redis-server, so a passing health check proves the
+# readiness evidence in that same fresh log belongs to the current startup.
+# A random start_id would be ornamental here: health only checks generation
+# binding, log freshness, and Redis's own readiness statement.
+generation_digest=$(sha256sum < "$runtime_dir/credential-generation.json" 2>/dev/null \
+    || shasum -a 256 < "$runtime_dir/credential-generation.json") \
+    || fail "cannot digest Redis credential generation metadata"
+generation_digest=${generation_digest%% *}
+case "$generation_digest" in
+    *[!0-9a-f]*|'') fail "invalid generation digest" ;;
+esac
+if [ "${#generation_digest}" -ne 64 ]; then
+    fail "invalid generation digest"
+fi
+marker_temporary=$(mktemp "$runtime_dir/.startup.XXXXXX") || fail "cannot create startup marker"
+printf '{"generation_sha256":"%s"}\n' "$generation_digest" \
+    > "$marker_temporary" || fail "cannot write startup marker"
+chown root:redis "$marker_temporary"
+chmod 0640 "$marker_temporary"
+mv -f "$marker_temporary" "$startup_marker" || fail "cannot install startup marker"
+marker_temporary=
 startup_ready=1
 
 if [ "$#" -eq 0 ]; then
@@ -194,4 +285,50 @@ fi
 if [ "$1" != "redis-server" ]; then
     fail "Redis entrypoint command must be redis-server"
 fi
+shift
+# Enforce the bounded replay-integrity log regardless of caller arguments.
+# Caller options are preserved; a conflicting replay-log path or level fails
+# startup, keeping replay evidence on the enforced log.
+have_logfile=0
+have_loglevel=0
+expect_value=""
+for redis_arg in "$@"; do
+    if [ -n "$expect_value" ]; then
+        if [ "$expect_value" = "--logfile" ]; then
+            [ "$redis_arg" = "$replay_log" ] || fail "Redis logfile must be the replay-integrity log"
+            have_logfile=1
+        else
+            [ "$redis_arg" = "$replay_log_level" ] || fail "Redis loglevel must stay bounded"
+            have_loglevel=1
+        fi
+        expect_value=""
+        continue
+    fi
+    case "$redis_arg" in
+        --logfile)
+            expect_value="--logfile"
+            ;;
+        --loglevel)
+            expect_value="--loglevel"
+            ;;
+        --logfile=*)
+            [ "${redis_arg#--logfile=}" = "$replay_log" ] || fail "Redis logfile must be the replay-integrity log"
+            have_logfile=1
+            ;;
+        --loglevel=*)
+            [ "${redis_arg#--loglevel=}" = "$replay_log_level" ] || fail "Redis loglevel must stay bounded"
+            have_loglevel=1
+            ;;
+    esac
+done
+if [ -n "$expect_value" ]; then
+    fail "Redis replay logging option is missing its value"
+fi
+if [ "$have_logfile" -eq 0 ]; then
+    set -- "$@" --logfile "$replay_log"
+fi
+if [ "$have_loglevel" -eq 0 ]; then
+    set -- "$@" --loglevel "$replay_log_level"
+fi
+set -- redis-server "$@"
 exec setpriv --reuid=redis --regid=redis --clear-groups -- "$@" --aclfile "$runtime_dir/users.acl"

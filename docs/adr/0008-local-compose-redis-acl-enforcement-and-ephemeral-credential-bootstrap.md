@@ -5,6 +5,15 @@ Date accepted: 2026-11-24
 Related issue: https://github.com/Tiny-Robot-Lab/autonomous-agent-lab/issues/229
 Supersedes: N/A
 
+## ADR 0009 partial-supersession notice
+
+ADR 0009 partially supersedes this record where ADR 0008 specifies or tests a
+fully permissionless disabled `default` user. ADR 0009 also adds the permanent
+legacy-dispatch destination boundary and the replay-integrity health gate.
+The per-service identities, tmpfs ACL bootstrap, PING-only health identity,
+credential-free URLs, secret isolation, and local Compose boundary below remain
+governing.
+
 ## Review status
 
 Proposed after repository-grounded reconnaissance, human architecture review,

@@ -128,7 +128,12 @@ def test_acl_template_is_default_deny_and_contains_only_reviewed_identities() ->
     lines = template.splitlines()
     users = _acl_user_lines()
 
-    assert lines.count("user default off resetpass resetkeys resetchannels -@all") == 1
+    default_lines = [line for line in lines if line.startswith("user default ")]
+    assert len(default_lines) == 1
+    assert default_lines[0].startswith(
+        "user default off resetpass resetkeys resetchannels -@all"
+    )
+    assert "task.routing:" not in default_lines[0]
     assert sum(line.startswith("user default ") for line in lines) == 1
     assert set(users) == {"default", *EXPECTED_USERS, "healthcheck"}
     assert all(
@@ -198,10 +203,14 @@ def test_compose_isolates_secrets_and_keeps_urls_credential_free() -> None:
         assert _environment_value(block, "REDIS_AUTH_MODE") == "required"
         assert _environment_value(block, "REDIS_USERNAME") == identity
         assert _environment_value(block, "REDIS_PASSWORD_FILE") == "/run/redis-auth/password"
-        assert _service_secret_sources(block) == {EXPECTED_USERS[identity]}
+        assert _service_secret_sources(block) == {
+            "redis_generation",
+            EXPECTED_USERS[identity],
+        }
 
     redis_block = _service_block(compose, "redis")
     assert _service_secret_sources(redis_block) == {
+        "redis_generation",
         *EXPECTED_USERS.values(),
         "redis_healthcheck",
     }
@@ -218,12 +227,13 @@ def test_compose_isolates_secrets_and_keeps_urls_credential_free() -> None:
         re.findall(r"^  ([a-z0-9_-]+):\n    file: ([^\n]+)$", top_level_secrets, re.MULTILINE)
     )
     assert source_files == {
-        "redis_orchestrator": ".secrets/redis/orchestrator",
-        "redis_worker_1": ".secrets/redis/worker-1",
-        "redis_research_agent_1": ".secrets/redis/research-agent-1",
-        "redis_research_agent_2": ".secrets/redis/research-agent-2",
-        "redis_analysis_agent_1": ".secrets/redis/analysis-agent-1",
-        "redis_healthcheck": ".secrets/redis/healthcheck",
+        "redis_generation": ".secrets/redis/current/generation.json",
+        "redis_orchestrator": ".secrets/redis/current/orchestrator",
+        "redis_worker_1": ".secrets/redis/current/worker-1",
+        "redis_research_agent_1": ".secrets/redis/current/research-agent-1",
+        "redis_research_agent_2": ".secrets/redis/current/research-agent-2",
+        "redis_analysis_agent_1": ".secrets/redis/current/analysis-agent-1",
+        "redis_healthcheck": ".secrets/redis/current/healthcheck",
     }
 
 
@@ -246,6 +256,7 @@ def test_compose_keeps_tmpfs_acl_separate_from_persistent_aof_and_waits_for_heal
     assert 'chown root:redis "$acl_temporary"' in entrypoint
     assert 'chmod 0440 "$acl_temporary"' in entrypoint
     assert 'mv -f "$acl_temporary" "$runtime_dir/users.acl"' in entrypoint
+    assert 'credential-generation.json' in entrypoint
     assert "chown -R redis:redis /data" not in entrypoint
     assert "sed " not in entrypoint
     assert "/data/users.acl" not in entrypoint
@@ -260,8 +271,13 @@ def test_healthcheck_is_ping_only_and_uses_scoped_secret_environment() -> None:
     assert "unset REDISCLI_AUTH password" in source
     assert "redis-cli --raw --user healthcheck ping" in source
     assert "cmp -s -" in source
-    assert "-a" not in source
+    cli_lines = [line for line in source.splitlines() if "redis-cli" in line]
+    assert cli_lines
+    for line in cli_lines:
+        assert " -a" not in line
     assert "redis://" not in source
+    assert "CRITICAL" in source
+    assert "NOPERM" in source
 
 
 def test_live_acl_harness_is_isolated_and_uses_real_template_without_ports_or_host_secrets() -> None:
@@ -284,9 +300,10 @@ def test_live_acl_harness_is_isolated_and_uses_real_template_without_ports_or_ho
     assert ".secrets/redis" not in harness
     assert ".secrets/redis" not in live_suite
 
-    # Zero host-published ports in live Docker harness
+    # ACL matrix defaults to no host ports; the integration-only mode binds loopback.
     assert '"-p"' not in harness
-    assert '"--publish"' not in harness
+    assert 'publish_host_port: bool = False' in harness
+    assert '"127.0.0.1::6379"' in harness
     assert "--internal" in harness
     assert "cluster.cleanup()" in harness
     assert "cluster.cleanup()" in live_suite

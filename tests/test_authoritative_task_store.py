@@ -1903,9 +1903,9 @@ async def test_redis_gateway_dispatch_uses_atomic_pipeline_with_transaction_true
     gateway._client.pipeline = MagicMock(return_value=mock_pipe)
 
     task = TaskRequested.create("Execute runtime task")
-    target = "agent.tasks.custom-executor-1"
+    target = "agent.tasks.general"
 
-    await gateway.dispatch(task, target=target)
+    await gateway.dispatch(task, target=target, capability="general")
 
     # Verified that pipeline was requested with transaction=True
     gateway._client.pipeline.assert_called_once_with(transaction=True)
@@ -1999,7 +1999,7 @@ async def test_simulated_dispatch_pipeline_failure_does_not_expose_queued_task_o
     task = TaskRequested.create("Root task")
 
     with pytest.raises(RuntimeError, match="Simulated pipeline commit failure"):
-        await gateway.dispatch(task, target="agent.tasks.general")
+        await gateway.dispatch(task, target="agent.tasks.general", capability="general")
 
     # Gateway client pipeline was invoked with transaction=True
     gateway._client.pipeline.assert_called_once_with(transaction=True)
@@ -2919,7 +2919,7 @@ async def test_redis_gateway_claim_and_acknowledgement_lua_branches() -> None:
         execution_kind="initial",
         task_id="task-001",
     )
-    await gateway.dispatch_hint(hint, "agent.hints.research")
+    await gateway.dispatch_hint(hint, "agent.hints.research", capability="research")
     gateway._client.rpush.assert_awaited_once_with("agent.hints.research", hint.to_json())
 
 

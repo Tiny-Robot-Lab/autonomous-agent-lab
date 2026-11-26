@@ -1,5 +1,6 @@
 import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -37,7 +38,7 @@ from agent_contracts import (
     normalize_canonical_utc_timestamp,
     resolve_client_connection_kwargs,
 )
-from redis.exceptions import ResponseError
+from redis.exceptions import AuthenticationError, NoPermissionError, ResponseError
 
 from orchestrator.application.inference_history import (
     TaskEventObservation,
@@ -88,11 +89,42 @@ def _parse_redis_stream_id(event_id: str) -> tuple[int, int]:
     except (AttributeError, ValueError):
         return (0, 0)
 
+LOCAL_COMPOSE_CAPABILITY_QUEUE_MAP: dict[str, str] = {
+    "general": "agent.tasks.general",
+    "research": "agent.tasks.research",
+    "analysis": "agent.tasks.analysis",
+}
+LOCAL_COMPOSE_CAPABILITY_HINT_MAP: dict[str, str] = {
+    "general": "agent.hints.general",
+    "research": "agent.hints.research",
+    "analysis": "agent.hints.analysis",
+}
 CAPABILITY_QUEUE_MAP: dict[AgentCapability, str] = {
-    AgentCapability.GENERAL: "agent.tasks.general",
-    AgentCapability.RESEARCH: "agent.tasks.research",
+    AgentCapability.GENERAL: LOCAL_COMPOSE_CAPABILITY_QUEUE_MAP["general"],
+    AgentCapability.RESEARCH: LOCAL_COMPOSE_CAPABILITY_QUEUE_MAP["research"],
 }
 RECOGNIZED_CAPABILITIES: frozenset[str] = frozenset({"general", "research", "analysis"})
+
+
+def _validate_capability_contract(contract: dict[str, str], *, kind: str) -> dict[str, str]:
+    """Validate an explicitly finite capability-to-destination contract.
+
+    Queue names must be exact: no globs, control characters, or empty
+    entries. The contract is never sourced from runtime-writable Redis
+    state, and there is no production validation-disable mode.
+    """
+    if not contract:
+        raise ValueError(f"Capability-to-{kind} contract must be finite and non-empty")
+    for contract_capability, queue in contract.items():
+        if not isinstance(contract_capability, str) or not contract_capability:
+            raise ValueError("Capability contract keys must be non-empty strings")
+        if not isinstance(queue, str) or not queue:
+            raise ValueError("Capability contract destinations must be non-empty strings")
+        if any(ord(character) < 32 or ord(character) == 127 for character in queue):
+            raise ValueError("Capability contract destinations must not contain control characters")
+        if any(glob_character in queue for glob_character in "*?[\\"):
+            raise ValueError("Capability contract destinations must be exact queue names")
+    return contract
 
 REGISTER_ROOT_TASK_LUA = """
 local marker_key = KEYS[1]
@@ -2157,6 +2189,8 @@ class RedisGateway:
         username: str | None = None,
         password: str | None = None,
         allow_unauthenticated_local_test: bool = False,
+        capability_queue_contract: Mapping[str, str] | None = None,
+        capability_hint_contract: Mapping[str, str] | None = None,
     ) -> None:
         resolved_url, client_kwargs = resolve_client_connection_kwargs(
             url,
@@ -2167,6 +2201,20 @@ class RedisGateway:
         )
         self._client = redis.from_url(resolved_url, **client_kwargs)
         self._delivery_mode = delivery_mode
+        if capability_queue_contract is None:
+            queue_contract = dict(LOCAL_COMPOSE_CAPABILITY_QUEUE_MAP)
+        else:
+            queue_contract = dict(capability_queue_contract)
+        if capability_hint_contract is None:
+            hint_contract = dict(LOCAL_COMPOSE_CAPABILITY_HINT_MAP)
+        else:
+            hint_contract = dict(capability_hint_contract)
+        self._capability_queue_contract = _validate_capability_contract(
+            queue_contract, kind="destination"
+        )
+        self._capability_hint_contract = _validate_capability_contract(
+            hint_contract, kind="hint-destination"
+        )
 
     async def register_root_task(
         self,
@@ -2239,6 +2287,8 @@ class RedisGateway:
                 task.task_id,
                 capability_json,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during register_root_task"
@@ -2304,6 +2354,8 @@ class RedisGateway:
                 capability_json,
                 task.task_id,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during register_child_task"
@@ -2340,6 +2392,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Required capability payload must be a JSON object")
             return RequiredCapabilityRecord.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt RequiredCapabilityRecord at key '{key}': {exc}"
@@ -2358,6 +2412,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Lineage payload must be a JSON object")
             return TaskLineage.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt TaskLineage record at key '{key}': {exc}"
@@ -2393,6 +2449,8 @@ class RedisGateway:
 
         try:
             raw_outcome = await self._client.get(f"task.outcome:{clean_task_id}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt terminal outcome at task.outcome:{clean_task_id}: {exc}"
@@ -2409,6 +2467,8 @@ class RedisGateway:
         key = f"task.status:{clean_task_id}"
         try:
             raw = await self._client.get(key)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt task status record at key '{key}': {exc}"
@@ -2421,6 +2481,8 @@ class RedisGateway:
                 cur_s = data["status"]
             else:
                 raise TypeError("Status record must be a JSON object containing a string 'status'")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt task status record at key '{key}': {exc}"
@@ -2435,6 +2497,8 @@ class RedisGateway:
         if cur_s == "pending":
             try:
                 raw_deadline = await self._client.get(f"task.claim_deadline:{clean_task_id}")
+            except (NoPermissionError, AuthenticationError):
+                raise
             except ResponseError as exc:
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt claim deadline record at task.claim_deadline:{clean_task_id}: {exc}"
@@ -2452,6 +2516,8 @@ class RedisGateway:
         elif cur_s == "working":
             try:
                 raw_claim = await self._client.get(f"task.claim:{clean_task_id}")
+            except (NoPermissionError, AuthenticationError):
+                raise
             except ResponseError as exc:
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"
@@ -2500,6 +2566,8 @@ class RedisGateway:
                     task_input.input_version,
                     payload,
                 )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during save_task_input"
@@ -2538,6 +2606,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return TaskInput.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt TaskInput record at key '{key}': {exc}"
@@ -2594,6 +2664,8 @@ class RedisGateway:
                 str(expected_fencing_epoch),
                 artifact.artifact_type,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during save_stage_artifact"
@@ -2650,6 +2722,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return StageArtifact.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt StageArtifact record at key '{key}': {exc}"
@@ -2686,6 +2760,8 @@ class RedisGateway:
                     continuation.continuation_version,
                     payload,
                 )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during save_continuation"
@@ -2730,6 +2806,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return TaskContinuation.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt TaskContinuation record at key '{key}': {exc}"
@@ -2745,6 +2823,8 @@ class RedisGateway:
                 target_key,
                 payload,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during save_root_authority"
@@ -2776,6 +2856,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return RootAuthorityRecord.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt RootAuthorityRecord at key '{key}': {exc}"
@@ -2791,6 +2873,8 @@ class RedisGateway:
                 target_key,
                 payload,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during save_authority_grant"
@@ -2825,6 +2909,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return DelegationGrant.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt DelegationGrant at key '{key}': {exc}"
@@ -2841,6 +2927,8 @@ class RedisGateway:
         key = f"task.claim:{clean_task_id}"
         try:
             raw = await self._client.get(key)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt ActiveClaim at key '{key}': {exc}"
@@ -2852,6 +2940,8 @@ class RedisGateway:
             if not isinstance(data, dict):
                 raise TypeError("Payload must be a JSON object")
             return ActiveClaim.from_dict(data)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt ActiveClaim at key '{key}': {exc}"
@@ -2863,6 +2953,8 @@ class RedisGateway:
             return 0
         try:
             raw = await self._client.get(f"task.fence:{clean_task_id}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt fencing epoch at key 'task.fence:{clean_task_id}': {exc}"
@@ -2942,6 +3034,8 @@ class RedisGateway:
                 "1" if is_root else "0",
                 str(expected_continuation_version),
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during atomic_claim_task"
@@ -3109,6 +3203,8 @@ class RedisGateway:
                 clean_time,
                 clean_exec_expires,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during acknowledge_claim"
@@ -3157,6 +3253,8 @@ class RedisGateway:
                 status_key,
                 now_iso,
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during expire_delivery_lease"
@@ -3286,6 +3384,8 @@ class RedisGateway:
 
         try:
             raw_res = await self._client.eval(ACCEPT_DELEGATION_LUA, len(keys), *keys, *argv)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during accept_delegation_proposal"
@@ -3556,6 +3656,8 @@ class RedisGateway:
 
         try:
             raw_res = await self._client.eval(COMPLETE_TURN_LUA, len(keys), *keys, *argv)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during complete_turn"
@@ -3684,6 +3786,8 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.completion:{clean_task}:{clean_cmd}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt completion record at task.completion:{clean_task}:{clean_cmd}"
@@ -3703,6 +3807,8 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.outcome:{clean_task}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt terminal outcome at task.outcome:{clean_task}"
@@ -3722,6 +3828,8 @@ class RedisGateway:
             return None
         try:
             raw = await self._client.get(f"task.result:{clean_task}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt canonical result at task.result:{clean_task}"
@@ -3754,6 +3862,8 @@ class RedisGateway:
             raw = await self._client.get(
                 f"task.assignment_completion:{clean_task}:{clean_assign}"
             )
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt assignment completion at task.assignment_completion:{clean_task}:{clean_assign}"
@@ -3791,6 +3901,8 @@ class RedisGateway:
         try:
             raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
             return DelegationProposalRecord.from_json(raw_str)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Failed to decode delegation proposal at key '{target_key}': {exc}"
@@ -3813,6 +3925,8 @@ class RedisGateway:
         deadline_key = f"task.claim_deadline:{clean_child}"
         try:
             deadline_raw = await self._client.get(deadline_key)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(f"Corrupt claim deadline at {deadline_key}: {exc}") from exc
         if not deadline_raw:
@@ -3884,6 +3998,8 @@ class RedisGateway:
 
         try:
             raw_res = await self._client.eval(MATERIALIZE_CLAIM_TIMEOUT_LUA, len(keys), *keys, *argv)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during materialize_claim_timeout"
@@ -4045,6 +4161,8 @@ class RedisGateway:
 
         try:
             raw_res = await self._client.eval(TRANSITION_EXPIRED_CLAIM_LUA, len(keys), *keys, *argv)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during transition_expired_claim"
@@ -4172,6 +4290,8 @@ class RedisGateway:
 
         try:
             raw_res = await self._client.eval(RESOLVE_EXPIRED_CLAIM_LUA, len(keys), *keys, *argv)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during resolve_expired_claim"
@@ -4236,12 +4356,16 @@ class RedisGateway:
         target_key = f"task.claim_expiry:{clean_task}"
         try:
             raw = await self._client.get(target_key)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(f"Corrupt record at {target_key}") from exc
         if raw is None:
             return None
         try:
             return ClaimExpiryRecord.from_json(raw)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Failed to decode ClaimExpiryRecord at {target_key}"
@@ -4257,27 +4381,56 @@ class RedisGateway:
         target_key = f"task.recovery_decision:{clean_task}:{clean_dec}"
         try:
             raw = await self._client.get(target_key)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(f"Corrupt record at {target_key}") from exc
         if raw is None:
             return None
         try:
             return RecoveryDecisionRecord.from_json(raw)
+        except (NoPermissionError, AuthenticationError):
+            raise
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Failed to decode RecoveryDecisionRecord at {target_key}"
             ) from exc
 
-    async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
-        clean_target = str(target).strip()
-        if not clean_target:
-            raise ValueError("target queue must be a non-empty string")
-        await self._client.rpush(clean_target, hint.to_json())
+    async def dispatch_hint(
+        self,
+        hint: WakeUpHint,
+        target: str | None = None,
+        capability: str | None = None,
+    ) -> None:
+        """Publish a wake-up hint to the governed finite hint destination.
+
+        Authorization binds to the authoritative Orchestrator-supplied
+        capability, never to a runtime-self-advertised capability or to the
+        untrusted target text. The target is validated before normalization
+        by exact raw equality against the canonical approved hint
+        destination, and only the canonical constant reaches RPUSH. An
+        omitted (``None``) target resolves from the authoritative
+        capability alone. No Redis write occurs unless validation succeeds.
+        """
+        if capability is None or not isinstance(capability, str):
+            raise ValueError("Authoritative hint capability is required")
+        if capability not in self._capability_hint_contract:
+            raise ValueError("Unrecognized authoritative hint capability")
+        approved_target = self._capability_hint_contract[capability]
+        if target is None:
+            resolved_target = approved_target
+        else:
+            if not isinstance(target, str):
+                raise ValueError("Hint target must be a string or omitted")
+            if target != approved_target:
+                raise ValueError("Hint target does not match authoritative capability")
+            resolved_target = approved_target
+        await self._client.rpush(resolved_target, hint.to_json())
 
     async def dispatch(
         self,
         task: TaskRequested,
-        target: str,
+        target: str | None,
         capability: str | None = None,
     ) -> None:
         """Atomically enqueue task payload or dispatch wake-up hint and establish pending status.
@@ -4287,30 +4440,20 @@ class RedisGateway:
         - In legacy_push mode, RPUSH of TaskRequested and transition of task.status to 'pending' commit together
           in an atomic transaction pipeline (transaction=True).
         """
-        if not target or not isinstance(target, str) or not target.strip():
-            raise ValueError("Dispatch target must be a non-empty string")
-        clean_target = target.strip()
-        if self._delivery_mode == "authenticated_claim":
-            canonical_cap: str | None = None
-            if capability is not None and str(capability).strip():
-                cand = str(capability).strip()
-                if cand in RECOGNIZED_CAPABILITIES:
-                    canonical_cap = cand
-                else:
-                    raise ValueError(f"Unrecognized canonical capability: '{cand}'")
-            else:
-                inv_map = {
-                    v: (k.value if hasattr(k, "value") else str(k))
-                    for k, v in CAPABILITY_QUEUE_MAP.items()
-                }
-                mapped = inv_map.get(clean_target)
-                if mapped in RECOGNIZED_CAPABILITIES:
-                    canonical_cap = mapped
-                else:
-                    raise ValueError(
-                        f"Cannot derive recognized canonical capability from target '{clean_target}'"
-                    )
+        if capability is None or not isinstance(capability, str):
+            raise ValueError("Authoritative dispatch capability is required")
+        if capability not in self._capability_queue_contract:
+            raise ValueError("Unrecognized authoritative dispatch capability")
+        approved_target = self._capability_queue_contract[capability]
 
+        if target is not None:
+            if not isinstance(target, str):
+                raise ValueError("Dispatch target must be a string or omitted")
+            if target != approved_target:
+                raise ValueError("Dispatch target does not match authoritative capability")
+
+        if self._delivery_mode == "authenticated_claim":
+            canonical_cap = capability
             hint_target = f"agent.hints.{canonical_cap}"
             hint = WakeUpHint(
                 hint_id=str(uuid4()),
@@ -4328,7 +4471,7 @@ class RedisGateway:
                 await pipe.execute()
         else:
             async with self._client.pipeline(transaction=True) as pipe:
-                pipe.rpush(clean_target, task.to_json())
+                pipe.rpush(approved_target, task.to_json())
                 pipe.set(
                     f"task.status:{task.task_id}",
                     json.dumps({"task_id": task.task_id, "status": "pending"}),
@@ -4341,10 +4484,11 @@ class RedisGateway:
         capability: AgentCapability = AgentCapability.GENERAL,
         target: str | None = None,
     ) -> None:
-        queue_name = target or CAPABILITY_QUEUE_MAP.get(capability)
-        if not queue_name:
+        capability_name = capability.value if hasattr(capability, "value") else str(capability)
+        queue_name = target if target is not None else self._capability_queue_contract.get(capability_name)
+        if queue_name is None:
             raise ValueError(f"Unknown capability: {capability}")
-        await self.dispatch(task, queue_name)
+        await self.dispatch(task, queue_name, capability=capability_name)
 
     async def get_result(self, task_id: str, now: str = "") -> dict[str, Any] | None:
         """Read task completion state with the canonical outcome as authority.
@@ -4368,6 +4512,8 @@ class RedisGateway:
 
         try:
             raw_outcome = await self._client.get(f"task.outcome:{clean_task_id}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt terminal outcome at task.outcome:{clean_task_id}"
@@ -4394,6 +4540,8 @@ class RedisGateway:
                 return result.to_dict()
             try:
                 unexpected = await self._client.get(f"task.result:{clean_task_id}")
+            except (NoPermissionError, AuthenticationError):
+                raise
             except ResponseError as exc:
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt canonical result at task.result:{clean_task_id}"
@@ -4410,6 +4558,8 @@ class RedisGateway:
 
         try:
             raw_result = await self._client.get(f"task.result:{clean_task_id}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt legacy result at task.result:{clean_task_id}"
@@ -4434,6 +4584,8 @@ class RedisGateway:
 
         try:
             raw_status = await self._client.get(f"task.status:{clean_task_id}")
+        except (NoPermissionError, AuthenticationError):
+            raise
         except ResponseError as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt task status at task.status:{clean_task_id}"
@@ -4460,6 +4612,8 @@ class RedisGateway:
             if cur_s == "pending":
                 try:
                     raw_deadline = await self._client.get(f"task.claim_deadline:{clean_task_id}")
+                except (NoPermissionError, AuthenticationError):
+                    raise
                 except ResponseError as exc:
                     raise CorruptAuthoritativeRecordError(
                         f"Corrupt claim deadline record at task.claim_deadline:{clean_task_id}: {exc}"
@@ -4481,6 +4635,8 @@ class RedisGateway:
             elif cur_s == "working":
                 try:
                     raw_claim = await self._client.get(f"task.claim:{clean_task_id}")
+                except (NoPermissionError, AuthenticationError):
+                    raise
                 except ResponseError as exc:
                     raise CorruptAuthoritativeRecordError(
                         f"Corrupt claim record at task.claim:{clean_task_id}: {exc}"

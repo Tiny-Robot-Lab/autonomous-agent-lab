@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -11,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from scripts.generate_redis_secrets import IDENTITIES, generate_secrets, main
+from scripts.generate_redis_secrets import (
+    IDENTITIES,
+    discard_rollback_generation,
+    generate_secrets,
+    get_generation_info,
+    main,
+    read_generation_secret,
+    rollback_generation,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACL_TEMPLATE = REPO_ROOT / "infrastructure" / "redis" / "users.acl.template"
@@ -24,6 +33,17 @@ def _write_synthetic_secrets(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for identity in IDENTITIES:
         (directory / identity).write_bytes(SYNTHETIC_SECRET)
+    (directory / "redis_generation").write_text(
+        json.dumps(
+            {
+                "generation_id": "1" * 32,
+                "identity_generations": {
+                    identity: str(index) * 32
+                    for index, identity in enumerate(IDENTITIES, start=1)
+                },
+            }
+        )
+    )
 
 
 def _fake_runtime_commands(directory: Path) -> Path:
@@ -109,16 +129,20 @@ def test_secret_generator_creates_private_allowlisted_files_without_newlines(
 
     assert generated == IDENTITIES
     assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
+    assert (secret_dir / "current").is_symlink()
+    assert stat.S_IMODE((secret_dir / "generations").stat().st_mode) == 0o700
+    generation = get_generation_info(secret_dir)
+    assert set(generation.identity_generations) == set(IDENTITIES)
     for identity in IDENTITIES:
-        path = secret_dir / identity
+        path = secret_dir / "current" / identity
         value = path.read_bytes()
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert len(value) >= 32
         assert all(character in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
         assert b"\n" not in value and b"\r" not in value
-    assert not list(secret_dir.glob(".*"))
+    assert stat.S_IMODE((secret_dir / ".generation.lock").stat().st_mode) == 0o600
     output = capsys.readouterr().out
-    assert all((secret_dir / identity).read_text() not in output for identity in IDENTITIES)
+    assert all((secret_dir / "current" / identity).read_text() not in output for identity in IDENTITIES)
 
 
 def test_secret_generator_reports_identity_names_without_values(
@@ -131,7 +155,8 @@ def test_secret_generator_reports_identity_names_without_values(
 
     output = capsys.readouterr().out
     assert all(identity in output for identity in IDENTITIES)
-    assert all((secret_dir / identity).read_text() not in output for identity in IDENTITIES)
+    assert get_generation_info(secret_dir).generation_id in output
+    assert all((secret_dir / "current" / identity).read_text() not in output for identity in IDENTITIES)
 
 
 def test_secret_generator_refuses_default_overwrite_and_bounds_explicit_rotation(
@@ -139,30 +164,127 @@ def test_secret_generator_refuses_default_overwrite_and_bounds_explicit_rotation
 ) -> None:
     secret_dir = tmp_path / "synthetic-redis-secrets"
     generate_secrets(secret_dir)
-    previous = {identity: (secret_dir / identity).read_bytes() for identity in IDENTITIES}
+    previous_info = get_generation_info(secret_dir)
+    previous = {
+        identity: read_generation_secret(secret_dir, identity) for identity in IDENTITIES
+    }
 
     with pytest.raises(FileExistsError):
         generate_secrets(secret_dir)
-    assert {identity: (secret_dir / identity).read_bytes() for identity in IDENTITIES} == previous
-    assert not (secret_dir / ".generation.lock").exists()
+    assert {
+        identity: read_generation_secret(secret_dir, identity) for identity in IDENTITIES
+    } == previous
 
     assert generate_secrets(secret_dir, rotate="research-agent-2") == ("research-agent-2",)
-    assert (secret_dir / "research-agent-2").read_bytes() != previous["research-agent-2"]
+    after_one = get_generation_info(secret_dir)
+    assert read_generation_secret(secret_dir, "research-agent-2") != previous["research-agent-2"]
     for identity in set(IDENTITIES) - {"research-agent-2"}:
-        assert (secret_dir / identity).read_bytes() == previous[identity]
+        assert read_generation_secret(secret_dir, identity) == previous[identity]
+        assert (
+            after_one.identity_generations[identity]
+            == previous_info.identity_generations[identity]
+        )
+    assert (secret_dir / "previous").readlink().as_posix() == (
+        f"generations/{previous_info.generation_id}"
+    )
 
     before_all_rotation = {
-        identity: (secret_dir / identity).read_bytes() for identity in IDENTITIES
+        identity: read_generation_secret(secret_dir, identity) for identity in IDENTITIES
     }
     assert generate_secrets(secret_dir, rotate="all") == IDENTITIES
     assert all(
-        (secret_dir / identity).read_bytes() != before_all_rotation[identity]
+        read_generation_secret(secret_dir, identity) != before_all_rotation[identity]
         for identity in IDENTITIES
     )
-    assert sorted(path.name for path in secret_dir.iterdir()) == sorted(IDENTITIES)
+    assert len(list((secret_dir / "generations").iterdir())) == 2
 
     with pytest.raises(ValueError, match="Unknown Redis identity"):
         generate_secrets(secret_dir, rotate="unknown")
+
+
+def test_secret_generation_can_rollback_and_discard_without_secret_backup_files(
+    tmp_path: Path,
+) -> None:
+    secret_dir = tmp_path / "synthetic-redis-secrets"
+    generate_secrets(secret_dir)
+    initial = get_generation_info(secret_dir)
+    initial_values = {
+        identity: read_generation_secret(secret_dir, identity) for identity in IDENTITIES
+    }
+
+    generate_secrets(secret_dir, rotate="worker-1")
+    rotated = get_generation_info(secret_dir)
+    assert read_generation_secret(secret_dir, "worker-1") != initial_values["worker-1"]
+
+    assert rollback_generation(secret_dir) == initial.generation_id
+    restored = get_generation_info(secret_dir)
+    assert restored.generation_id == initial.generation_id
+    assert {
+        identity: read_generation_secret(secret_dir, identity) for identity in IDENTITIES
+    } == initial_values
+    assert (secret_dir / "previous").readlink().as_posix() == (
+        f"generations/{rotated.generation_id}"
+    )
+
+    assert discard_rollback_generation(secret_dir) == rotated.generation_id
+    assert not (secret_dir / "previous").exists()
+    assert sorted(path.name for path in (secret_dir / "generations").iterdir()) == [
+        initial.generation_id
+    ]
+
+
+def test_secret_generator_recovers_an_interrupted_pointer_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.generate_redis_secrets as generator
+
+    secret_dir = tmp_path / "synthetic-redis-secrets"
+    generate_secrets(secret_dir)
+    initial = get_generation_info(secret_dir)
+    original_set_pointer = generator._atomic_set_pointer
+
+    def fail_after_current_switch(directory: Path, name: str, generation_id: str | None) -> None:
+        if name == "previous":
+            raise OSError("synthetic pointer-switch interruption")
+        original_set_pointer(directory, name, generation_id)
+
+    monkeypatch.setattr(generator, "_atomic_set_pointer", fail_after_current_switch)
+    with pytest.raises(OSError, match="synthetic pointer-switch interruption"):
+        generate_secrets(secret_dir, rotate="worker-1")
+
+    monkeypatch.setattr(generator, "_atomic_set_pointer", original_set_pointer)
+    assert (secret_dir / ".generation-transaction.json").exists()
+    assert rollback_generation(secret_dir) == initial.generation_id
+    assert not (secret_dir / ".generation-transaction.json").exists()
+    assert get_generation_info(secret_dir).generation_id == initial.generation_id
+
+
+def test_secret_generator_adopts_legacy_files_without_overwriting_them_first(
+    tmp_path: Path,
+) -> None:
+    secret_dir = tmp_path / "synthetic-redis-secrets"
+    secret_dir.mkdir()
+    for identity in IDENTITIES:
+        (secret_dir / identity).write_bytes(SYNTHETIC_SECRET)
+
+    assert generate_secrets(secret_dir) == IDENTITIES
+    assert all(
+        read_generation_secret(secret_dir, identity) == SYNTHETIC_SECRET
+        for identity in IDENTITIES
+    )
+    assert all(not (secret_dir / identity).exists() for identity in IDENTITIES)
+
+
+def test_secret_generator_rejects_partial_legacy_layout(tmp_path: Path) -> None:
+    secret_dir = tmp_path / "synthetic-redis-secrets"
+    secret_dir.mkdir()
+    (secret_dir / "orchestrator").write_bytes(SYNTHETIC_SECRET)
+
+    with pytest.raises(ValueError, match="Incomplete legacy Redis secrets"):
+        generate_secrets(secret_dir)
+    assert (secret_dir / "orchestrator").read_bytes() == SYNTHETIC_SECRET
+    assert not (secret_dir / "current").exists()
 
 
 @pytest.mark.parametrize(
@@ -458,8 +580,22 @@ def test_redis_entrypoint_renders_hashes_atomically_on_private_runtime_path(
     assert stat.S_IMODE((runtime_dir / "users.acl").stat().st_mode) == 0o440
     assert stat.S_IMODE((runtime_dir / "healthcheck.password").stat().st_mode) == 0o400
     assert (runtime_dir / "healthcheck.password").read_bytes() == SYNTHETIC_SECRET
+    assert stat.S_IMODE(
+        (runtime_dir / "credential-generation.json").stat().st_mode
+    ) == 0o440
+    assert json.loads(
+        (runtime_dir / "credential-generation.json").read_text()
+    )["generation_id"] == "1" * 32
     assert sorted(path.name for path in runtime_dir.iterdir()) == [
+        "credential-generation.json",
         "healthcheck.password",
+        "replay-integrity.log",
+        "startup.json",
         "users.acl",
     ]
+    assert (runtime_dir / "replay-integrity.log").read_bytes() == b""
+    marker = json.loads((runtime_dir / "startup.json").read_text())
+    assert marker["generation_sha256"] == hashlib.sha256(
+        (runtime_dir / "credential-generation.json").read_bytes()
+    ).hexdigest()
     assert SYNTHETIC_SECRET.decode() not in result.stdout + result.stderr

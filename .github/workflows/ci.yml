@@ -14,17 +14,6 @@ jobs:
     name: Test and Lint
     runs-on: ubuntu-latest
 
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -47,9 +36,13 @@ jobs:
         run: pytest -q
 
       - name: Run real Redis integration tests
-        env:
-          REDIS_URL: redis://localhost:6379/15
         run: pytest -q -m redis
+
+      - name: Run bounded Redis rotation and AOF integration test
+        run: pytest -q -m live_redis_rotation
+
+      - name: Run live Redis ACL enforcement matrix
+        run: pytest -q -m live_redis_acl
 
       - name: Validate Docker Compose configuration
         run: docker compose config --quiet

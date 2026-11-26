@@ -308,7 +308,9 @@ class FakeTaskQueue(AuthoritativeTaskStore):
             return True
         return False
 
-    async def dispatch_hint(self, hint: WakeUpHint, target: str) -> None:
+    async def dispatch_hint(
+        self, hint: WakeUpHint, target: str | None = None, capability: str | None = None
+    ) -> None:
         self.hints.append((hint, target))
 
     async def materialize_claim_timeout(self, child_task_id: str, now: str) -> Any:

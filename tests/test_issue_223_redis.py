@@ -1,8 +1,9 @@
-"""Dedicated live Redis 7 integration tests for Issue #223.
+"""Dedicated live Redis integration tests for Issue #223.
 
 Governed by ADR-0005, ADR-0006, and ADR-0007 (Decisions 10, 11, 12, 13):
-- Dedicated to database 15 (REDIS_URL=redis://127.0.0.1:6379/15);
-- Never runs FLUSHALL (flushes only DB 15);
+- Uses an isolated disposable Redis 7.4.12 container and database 0;
+- Uses fixture-admin only for test setup, cleanup, and assertion;
+- Uses production identities for gateway and runtime-bus operations;
 - Tests child timeout materialization (before, at, after deadline, idempotent replay, claim trigger);
 - Tests acknowledged claim execution expiry (before, after, fence invariant, replay);
 - Tests recovery resolution (operator authorization, restore_claimable, fence invariant, next claim fence increment);
@@ -14,15 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
 import pytest
-import redis.asyncio as redis
 from agent_contracts import (
     ActiveClaim,
     CompletionCommand,
@@ -62,51 +59,11 @@ from research_agent.application.processor import ResearchProcessor
 from research_agent.domain.models import ResearchResult, SynthesisResult
 from research_agent.infrastructure.redis_bus import RedisBus
 
+from scripts.redis_test_support import make_test_bus, make_test_gateway
+
 pytestmark = [pytest.mark.anyio, pytest.mark.redis]
 
-REQUIRED_TEST_DB = "15"
 TEST_PEPPER = "test_issue_223_redis_proof_pepper_4567890123456789"
-
-
-def _validate_test_redis_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("redis", "rediss"):
-        raise ValueError(f"Redis integration tests require a redis:// URL, got scheme '{parsed.scheme}'")
-    if parsed.path.strip("/") != REQUIRED_TEST_DB:
-        raise ValueError(
-            "Redis integration tests require database 15 to prevent accidental data loss, "
-            f"got '{parsed.path}'"
-        )
-
-
-@pytest.fixture
-def redis_url() -> str:
-    url = os.getenv("REDIS_URL", "").strip()
-    if not url:
-        pytest.skip("Redis integration tests disabled: REDIS_URL environment variable is not set")
-    try:
-        _validate_test_redis_url(url)
-    except ValueError as exc:
-        pytest.fail(str(exc))
-    return url
-
-
-@pytest.fixture
-async def clean_gateway(redis_url: str) -> AsyncGenerator[RedisGateway, None]:
-    gateway = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
-    try:
-        await asyncio.wait_for(gateway._client.ping(), timeout=1.0)
-    except (redis.ConnectionError, OSError) as exc:
-        await gateway.aclose()
-        pytest.fail(f"Configured Redis endpoint is unreachable within 1.0s timeout: {exc}")
-    await gateway._client.flushdb()
-    try:
-        yield gateway
-    finally:
-        try:
-            await gateway._client.flushdb()
-        finally:
-            await gateway.aclose()
 
 
 def _research_principal() -> RuntimePrincipal:
@@ -686,7 +643,7 @@ async def test_redis_resumed_research_e2e_flow(clean_gateway: RedisGateway, redi
     assert "battery storage capacity is 85% viable" in ctx.child_result.output
 
     # 8. Run ResearchProcessor for resumed turn
-    bus = RedisBus(redis_url, allow_unauthenticated_local_test=True)
+    bus = make_test_bus(RedisBus, redis_url, "research-agent-1")
     executor = StubResearchExecutor()
     provider = StubInferenceProvider()
     processor = ResearchProcessor(
@@ -961,10 +918,16 @@ async def test_redis_queue_fairness_interleaving(
 ) -> None:
     from agent_contracts import WakeUpHint
 
-    queue_name = f"fair.tasks.{uuid4().hex[:6]}"
-    hint_queue = f"fair.hints.{uuid4().hex[:6]}"
+    queue_name = "agent.tasks.research"
+    hint_queue = "agent.hints.research"
 
-    bus = RedisBus(redis_url, queue_name=queue_name, hint_queue=hint_queue, allow_unauthenticated_local_test=True)
+    bus = make_test_bus(
+        RedisBus,
+        redis_url,
+        "research-agent-1",
+        queue_name=queue_name,
+        hint_queue=hint_queue,
+    )
 
     try:
         # Push 3 hints and 3 tasks
@@ -1416,8 +1379,8 @@ async def test_redis_evaluate_expiry_child_deadline(
 async def test_redis_race_pull_claim_vs_child_timeout(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
-    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw1 = make_test_gateway(redis_url)
+    gw2 = make_test_gateway(redis_url)
     try:
         parent_id = f"parent-race-{uuid4().hex[:8]}"
         child_id = f"child-race-{uuid4().hex[:8]}"
@@ -1493,8 +1456,8 @@ async def test_redis_race_pull_claim_vs_child_timeout(
 async def test_redis_race_completion_vs_acknowledged_expiry(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
-    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw1 = make_test_gateway(redis_url)
+    gw2 = make_test_gateway(redis_url)
     try:
         task_id = f"task-race-comp-{uuid4().hex[:8]}"
         now_dt = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
@@ -1579,8 +1542,8 @@ async def test_redis_race_completion_vs_acknowledged_expiry(
 async def test_redis_race_recovery_resolution_vs_pull_claim(
     redis_url: str,
 ) -> None:
-    gw1 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
-    gw2 = RedisGateway(redis_url, allow_unauthenticated_local_test=True)
+    gw1 = make_test_gateway(redis_url)
+    gw2 = make_test_gateway(redis_url)
     try:
         task_id = f"task-race-rec-{uuid4().hex[:8]}"
         now_dt = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
