@@ -154,7 +154,8 @@ exec "$real_binary" "$@"
 
 def _write_gate_wrapper(host_dir: Path) -> Path:
     """Install the test-only redis-server wrapper into a host mount dir."""
-    host_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    host_dir.chmod(0o755)
     wrapper = host_dir / "redis-server"
     wrapper.write_text(GATE_WRAPPER_SCRIPT, encoding="utf-8")
     wrapper.chmod(0o755)
@@ -620,16 +621,15 @@ def test_entrypoint_gate_wrapper_is_test_only_and_bounded(tmp_path: Path) -> Non
     ):
         assert forged not in GATE_WRAPPER_SCRIPT
 
-    # The host mount dir is owner-only while the wrapper file itself is
-    # 0755 so the container's unprivileged redis user can execute it through
-    # the read-only mount. The release signal is a bounded empty file, not
-    # a content-bearing artifact.
+    # The gate mount dir and wrapper file are 0755 (non-secret) so the
+    # container's dropped unprivileged redis user can traverse and execute
+    # them on native Linux bind mounts, while secret_dir remains 0700.
     wrapper = _write_gate_wrapper(tmp_path / "gate")
     assert wrapper.name == "redis-server"
     assert wrapper.read_text(encoding="utf-8") == GATE_WRAPPER_SCRIPT
     import stat as stat_module
 
-    assert stat_module.S_IMODE(wrapper.parent.stat().st_mode) == 0o700
+    assert stat_module.S_IMODE(wrapper.parent.stat().st_mode) == 0o755
     assert stat_module.S_IMODE(wrapper.stat().st_mode) == 0o755
     assert ": > " in GATE_WRAPPER_SCRIPT or ': > "$reached"' in GATE_WRAPPER_SCRIPT
 

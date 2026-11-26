@@ -58,7 +58,9 @@ REDIS_REPLAY_LOG_PATH: Final[str] = "/run/redis/replay-integrity.log"
 REDIS_REPLAY_LOG_LEVEL: Final[str] = "notice"
 
 
-def redis_replay_log_prep(*, log_path: str = REDIS_REPLAY_LOG_PATH) -> str:
+def redis_replay_log_prep(
+    *, log_path: str = REDIS_REPLAY_LOG_PATH, log_mode: str = "0660"
+) -> str:
     """Root bootstrap fragment preparing the current-start replay log.
 
     Rejects symlinked log paths, truncates the current-start log so stale
@@ -67,11 +69,13 @@ def redis_replay_log_prep(*, log_path: str = REDIS_REPLAY_LOG_PATH) -> str:
     other identity can replace the evidence. Must run as root before the
     final setpriv drop to the redis user.
     """
+    if log_mode not in {"0660", "0664"}:
+        raise ValueError(f"Unsupported replay log mode: {log_mode!r}")
     return (
         f'if [ -L "{log_path}" ]; then echo "symlinked replay log" >&2; exit 1; fi\n'
         f': > "{log_path}"\n'
         f'chown root:redis "{log_path}"\n'
-        f'chmod 0660 "{log_path}"\n'
+        f'chmod {log_mode} "{log_path}"\n'
     )
 
 
@@ -724,11 +728,12 @@ class LiveRedisAclCluster:
         if service not in self.service_images:
             raise KeyError(f"Unknown service image: {service}")
 
-        secret_file = self.secret_dir / "current" / identity
+        secret_file = (self.secret_dir / "current" / identity).resolve()
         if override_secret is not None:
             secret_file = self.temp_dir / f"override-{uuid.uuid4().hex[:8]}"
             secret_file.write_text(override_secret, encoding="ascii")
             secret_file.chmod(0o600)
+        generation_file = (self.secret_dir / "current" / "generation.json").resolve()
 
         proc = _run_docker(
             [
@@ -741,7 +746,7 @@ class LiveRedisAclCluster:
                 "--mount",
                 f"type=bind,src={secret_file},dst=/run/secrets/redis_password,readonly",
                 "--mount",
-                f"type=bind,src={self.secret_dir / 'current' / 'generation.json'},dst=/run/secrets/redis_generation,readonly",
+                f"type=bind,src={generation_file},dst=/run/secrets/redis_generation,readonly",
                 "--env",
                 "REDIS_URL=redis://redis:6379/0",
                 "--env",
@@ -812,6 +817,24 @@ class LiveRedisAclCluster:
                     errors.append(f"volume {volume}: {removed.stderr.strip()}")
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if self.temp_dir.exists():
+            _run_docker(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--mount",
+                    f"type=bind,src={self.temp_dir},dst=/cleanup-target",
+                    "--entrypoint",
+                    "/bin/sh",
+                    REDIS_IMAGE,
+                    "-c",
+                    "rm -rf /cleanup-target/* /cleanup-target/.[!.]* /cleanup-target/..?* 2>/dev/null || true",
+                ],
+                check=False,
+                timeout=30,
+            )
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
         if self.temp_dir.exists():
             errors.append(f"temp_dir {self.temp_dir} still exists")
 

@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -89,6 +90,44 @@ def _wait_for_log_text(log_file: Path, text: str, timeout: float = 30.0) -> str:
     raise AssertionError(f"timed out waiting for {text!r} in replay log; log content:\n{content}")
 
 
+def _prepare_replay_evidence_dir(
+    evidence: Path,
+    acl_text: str,
+    generation_text: str,
+    password_text: str,
+) -> None:
+    """Create host-side replay evidence with portable least-privilege modes.
+
+    - evidence dir: 0755 (container redis user traverses; host cleans up)
+    - users.acl: 0644 (hashed ACL only, no secrets; container redis user reads)
+    - generation.json, startup.json, healthcheck.password: 0600 (root-only in container)
+    - replay.log: 0664 (pre-created host-side; container root:redis 0664 lets redis write & host read)
+    """
+    evidence.mkdir(parents=True, exist_ok=True)
+    evidence.chmod(0o755)
+    acl_path = evidence / "users.acl"
+    acl_path.write_text(acl_text, encoding="utf-8")
+    acl_path.chmod(0o644)
+    gen_path = evidence / "generation.json"
+    gen_path.write_text(generation_text, encoding="utf-8")
+    gen_path.chmod(0o600)
+    pw_path = evidence / "healthcheck.password"
+    pw_path.write_text(password_text, encoding="utf-8")
+    pw_path.chmod(0o600)
+    log_path = evidence / "replay.log"
+    log_path.write_text("", encoding="utf-8")
+    log_path.chmod(0o664)
+    startup_path = evidence / "startup.json"
+    startup_path.write_bytes(_production_marker_bytes(generation_text))
+    startup_path.chmod(0o600)
+
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o755
+    assert stat.S_IMODE(acl_path.stat().st_mode) == 0o644
+    assert stat.S_IMODE(pw_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(gen_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o664
+
+
 def _start_replay_container(
     cluster: LiveRedisAclCluster,
     name: str,
@@ -97,19 +136,14 @@ def _start_replay_container(
     generation_text: str,
     password_text: str,
 ) -> None:
-    evidence.mkdir(parents=True, exist_ok=True)
-    (evidence / "users.acl").write_text(acl_text, encoding="utf-8")
-    (evidence / "generation.json").write_text(generation_text, encoding="utf-8")
-    (evidence / "healthcheck.password").write_text(password_text, encoding="utf-8")
-    (evidence / "replay.log").write_text("", encoding="utf-8")
-    (evidence / "startup.json").write_bytes(_production_marker_bytes(generation_text))
+    _prepare_replay_evidence_dir(evidence, acl_text, generation_text, password_text)
     # Root bootstrap inside the container normalizes the bind-mounted logfile
     # (Docker Desktop bind mounts do not inherit the tmpfs ownership the
     # production entrypoint establishes) before dropping to the redis user.
     # Redis never runs as root here.
     bootstrap = (
         "set -eu\n"
-        + redis_replay_log_prep(log_path="/run/redis-evd/replay.log")
+        + redis_replay_log_prep(log_path="/run/redis-evd/replay.log", log_mode="0664")
         + "exec setpriv --reuid=redis --regid=redis --clear-groups -- "
         "redis-server --appendonly yes "
         "--aclfile /run/redis-evd/users.acl "
@@ -764,19 +798,16 @@ def test_production_envelope_subtraction_matrix() -> None:
 
         for idx, (case_name, narrowed_acl) in enumerate(cases):
             evidence = cluster.temp_dir / f"sub-{idx}"
-            evidence.mkdir(parents=True, exist_ok=True)
-            (evidence / "users.acl").write_text(narrowed_acl, encoding="utf-8")
-            (evidence / "generation.json").write_text(generation_text, encoding="utf-8")
-            (evidence / "healthcheck.password").write_text(password_text, encoding="utf-8")
-            (evidence / "replay.log").write_text("", encoding="utf-8")
-            (evidence / "startup.json").write_bytes(_production_marker_bytes(generation_text))
+            _prepare_replay_evidence_dir(
+                evidence, narrowed_acl, generation_text, password_text
+            )
 
             cname = f"{cluster.redis_container}-sub-{idx}"
             bootstrap = (
                 "set -eu\n"
                 "cp -a /snapshot/. /data/\n"
                 "chown -R redis:redis /data\n"
-                + redis_replay_log_prep(log_path="/run/redis-evd/replay.log")
+                + redis_replay_log_prep(log_path="/run/redis-evd/replay.log", log_mode="0664")
                 + "exec setpriv --reuid=redis --regid=redis --clear-groups -- "
                 "redis-server --appendonly yes "
                 "--aclfile /run/redis-evd/users.acl "
