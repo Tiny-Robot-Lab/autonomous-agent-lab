@@ -200,6 +200,17 @@ def _run_evidence_health(name: str) -> CliResult:
     )
 
 
+def _read_container_replay_seal(name: str) -> bytes:
+    """Read /run/redis-evd/startup-sealed.json via the container without weakening its 0640 mode."""
+    res = _run_docker(
+        ["docker", "exec", name, "cat", "/run/redis-evd/startup-sealed.json"],
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.combined
+    return res.stdout.encode("utf-8")
+
+
 def _assert_redis_runs_unprivileged(name: str) -> None:
     comm = _run_docker(["docker", "exec", name, "cat", "/proc/1/comm"], check=False, timeout=30)
     assert comm.stdout.strip() == "redis-server", comm.combined
@@ -306,7 +317,10 @@ def test_narrowed_replay_rule_denial_fails_health() -> None:
         _assert_redis_runs_unprivileged(f"{cluster.redis_container}-full")
         sealed_path = full_evidence / "startup-sealed.json"
         assert sealed_path.exists(), "clean startup must seal its replay verdict"
-        sealed_full = sealed_path.read_bytes()
+        assert stat.S_IMODE(sealed_path.stat().st_mode) == 0o640, (
+            "startup seal must remain restrictive (0640) on the host"
+        )
+        sealed_full = _read_container_replay_seal(f"{cluster.redis_container}-full")
 
         # The runtime denial is proven by the client response, not by the
         # notice logfile: Redis does not emit post-readiness NOPERM lines at
@@ -324,7 +338,7 @@ def test_narrowed_replay_rule_denial_fails_health() -> None:
             "a later runtime authorization failure must not poison the sealed "
             f"startup verdict: {resealed.combined}"
         )
-        assert sealed_path.read_bytes() == sealed_full, (
+        assert _read_container_replay_seal(f"{cluster.redis_container}-full") == sealed_full, (
             "sealed startup evidence must remain unchanged by later runtime logs"
         )
         _run_docker(["docker", "stop", f"{cluster.redis_container}-full"], timeout=60)
