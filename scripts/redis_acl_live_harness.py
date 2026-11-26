@@ -155,7 +155,6 @@ class LiveRedisAclCluster:
     redis_container: str
     secrets_map: dict[str, str] = field(repr=False)
     admin_secret: str = field(repr=False)
-    admin_password_file: Path = field(repr=False)
     admin_hash_file: Path = field(repr=False)
     service_images: dict[str, str] = field(default_factory=dict)
     created_containers: list[str] = field(default_factory=list)
@@ -209,9 +208,6 @@ class LiveRedisAclCluster:
         admin_hash_file = temp_dir / "fixture-admin.sha256"
         admin_hash_file.write_text(admin_sha256, encoding="ascii")
         admin_hash_file.chmod(0o600)
-        admin_password_file = temp_dir / "fixture-admin.password"
-        admin_password_file.write_text(admin_secret, encoding="ascii")
-        admin_password_file.chmod(0o600)
         data_volume_name = (
             f"tiny-agent-lab-acl-data-{token}"
             if persistent_data or use_compose
@@ -226,7 +222,6 @@ class LiveRedisAclCluster:
             redis_container=f"tiny-agent-lab-acl-redis-{token}",
             secrets_map=secrets_map,
             admin_secret=admin_secret,
-            admin_password_file=admin_password_file,
             admin_hash_file=admin_hash_file,
             publish_host_port=publish_host_port,
             data_volume_name=data_volume_name,

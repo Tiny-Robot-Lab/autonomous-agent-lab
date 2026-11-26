@@ -484,15 +484,16 @@ def main(
             print(f"Discarded Redis rollback generation: {discarded_id or 'none'}")
             return 0
 
-        generated = generate_secrets(secret_directory, rotate=args.rotate)
+        generate_secrets(secret_directory, rotate=args.rotate)
         generation = get_generation_info(secret_directory)
     except (FileExistsError, OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 
     action = "Rotated" if args.rotate is not None else "Created"
     print(f"{action} Redis credential generation: {generation.generation_id}")
-    for identity in generated:
-        print(f"{action} Redis credential for {identity}")
+    for identity in IDENTITIES:
+        if args.rotate in (None, "all") or identity == args.rotate:
+            print(f"{action} Redis credential for {identity}")
     return 0
 
 

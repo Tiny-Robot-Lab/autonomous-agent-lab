@@ -153,10 +153,41 @@ def test_secret_generator_reports_identity_names_without_values(
 
     assert main([], secret_directory=secret_dir) == 0
 
-    output = capsys.readouterr().out
-    assert all(identity in output for identity in IDENTITIES)
-    assert get_generation_info(secret_dir).generation_id in output
-    assert all((secret_dir / "current" / identity).read_text() not in output for identity in IDENTITIES)
+    created = capsys.readouterr()
+    created_output = created.out
+    assert all(f"Created Redis credential for {identity}" in created_output for identity in IDENTITIES)
+    assert get_generation_info(secret_dir).generation_id in created_output
+    initial_secrets = {
+        identity: (secret_dir / "current" / identity).read_text() for identity in IDENTITIES
+    }
+    assert all(secret not in created_output and secret not in created.err for secret in initial_secrets.values())
+
+    assert main(["--rotate", "research-agent-2"], secret_directory=secret_dir) == 0
+
+    rotated_one = capsys.readouterr()
+    assert "Rotated Redis credential for research-agent-2" in rotated_one.out
+    assert all(
+        identity not in rotated_one.out
+        for identity in IDENTITIES
+        if identity != "research-agent-2"
+    )
+    assert get_generation_info(secret_dir).generation_id in rotated_one.out
+    after_one_secrets = {
+        identity: (secret_dir / "current" / identity).read_text() for identity in IDENTITIES
+    }
+    all_seen_secrets = set(initial_secrets.values()) | set(after_one_secrets.values())
+    assert all(secret not in rotated_one.out and secret not in rotated_one.err for secret in all_seen_secrets)
+
+    assert main(["--rotate", "all"], secret_directory=secret_dir) == 0
+
+    rotated_all = capsys.readouterr()
+    assert all(f"Rotated Redis credential for {identity}" in rotated_all.out for identity in IDENTITIES)
+    assert get_generation_info(secret_dir).generation_id in rotated_all.out
+    after_all_secrets = {
+        identity: (secret_dir / "current" / identity).read_text() for identity in IDENTITIES
+    }
+    all_seen_secrets |= set(after_all_secrets.values())
+    assert all(secret not in rotated_all.out and secret not in rotated_all.err for secret in all_seen_secrets)
 
 
 def test_secret_generator_refuses_default_overwrite_and_bounds_explicit_rotation(
