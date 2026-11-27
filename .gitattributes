@@ -1,0 +1,6 @@
+# Keep ADR Markdown consistently LF-normalized.
+docs/adr/*.md text eol=lf
+
+# This accepted contract has a pinned physical byte identity.
+# Treat it as opaque so Git neither normalizes nor whitespace-checks its CRLF bytes.
+evaluation/routing/contracts/run-002-offline-shadow-integration-003.json binary

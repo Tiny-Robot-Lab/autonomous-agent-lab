@@ -1,0 +1,291 @@
+{
+  "schema_version": 3,
+  "contract_id": "run-002-offline-shadow-integration-003",
+  "supersedes": "run-002-offline-shadow-integration-002",
+  "status": "proposed-for-final-closure-review",
+  "repository_basis": {
+    "repository": "Tiny-Robot-Lab/autonomous-agent-lab",
+    "commit": "aca2962353c1bc6d112b40bc7404c2d8954ed43c",
+    "location": "evaluation/routing/",
+    "submit_task_modified": false,
+    "production_ports_modified": false,
+    "production_composition_roots_modified": false
+  },
+  "authority": {
+    "router": "DeterministicCapabilityRouter",
+    "comparison": "RoutingAssessment.provisional_capability",
+    "shadow_operational_authority": false,
+    "automatic_promotion_prohibited": true,
+    "live_shadow_requires_separate_adr": true,
+    "assisted_routing_requires_separate_adr": true
+  },
+  "canonical_json": {
+    "encoding": "UTF-8 strict",
+    "sort_keys": true,
+    "separators": [
+      ",",
+      ":"
+    ],
+    "ensure_ascii": false,
+    "allow_nan": false,
+    "self_hash_rule": "remove exactly the named self-hash field before canonical serialization and SHA-256",
+    "contract_self_hash_field": "canonical_contract_sha256",
+    "artifact_manifest_self_hash_field": "canonical_manifest_sha256",
+    "corpus_manifest_self_hash_field": "canonical_manifest_sha256"
+  },
+  "trust_anchors": {
+    "source": "this repository-controlled contract, outside the model artifact directory",
+    "expected_model_artifact_identity": "2d449b48722dfe6b7fc6a520b0beffd59472b8458c8c65560febd58adcae5b05",
+    "artifact_manifest_file": "development-v3-run-002-artifact-manifest.json",
+    "expected_protocol_identity": "1e03a65057e3dd2938975dbe28f0e0ddd92417f336598de89ae270963b748beb",
+    "protocol_artifact": "run-002-shadow-comparison-v1-protocol.json",
+    "protocol_identity_rule": "physical SHA-256 of exact protocol file bytes",
+    "must_match_before_loader_import_or_deserialization": true
+  },
+  "artifact_filesystem": {
+    "exact_bidirectional_regular_file_set": true,
+    "reject_missing_files": true,
+    "reject_unlisted_extra_files": true,
+    "reject_symlinks": true,
+    "reject_absolute_paths": true,
+    "reject_parent_traversal": true,
+    "read_only_or_isolated_during_replay": true,
+    "verify_every_file_before_loader_import": true,
+    "local_files_only": true,
+    "trust_remote_code": false,
+    "network_egress_prohibited": true,
+    "expected_label_index_map": {
+      "0": "general",
+      "1": "research"
+    },
+    "verify_persisted_and_runtime_class_order": true
+  },
+  "canonical_input": {
+    "steps": [
+      "require Python str",
+      "remove exactly one leading U+FEFF",
+      "replace CRLF with LF then CR with LF",
+      "split only on U+000A; str.splitlines is prohibited",
+      "remove trailing ASCII space and U+0009 from each line",
+      "remove leading and trailing lines empty after removing ASCII space and U+0009",
+      "preserve internal content, leading indentation, case, punctuation, order, and Unicode code points",
+      "perform no Unicode normalization",
+      "reject empty result during corpus-manifest validation",
+      "encode strict UTF-8 and reject lone surrogates",
+      "SHA-256 normalized UTF-8 bytes"
+    ],
+    "router_and_model_receive_identical_canonical_string": true,
+    "normative_cross_repository_vectors_required": true
+  },
+  "router_mode": {
+    "coordinator_constructs": "DeterministicCapabilityRouter() with no injected keywords or patterns",
+    "arbitrary_or_injected_router_instances_prohibited": true,
+    "private_attribute_introspection_prohibited": true
+  },
+  "eligibility": {
+    "owner": "single pure function before model load or inference",
+    "precedence": [
+      "empty_normalized_prompt",
+      "corpus_not_approved",
+      "corpus_record_not_eligible",
+      "unsupported_router_mode",
+      "invalid_assessment",
+      "ambiguous_assessment",
+      "unsupported_capability",
+      "compound_mixed_task"
+    ],
+    "empty_prompt_lifecycle": "fatal corpus-manifest validation error; no observation row and no fingerprint",
+    "all_required": [
+      "approved hash-pinned corpus manifest",
+      "corpus_eligible=true",
+      "coordinator-created default router",
+      "RoutingAssessment",
+      "clarity clear",
+      "provisional capability general or research",
+      "no compound_mixed_task"
+    ],
+    "strata": {
+      "clear_research": "clear and research",
+      "clear_general_signal_backed": "clear and general and len(signals)>0",
+      "clear_general_zero_signal_default": "clear and general and len(signals)==0"
+    },
+    "ineligible_reaches_adapter": false
+  },
+  "corpus": {
+    "duplicate_policy": "reject duplicate canonical_input_sha256 during manifest validation",
+    "conflicting_duplicate_metadata": "fatal",
+    "minimum_completed_unique_eligible": 200,
+    "minimum_completed_per_authoritative_class": 50,
+    "forbidden_overlap_manifests": "non-empty, hash-pinned, same canonicalization protocol",
+    "overlap_scope": "all manifest records, including corpus_eligible=false",
+    "corpus_sha256": "SHA-256 of canonical records payload",
+    "corpus_manifest_sha256": "SHA-256 of canonical manifest excluding canonical_manifest_sha256",
+    "training_use": "prohibited",
+    "policy_selection_use": "prohibited"
+  },
+  "worker_isolation": {
+    "mechanism": "separate subprocess",
+    "coordinator_has_no_ML_runtime_imports": true,
+    "hard_timeout_terminates_worker": true,
+    "native_crash_or_OOM_becomes_per_record_unexpected_observer_error_when coordinator remains healthy": true,
+    "IPC_payload": "canonical prompt in; typed privacy-safe result out"
+  },
+  "probability": {
+    "source": "predict_proba",
+    "shape": [
+      1,
+      2
+    ],
+    "numeric_non_boolean": true,
+    "finite": true,
+    "range": [
+      0.0,
+      1.0
+    ],
+    "row_sum_tolerance": 0.0001,
+    "normalize_then_revalidate": true,
+    "argmax_on_recorded_post_normalization_values": true,
+    "exact_tie": "invalid_probabilities",
+    "malformed_output": "non-array, wrong shape, or non-numeric",
+    "invalid_probabilities": "boolean, NaN, Inf, out-of-range, bad row sum, post-normalization failure, or exact tie"
+  },
+  "failure_lifecycle": {
+    "fatal_run_abort_nonzero_no_valid_completed_report": [
+      "empty_normalized_prompt",
+      "corpus_not_approved",
+      "unsupported_router_mode",
+      "artifact_manifest_missing",
+      "artifact_identity_mismatch",
+      "protocol_identity_mismatch",
+      "label_map_mismatch",
+      "network_access_attempted",
+      "telemetry_write_failed"
+    ],
+    "per_record_continue": [
+      "inference_timeout",
+      "malformed_output",
+      "invalid_probabilities",
+      "unexpected_observer_error"
+    ],
+    "telemetry_write_failed_not_a_record_error": true
+  },
+  "telemetry": {
+    "observation_states": [
+      "ineligible",
+      "eligible_agreed",
+      "eligible_disagreed",
+      "eligible_shadow_execution_error"
+    ],
+    "privacy_prohibitions": [
+      "raw_prompt",
+      "normalized_prompt",
+      "RoutingAssessment.reason",
+      "RoutingSignal.evidence",
+      "raw exception text",
+      "hostname",
+      "username",
+      "absolute path",
+      "environment variables"
+    ],
+    "run_metadata_location": "separate run summary artifact, not every JSONL row",
+    "environment_fingerprint_allowlist": [
+      "python_version",
+      "platform_system",
+      "platform_release_major",
+      "machine_architecture",
+      "package_versions",
+      "device_class",
+      "repository_commit"
+    ],
+    "state_matrix": {
+      "ineligible": {
+        "ineligibility_reason": "non-null",
+        "stratum": null,
+        "authoritative_capability": null,
+        "model_decision": null,
+        "probabilities": null,
+        "agreement": null,
+        "disagreement_category": null,
+        "error_code": null,
+        "latency": null
+      },
+      "eligible_agreed": {
+        "ineligibility_reason": null,
+        "stratum": "non-null",
+        "authoritative_capability": "non-null",
+        "model_decision": "non-null",
+        "probabilities": "non-null",
+        "agreement": true,
+        "disagreement_category": null,
+        "error_code": null,
+        "latency": "non-null"
+      },
+      "eligible_disagreed": {
+        "ineligibility_reason": null,
+        "stratum": "non-null",
+        "authoritative_capability": "non-null",
+        "model_decision": "non-null",
+        "probabilities": "non-null",
+        "agreement": false,
+        "disagreement_category": "directional non-null",
+        "error_code": null,
+        "latency": "non-null"
+      },
+      "eligible_shadow_execution_error": {
+        "ineligibility_reason": null,
+        "stratum": "non-null",
+        "authoritative_capability": "non-null",
+        "model_decision": null,
+        "probabilities": null,
+        "agreement": null,
+        "disagreement_category": "shadow_execution_error",
+        "error_code": "per-record non-null",
+        "latency": "null before inference; otherwise measured"
+      }
+    }
+  },
+  "promotion": {
+    "enum": [
+      "STOP_AND_INVESTIGATE",
+      "INVALID_RUN_EXECUTION_ERRORS",
+      "INVALID_RUN_INSUFFICIENT_EVIDENCE",
+      "ELIGIBLE_FOR_HUMAN_REVIEW"
+    ],
+    "precedence": [
+      "dangerous disagreement count > 0 => STOP_AND_INVESTIGATE",
+      "else per-record execution error count > 0 => INVALID_RUN_EXECUTION_ERRORS",
+      "else completed evidence below 200 total or 50 per class => INVALID_RUN_INSUFFICIENT_EVIDENCE",
+      "else ELIGIBLE_FOR_HUMAN_REVIEW"
+    ],
+    "dangerous_disagreement": "authoritative research, shadow general",
+    "bounded_run_completes_after_dangerous_disagreement": true,
+    "eligible_for_human_review_is_not_automatic_promotion": true
+  },
+  "dependency_boundary": {
+    "prohibited_in_entire_services_orchestrator_tree": [
+      "setfit",
+      "torch",
+      "transformers",
+      "sentence_transformers",
+      "sklearn",
+      "evaluation.routing"
+    ],
+    "architecture_test_required": true
+  },
+  "increments": [
+    {
+      "id": 1,
+      "scope": "offline coordinator, canonicalization, router construction, eligibility, schemas, state matrix, corpus validation, promotion logic, stub worker; no ML runtime"
+    },
+    {
+      "id": 2,
+      "scope": "subprocess Run 002 worker, externally anchored verify-before-deserialize, offline/network guard, label checks, probability checks, timeout/crash containment"
+    },
+    {
+      "id": 3,
+      "scope": "approved 200+ replay, overlap checks, JSONL and summary, strata, promotion verdict, frozen evidence"
+    }
+  ],
+  "test_floor_exception": "Increment 1 synthetic test manifests may bypass 200/50 floors only through an explicit test-only API unavailable to production replay CLI",
+  "canonical_contract_sha256": "40ab49738b4f45ea5fc13b9fc7f498622fab0af313b81c0698e4a46746a13fed"
+}
