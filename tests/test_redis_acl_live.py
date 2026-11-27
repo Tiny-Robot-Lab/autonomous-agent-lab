@@ -417,6 +417,8 @@ def test_runtime_identities_negative_commands_and_task_isolation(
         ("GET", "task.delegation_wave_proposal:t1:p1"),
         ("SET", "task.delegation_wave:t1:w1", "{}"),
         ("GET", "task.delegation_wave:t1:w1"),
+        ("SET", "task.delegation_wave_resolution:t1:w1", "{}"),
+        ("GET", "task.delegation_wave_resolution:t1:w1"),
         ("SET", "task.routing:t1", "{}"),
         ("RPUSH", "task.children:t1", "c1"),
         ("BLPOP", "task.status:t1", "1"),
@@ -624,13 +626,20 @@ import os
 from datetime import UTC, datetime, timedelta
 
 from agent_contracts import (
+    MAX_WAVE_DURATION_SECONDS,
+    MIN_WAVE_DURATION_SECONDS,
+    AcceptedDelegationWave,
     ActiveClaim,
     AgentEvent,
     ArtifactReference,
     AssignmentYieldRecord,
     CompletionCommand,
     DelegationGrant,
+    DelegationGrantV2,
     DelegationProposalRecord,
+    DelegationWaveProposalItem,
+    DelegationWaveProposalRecord,
+    DelegationWaveProposalRequest,
     InferenceExecutionTelemetry,
     RecoveryDecisionCommand,
     RootAuthorityRecord,
@@ -638,11 +647,15 @@ from agent_contracts import (
     RoutingProvenance,
     StageArtifact,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskRequested,
     TaskResult,
     WakeUpHint,
+    WaveYieldRecord,
     compute_proposal_fingerprint,
+    compute_wave_proposal_fingerprint,
+    derive_wave_deadline,
     resolve_redis_connection_from_env,
 )
 from orchestrator.domain.capability import AgentCapability
@@ -930,6 +943,110 @@ async def main() -> None:
         assert dec_rec.restored_status == "pending"
         assert await gw.get_recovery_decision(t_exp, "rec-dec-1") is not None
         assert await gw.get_status(t_exp) == "pending"
+
+        # ------------------------------------------------------------------
+        # D. Bounded v2 Wave Acceptance -> Child Completion -> Barrier Resolution -> V2 Resumed Claim
+        # ------------------------------------------------------------------
+        w_parent = "task-acl-wave-parent"
+        await gw.register_root_task(
+            TaskRequested(task_id=w_parent, root_task_id=w_parent, parent_task_id=None, prompt="Wave ACL", created_at=t0, version=2),
+            initial_status="pending",
+            required_capability="research",
+        )
+        await gw._client.set(
+            f"task.authority:{w_parent}",
+            RootAuthorityRecord.create_wave_baseline(w_parent, max_children_per_wave=2, created_at=t0).to_json(),
+        )
+        w_grant = DelegationGrantV2(
+            grant_id="grant-acl-wave", root_task_id=w_parent, issued_to_assignment_id="assign-acl-wave",
+            issued_to_principal_id="principal-research-1", fencing_epoch=1, turn_id="turn-acl-wave", issued_at=t0, max_children=2,
+        )
+        w_claim = ActiveClaim(
+            task_id=w_parent, assignment_id="assign-acl-wave", claim_id="claim-acl-wave", root_task_id=w_parent,
+            turn_id="turn-acl-wave", runtime_principal_id="principal-research-1", bound_agent_id="research-agent-1",
+            assigned_capability="research", execution_kind="initial", fencing_epoch=1, proof_digest="1" * 64,
+            request_id="req-acl-wave", claimed_at=t0, delivery_expires_at=future_lease,
+            delegation_grant_id="grant-acl-wave", prior_claimable_status="pending",
+        )
+        await gw.atomic_claim_task(w_parent, w_claim, grant=w_grant, now=t0)
+        await gw.acknowledge_claim(w_parent, "assign-acl-wave", "principal-research-1", t0)
+        w_art = StageArtifact(
+            artifact_id="art-acl-wave", producing_task_id=w_parent, artifact_type="research_material",
+            content={"material": "acl wave"}, created_at=t0, producing_turn_id="turn-acl-wave",
+            artifact_version=1, payload_schema_version=1, sealed=True, metadata={"turn_id": "turn-acl-wave"},
+        )
+        await gw.save_stage_artifact(w_art, "assign-acl-wave", "principal-research-1", 1)
+        w_ref = ArtifactReference(artifact_id="art-acl-wave", producing_task_id=w_parent, artifact_version=1)
+        w_req = DelegationWaveProposalRequest(
+            proposal_id="prop-acl-wave",
+            items=(
+                DelegationWaveProposalItem(item_id="i1", child_intent="Branch 1", artifact_reference=w_ref),
+                DelegationWaveProposalItem(item_id="i2", child_intent="Branch 2", artifact_reference=w_ref),
+            ),
+            barrier_policy="PARTIAL",
+            required_success_fraction={"numerator": 1, "denominator": 2},
+        )
+        wc1, wc2 = "task-acl-wave-c1", "task-acl-wave-c2"
+        w_dd = derive_wave_deadline(
+            work_complexity=w_req.work_complexity, uncertainty_level=w_req.uncertainty_level,
+            required_child_count=2, planned_parallelism=2,
+            min_duration_seconds=MIN_WAVE_DURATION_SECONDS, max_duration_seconds=MAX_WAVE_DURATION_SECONDS, accepted_at=t0,
+        )
+        w_acc = AcceptedDelegationWave(
+            wave_id="wave-acl-1", parent_task_id=w_parent, required_child_task_ids=(wc1, wc2),
+            barrier_policy="PARTIAL", required_success_fraction=w_req.required_success_fraction,
+            required_success_count=1, deadline_derivation=w_dd, accepted_at=t0,
+        )
+        w_prop = DelegationWaveProposalRecord(
+            parent_task_id=w_parent, proposal_id="prop-acl-wave", wave_id="wave-acl-1",
+            delegation_decision_id="dec-acl-wave", assignment_id="assign-acl-wave",
+            runtime_principal_id="principal-research-1", bound_agent_id="research-agent-1",
+            fencing_epoch=1, proof_digest="1" * 64,
+            proposal_fingerprint=compute_wave_proposal_fingerprint(
+                parent_task_id=w_parent,
+                assignment_id="assign-acl-wave",
+                request=w_req,
+            ),
+            delegation_grant_id="grant-acl-wave", required_child_task_ids=(wc1, wc2),
+            barrier_policy="PARTIAL", required_success_fraction=w_req.required_success_fraction,
+            required_success_count=1, accepted_at=t0, wave_deadline=w_dd.wave_deadline, child_claim_deadline=future_now,
+        )
+        w_cont = TaskContinuationV2(
+            parent_task_id=w_parent, wave_id="wave-acl-1", required_child_task_ids=(wc1, wc2),
+            created_at=t0, updated_at=t0, input_version=1, continuation_capability="research",
+            stage="incorporate_analysis_child", control_fields={}, artifact_references=(w_ref,),
+            continuation_version=2, state="active", wave_resolution=None,
+        )
+        w_inputs = [TaskInput(task_id=cid, prompt=it.child_intent, created_at=t0, input_version=1, artifact_references=(w_ref,)) for cid, it in zip((wc1, wc2), w_req.items, strict=True)]
+        w_hints = [WakeUpHint(hint_id=f"hint-{cid}", capability="analysis", created_at=t0, execution_kind="delegated_child", task_id=cid) for cid in (wc1, wc2)]
+        w_yield = WaveYieldRecord(assignment_id="assign-acl-wave", parent_task_id=w_parent, principal_id="principal-research-1", proposal_id="prop-acl-wave", wave_id="wave-acl-1", required_child_task_ids=(wc1, wc2), delegation_decision_id="dec-acl-wave", yielded_at=t0)
+        await gw.accept_delegation_wave(w_parent, w_prop, w_acc, w_inputs, w_cont, w_yield, w_hints, expected_fencing_epoch=1, now=t0)
+        wc1_claim = ActiveClaim(
+            task_id=wc1, assignment_id="assign-acl-wc1", claim_id="claim-acl-wc1", root_task_id=w_parent,
+            turn_id="turn-acl-wc1", runtime_principal_id="principal-analysis-1", bound_agent_id="analysis-agent-1",
+            assigned_capability="analysis", execution_kind="delegated_child", fencing_epoch=1, proof_digest="2" * 64,
+            request_id="req-acl-wc1", claimed_at=t0, delivery_expires_at=future_lease, prior_claimable_status="pending",
+        )
+        await gw.atomic_claim_task(wc1, wc1_claim, grant=None, now=t0, is_root=False)
+        await gw.acknowledge_claim(wc1, "assign-acl-wc1", "principal-analysis-1", t0)
+        await gw.complete_turn(
+            wc1,
+            CompletionCommand(completion_command_id="cmd-acl-wc1", assignment_id="assign-acl-wc1", execution_kind="delegated_child", completed_result=TaskResult(task_id=wc1, output="Branch 1 ok")),
+            "2" * 64, 1, w_parent, w_parent, t0, "principal-analysis-1", "analysis-agent-1",
+        )
+        rw = await gw.get_resolved_delegation_wave(w_parent, "wave-acl-1")
+        assert rw is not None and rw.resolution == "SATISFIED"
+        assert await gw.get_status(wc2) == "ended / barrier_resolved"
+        assert await gw.get_status(w_parent) == "resumable"
+        w_res_claim = ActiveClaim(
+            task_id=w_parent, assignment_id="assign-acl-wres", claim_id="claim-acl-wres", root_task_id=w_parent,
+            turn_id="turn-acl-wres", runtime_principal_id="principal-research-2", bound_agent_id="research-agent-2",
+            assigned_capability="research", execution_kind="resumed_continuation", continuation_version=2,
+            fencing_epoch=2, proof_digest="3" * 64, request_id="req-acl-wres", claimed_at=t0,
+            delivery_expires_at=future_lease, prior_claimable_status="resumable",
+        )
+        await gw.atomic_claim_task(w_parent, w_res_claim, grant=None, now=t0, expected_continuation_version=2, is_root=True)
+        assert await gw.get_status(w_parent) == "working"
 
         print("ALL_15_LUA_AND_GATEWAY_OK")
     finally:

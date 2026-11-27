@@ -10,6 +10,7 @@ from agent_contracts import (
     MAX_WAVE_DURATION_SECONDS,
     MIN_WAVE_CHILDREN,
     MIN_WAVE_DURATION_SECONDS,
+    RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED,
     AcceptedDelegationWave,
     ActiveClaim,
     AgentEvent,
@@ -30,6 +31,7 @@ from agent_contracts import (
     DelegationWaveResponse,
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
+    ResolvedDelegationWave,
     ResumedContinuationContext,
     RoutingDecision,
     RoutingProvenance,
@@ -43,6 +45,7 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveResolution,
     WaveYieldRecord,
     compute_proposal_fingerprint,
     compute_wave_proposal_fingerprint,
@@ -634,16 +637,45 @@ class ClaimTask:
                 raise TaskNotClaimableError(
                     f"Continuation version {continuation_version} not found for task '{clean_task_id}'"
                 )
-            if isinstance(continuation, TaskContinuationV2) and not continuation.is_claimable:
-                raise TaskNotClaimableError(
-                    f"Continuation version {continuation_version} for task '{clean_task_id}' is not claimable"
-                )
             if continuation.parent_task_id != clean_task_id:
                 raise TaskNotClaimableError("Continuation task mismatch")
             if continuation.continuation_capability != clean_cap:
                 raise CapabilityMismatchError(
                     f"Continuation requires capability '{continuation.continuation_capability}', but requested '{clean_cap}'"
                 )
+            if isinstance(continuation, TaskContinuationV2):
+                if continuation_version != 2 or continuation.version != 2:
+                    raise TaskNotClaimableError(
+                        f"Continuation version {continuation_version} mismatch for TaskContinuationV2"
+                    )
+                if not continuation.is_claimable:
+                    raise TaskNotClaimableError(
+                        f"Continuation version {continuation_version} for task '{clean_task_id}' is not claimable"
+                    )
+                if continuation.wave_resolution not in (
+                    WaveResolution.SATISFIED.value,
+                    WaveResolution.UNSATISFIABLE.value,
+                ):
+                    raise TaskNotClaimableError(
+                        f"Wave resolution '{continuation.wave_resolution}' is not resumable in Increment 3"
+                    )
+                resolved_wave = await self._task_store.get_resolved_delegation_wave(
+                    clean_task_id, continuation.wave_id
+                )
+                if resolved_wave is None:
+                    raise CorruptAuthoritativeRecordError(
+                        f"ResolvedDelegationWave missing for released continuation '{continuation.wave_id}'"
+                    )
+                if (
+                    resolved_wave.version != 2
+                    or resolved_wave.parent_task_id != clean_task_id
+                    or resolved_wave.wave_id != continuation.wave_id
+                    or resolved_wave.resolution != continuation.wave_resolution
+                    or resolved_wave.required_child_task_ids != continuation.required_child_task_ids
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"ResolvedDelegationWave '{continuation.wave_id}' disagrees with TaskContinuationV2"
+                    )
             pinned_artifacts = tuple(dict.fromkeys(task_input.artifact_references + continuation.artifact_references))
         else:
             pinned_artifacts = task_input.artifact_references
@@ -1239,6 +1271,7 @@ def _assert_wave_consistency(
     parent_status: str | None,
     parent_children: list[str],
     wave_yield: WaveYieldRecord | None,
+    resolved_wave: ResolvedDelegationWave | None = None,
 ) -> None:
     if (
         record.barrier_policy != request.barrier_policy
@@ -1254,10 +1287,6 @@ def _assert_wave_consistency(
     if latest_continuation_version != 2:
         raise CorruptAuthoritativeRecordError(
             f"Invalid continuation_latest for wave '{record.wave_id}': {latest_continuation_version}"
-        )
-    if parent_status != "waiting_for_children":
-        raise CorruptAuthoritativeRecordError(
-            f"Parent status for wave '{record.wave_id}' must be 'waiting_for_children', got '{parent_status}'"
         )
     if tuple(sorted(parent_children)) != record.required_child_task_ids or len(parent_children) != len(
         record.required_child_task_ids
@@ -1304,12 +1333,49 @@ def _assert_wave_consistency(
         or continuation.artifact_references != expected_artifacts
         or continuation.continuation_version != 2
         or continuation.version != 2
-        or continuation.state != "active"
-        or continuation.wave_resolution is not None
     ):
         raise CorruptAuthoritativeRecordError(
             f"TaskContinuationV2 for wave '{record.wave_id}' is inconsistent with accepted wave"
         )
+
+    if resolved_wave is None:
+        if parent_status != "waiting_for_children":
+            raise CorruptAuthoritativeRecordError(
+                f"Parent status for wave '{record.wave_id}' must be 'waiting_for_children', got '{parent_status}'"
+            )
+        if continuation.state != "active" or continuation.wave_resolution is not None:
+            raise CorruptAuthoritativeRecordError(
+                f"TaskContinuationV2 for unresolved wave '{record.wave_id}' must be active without resolution"
+            )
+    else:
+        if (
+            resolved_wave.version != 2
+            or resolved_wave.wave_id != record.wave_id
+            or resolved_wave.parent_task_id != record.parent_task_id
+            or resolved_wave.required_child_task_ids != record.required_child_task_ids
+            or resolved_wave.barrier_policy != record.barrier_policy
+            or resolved_wave.required_success_fraction != record.required_success_fraction
+            or resolved_wave.required_success_count != record.required_success_count
+            or resolved_wave.accepted_at != record.accepted_at
+            or resolved_wave.wave_deadline != record.wave_deadline
+            or resolved_wave.accepted_wave_fingerprint != wave.semantic_fingerprint()
+            or resolved_wave.resolution
+            not in (WaveResolution.SATISFIED.value, WaveResolution.UNSATISFIABLE.value)
+        ):
+            raise CorruptAuthoritativeRecordError(
+                f"ResolvedDelegationWave '{record.wave_id}' is inconsistent with accepted wave"
+            )
+        if (
+            continuation.state != "released"
+            or continuation.wave_resolution != resolved_wave.resolution
+        ):
+            raise CorruptAuthoritativeRecordError(
+                f"TaskContinuationV2 for resolved wave '{record.wave_id}' must be released with matching resolution"
+            )
+        if parent_status not in ("resumable", "working", "completed", "failed", "recovery_required"):
+            raise CorruptAuthoritativeRecordError(
+                f"Parent status for resolved wave '{record.wave_id}' is invalid: '{parent_status}'"
+            )
 
 
 class AcceptDelegationWave:
@@ -1523,9 +1589,10 @@ class AcceptDelegationWave:
                 raise DelegationReplayAuthorizationError("Delegation wave replay authorization failed")
 
             wave = await self._task_store.get_accepted_delegation_wave(clean_parent, record.wave_id)
+            resolved_wave = await self._task_store.get_resolved_delegation_wave(clean_parent, record.wave_id)
             cont = await self._task_store.get_continuation(clean_parent, 2)
             latest_cont = await self._task_store.get_latest_continuation_version(clean_parent)
-            parent_status = await self._task_store.get_status(clean_parent)
+            parent_status = await self._task_store.get_status(clean_parent, now=record.accepted_at)
             parent_children = await self._task_store.get_children(clean_parent)
             wave_yield = await self._task_store.get_wave_yield(clean_parent, clean_assign_id)
             _assert_wave_consistency(
@@ -1537,17 +1604,34 @@ class AcceptDelegationWave:
                 parent_status=parent_status,
                 parent_children=parent_children,
                 wave_yield=wave_yield,
+                resolved_wave=resolved_wave,
+            )
+            expected_artifacts = {item.artifact_reference for item in request.items}
+            expected_intents = {item.child_intent for item in request.items}
+            completion_store = (
+                self._task_store if isinstance(self._task_store, TurnCompletionStore) else None
             )
             for child_id in record.required_child_task_ids:
-                child_status = await self._task_store.get_status(child_id)
+                child_status = await self._task_store.get_status(child_id, now=record.accepted_at)
                 child_lineage = await self._task_store.get_lineage(child_id)
                 child_cap = await self._task_store.get_required_capability(child_id)
                 child_input = await self._task_store.get_task_input(child_id, 1)
                 child_deadline = await self._task_store.get_child_claim_deadline(child_id)
                 child_fence = await self._task_store.get_fencing_epoch(child_id)
+                child_claim = await self._task_store.get_active_claim(child_id)
+                child_marker = await self._task_store.get_child_completion_marker(child_id)
+                child_outcome = (
+                    await completion_store.get_terminal_outcome(child_id)
+                    if completion_store is not None
+                    else None
+                )
+                child_result = (
+                    await completion_store.get_canonical_result(child_id)
+                    if completion_store is not None
+                    else None
+                )
                 if (
-                    child_status != "pending"
-                    or child_lineage is None
+                    child_lineage is None
                     or child_lineage.task_id != child_id
                     or child_lineage.parent_task_id != clean_parent
                     or child_lineage.root_task_id != clean_parent
@@ -1556,11 +1640,103 @@ class AcceptDelegationWave:
                     or child_input is None
                     or child_input.task_id != child_id
                     or child_input.input_version != 1
+                    or len(child_input.artifact_references) != 1
+                    or child_input.artifact_references[0] not in expected_artifacts
+                    or child_input.prompt not in expected_intents
                     or child_deadline != record.child_claim_deadline
-                    or child_fence != 0
                 ):
                     raise CorruptAuthoritativeRecordError(
                         f"Child record '{child_id}' is missing or inconsistent with accepted wave '{record.wave_id}'"
+                    )
+
+                if child_status == "pending":
+                    if (
+                        resolved_wave is not None
+                        or child_fence != 0
+                        or child_claim is not None
+                        or child_outcome is not None
+                        or child_result is not None
+                        or child_marker is not None
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Pending child '{child_id}' has inconsistent state under wave '{record.wave_id}'"
+                        )
+                elif child_status == "working":
+                    if (
+                        resolved_wave is not None
+                        or child_fence < 1
+                        or child_claim is None
+                        or child_claim.task_id != child_id
+                        or child_claim.fencing_epoch != child_fence
+                        or child_claim.execution_kind != "delegated_child"
+                        or child_claim.assigned_capability != "analysis"
+                        or child_outcome is not None
+                        or child_result is not None
+                        or child_marker is not None
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Working child '{child_id}' has inconsistent claim/fence state under wave '{record.wave_id}'"
+                        )
+                elif child_status in ("completed", "failed", "claim_timed_out"):
+                    if (
+                        child_claim is not None
+                        or child_outcome is None
+                        or child_outcome.task_id != child_id
+                        or child_outcome.terminal_status != child_status
+                        or child_marker is None
+                        or child_marker.get("child_task_id") != child_id
+                        or child_marker.get("parent_task_id") != clean_parent
+                        or child_marker.get("outcome_id") != child_outcome.outcome_id
+                        or child_marker.get("continuation_version") != 2
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Terminal child '{child_id}' has inconsistent outcome/marker state under wave '{record.wave_id}'"
+                        )
+                    if child_status == "completed":
+                        if (
+                            child_fence < 1
+                            or child_result is None
+                            or child_result.task_id != child_id
+                            or child_result.status != "completed"
+                        ):
+                            raise CorruptAuthoritativeRecordError(
+                                f"Completed child '{child_id}' missing valid canonical result or fence"
+                            )
+                    elif child_result is not None:
+                        raise CorruptAuthoritativeRecordError(
+                            f"Non-completed terminal child '{child_id}' has unexpected canonical result"
+                        )
+                    if resolved_wave is not None:
+                        assert resolved_wave.child_outcomes is not None
+                        snap = resolved_wave.child_outcomes.get(child_id)
+                        if (
+                            snap is None
+                            or snap.get("status") != child_status
+                            or snap.get("outcome_id") != child_outcome.outcome_id
+                        ):
+                            raise CorruptAuthoritativeRecordError(
+                                f"Terminal child '{child_id}' mismatches resolved wave snapshot"
+                            )
+                elif child_status == RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED:
+                    if (
+                        resolved_wave is None
+                        or resolved_wave.residual_child_task_ids is None
+                        or child_id not in resolved_wave.residual_child_task_ids
+                        or resolved_wave.child_outcomes is None
+                        or resolved_wave.child_outcomes.get(child_id, {}).get("status")
+                        != RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED
+                        or child_fence < 0
+                        or child_claim is not None
+                        or child_outcome is not None
+                        or child_result is not None
+                        or child_marker is not None
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Residual child '{child_id}' has inconsistent closure state under wave '{record.wave_id}'"
+                        )
+                else:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Child '{child_id}' has unsupported lifecycle status '{child_status}' under wave '{record.wave_id}'"
                     )
             accepted_record = record
 

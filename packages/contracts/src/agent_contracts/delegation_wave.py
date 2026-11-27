@@ -14,6 +14,7 @@ from .delegation_proposal import (
     ALLOWED_TARGET_CAPABILITIES,
     FORBIDDEN_AUTHORITY_FIELDS,
 )
+from .lifecycle import TaskLifecycleStatus
 from .serialization import (
     canonical_json_dumps,
     check_no_credential_bearing_keys,
@@ -23,6 +24,7 @@ from .serialization import (
 )
 
 DELEGATION_WAVE_CONTRACT_VERSION: int = 1
+RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION: int = 2
 DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION: int = 2
 DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION: int = 2
 WAVE_YIELD_CONTRACT_VERSION: int = 2
@@ -66,6 +68,19 @@ WAVE_DEADLINE_POLICY_VERSION: int = 1
 RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED: str = "ended / barrier_resolved"
 ALLOWED_RESIDUAL_DISPOSITIONS: frozenset[str] = frozenset({
     RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED,
+})
+ALLOWED_RESOLVED_CHILD_OUTCOME_STATUSES: frozenset[str] = frozenset({
+    TaskLifecycleStatus.COMPLETED.value,
+    TaskLifecycleStatus.FAILED.value,
+    TaskLifecycleStatus.CLAIM_TIMED_OUT.value,
+    TaskLifecycleStatus.DISPATCH_FAILED.value,
+    RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED,
+})
+TERMINAL_RESOLVED_CHILD_STATUSES: frozenset[str] = frozenset({
+    TaskLifecycleStatus.COMPLETED.value,
+    TaskLifecycleStatus.FAILED.value,
+    TaskLifecycleStatus.CLAIM_TIMED_OUT.value,
+    TaskLifecycleStatus.DISPATCH_FAILED.value,
 })
 
 # Deterministic Increment 1 baseline constants (integer-only, not empirically calibrated).
@@ -647,6 +662,103 @@ class AcceptedDelegationWave:
         return cls.from_dict(json.loads(value))
 
 
+def _normalize_optional_subset_child_ids(
+    raw_ids: Any,
+    required_child_task_ids: tuple[str, ...],
+    field_name: str,
+) -> tuple[str, ...]:
+    if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence):
+        raise TypeError(
+            f"{field_name} must be a sequence of strings, got {type(raw_ids).__name__}"
+        )
+    allowed = set(required_child_task_ids)
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for idx, child_id in enumerate(raw_ids):
+        if not isinstance(child_id, str) or not child_id.strip():
+            raise ValueError(f"{field_name}[{idx}] must be a non-empty string")
+        clean_child = _require_utf8_bound(
+            child_id.strip(), f"{field_name}[{idx}]", MAX_WAVE_IDENTIFIER_BYTES
+        )
+        if clean_child not in allowed:
+            raise ValueError(
+                f"{field_name} contains child '{clean_child}' not in required_child_task_ids"
+            )
+        if clean_child in seen:
+            raise ValueError(f"Duplicate child task ID in {field_name}: '{clean_child}'")
+        seen.add(clean_child)
+        cleaned.append(clean_child)
+    return tuple(sorted(cleaned))
+
+
+def _normalize_child_outcomes(
+    raw_outcomes: Any,
+    required_child_task_ids: tuple[str, ...],
+) -> MappingProxyType[str, MappingProxyType[str, Any]]:
+    if not isinstance(raw_outcomes, (Mapping, MappingProxyType)):
+        raise TypeError(
+            f"child_outcomes must be a mapping, got {type(raw_outcomes).__name__}"
+        )
+    check_no_credential_bearing_keys(raw_outcomes, "ResolvedDelegationWave.child_outcomes")
+    normalized: dict[str, MappingProxyType[str, Any]] = {}
+    for raw_cid, raw_entry in raw_outcomes.items():
+        if not isinstance(raw_cid, str) or not raw_cid.strip():
+            raise ValueError("child_outcomes keys must be non-empty strings")
+        clean_cid = _require_utf8_bound(
+            raw_cid.strip(), "child_outcomes key", MAX_WAVE_IDENTIFIER_BYTES
+        )
+        if clean_cid in normalized:
+            raise ValueError(f"Duplicate child_outcomes key '{clean_cid}'")
+        if not isinstance(raw_entry, (Mapping, MappingProxyType)):
+            raise TypeError(
+                f"child_outcomes['{clean_cid}'] must be a mapping, got {type(raw_entry).__name__}"
+            )
+        unexpected_entry_keys = set(raw_entry.keys()) - {"status", "outcome_id"}
+        if unexpected_entry_keys:
+            raise TypeError(
+                f"Unexpected fields in child_outcomes['{clean_cid}']: {sorted(unexpected_entry_keys)}"
+            )
+        if "status" not in raw_entry:
+            raise ValueError(f"child_outcomes['{clean_cid}'].status is required")
+        clean_status = _require_nonempty_str(
+            raw_entry["status"], f"child_outcomes['{clean_cid}'].status"
+        )
+        if clean_status not in ALLOWED_RESOLVED_CHILD_OUTCOME_STATUSES:
+            raise ValueError(
+                f"Unsupported status '{clean_status}' in child_outcomes['{clean_cid}']"
+            )
+        raw_outcome_id = raw_entry.get("outcome_id")
+        if clean_status in TERMINAL_RESOLVED_CHILD_STATUSES:
+            clean_outcome_id: str | None = _require_utf8_bound(
+                _require_nonempty_str(
+                    raw_outcome_id, f"child_outcomes['{clean_cid}'].outcome_id"
+                ),
+                f"child_outcomes['{clean_cid}'].outcome_id",
+                MAX_WAVE_IDENTIFIER_BYTES,
+            )
+        else:
+            if raw_outcome_id is not None:
+                raise ValueError(
+                    f"Residual child '{clean_cid}' with status '{clean_status}' must not carry outcome_id"
+                )
+            clean_outcome_id = None
+        normalized[clean_cid] = MappingProxyType({
+            "outcome_id": clean_outcome_id,
+            "status": clean_status,
+        })
+
+    expected_set = set(required_child_task_ids)
+    actual_set = set(normalized.keys())
+    if actual_set != expected_set:
+        missing = sorted(expected_set - actual_set)
+        extra = sorted(actual_set - expected_set)
+        raise ValueError(
+            f"child_outcomes keys must match required_child_task_ids "
+            f"(missing={missing}, extra={extra})"
+        )
+    return MappingProxyType({cid: normalized[cid] for cid in required_child_task_ids})
+
+
 @dataclass(frozen=True)
 class ResolvedDelegationWave:
     """Immutable contract representing an authoritatively resolved delegation wave.
@@ -654,6 +766,12 @@ class ResolvedDelegationWave:
     Explicitly separated from AcceptedDelegationWave so an accepted wave
     remains strictly unresolved while resolved state carries canonical resolution
     and residual child disposition ('ended / barrier_resolved').
+
+    Supports:
+    - version=1: minimal Increment 1 resolution contract;
+    - version=2: Increment 3+ full immutable barrier-resolution snapshot binding
+      accepted wave identity, canonical child outcomes, barrier counts,
+      triggering execution identity, residual membership, and deadline policy.
     """
 
     wave_id: str
@@ -667,10 +785,25 @@ class ResolvedDelegationWave:
     required_success_fraction: RequiredSuccessFraction | None = None
     required_success_count: int | None = None
     version: int = DELEGATION_WAVE_CONTRACT_VERSION
+    accepted_at: str | None = None
+    accepted_wave_fingerprint: str | None = None
+    child_outcomes: Mapping[str, Mapping[str, Any]] | None = None
+    residual_child_task_ids: tuple[str, ...] | None = None
+    completed_count: int | None = None
+    terminal_count: int | None = None
+    unresolved_count: int | None = None
+    triggering_child_task_id: str | None = None
+    triggering_assignment_id: str | None = None
+    triggering_fencing_epoch: int | None = None
+    deadline_policy_id: str | None = None
+    deadline_policy_version: int | None = None
 
     def __post_init__(self) -> None:
         ver = _require_int(self.version, "version", minimum=1)
-        if ver != DELEGATION_WAVE_CONTRACT_VERSION:
+        if ver not in (
+            DELEGATION_WAVE_CONTRACT_VERSION,
+            RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION,
+        ):
             raise ValueError(f"Unsupported contract version: {ver}")
 
         clean_wave_id = _require_nonempty_str(self.wave_id, "wave_id")
@@ -680,6 +813,14 @@ class ResolvedDelegationWave:
 
         clean_children = _normalize_wave_child_ids(self.required_child_task_ids, clean_parent_id)
         object.__setattr__(self, "required_child_task_ids", clean_children)
+
+        if ver == RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION:
+            _require_utf8_bound(clean_wave_id, "wave_id", MAX_WAVE_IDENTIFIER_BYTES)
+            _require_utf8_bound(clean_parent_id, "parent_task_id", MAX_WAVE_IDENTIFIER_BYTES)
+            for idx, cid in enumerate(clean_children):
+                _require_utf8_bound(
+                    cid, f"required_child_task_ids[{idx}]", MAX_WAVE_IDENTIFIER_BYTES
+                )
 
         clean_policy, parsed_fraction, derived_count = _validate_barrier_and_threshold(
             self.barrier_policy,
@@ -715,6 +856,191 @@ class ResolvedDelegationWave:
         object.__setattr__(
             self, "wave_deadline", normalize_canonical_utc_timestamp(self.wave_deadline)
         )
+
+        v2_only_fields = (
+            "accepted_at",
+            "accepted_wave_fingerprint",
+            "child_outcomes",
+            "residual_child_task_ids",
+            "completed_count",
+            "terminal_count",
+            "unresolved_count",
+            "triggering_child_task_id",
+            "triggering_assignment_id",
+            "triggering_fencing_epoch",
+            "deadline_policy_id",
+            "deadline_policy_version",
+        )
+        if ver == DELEGATION_WAVE_CONTRACT_VERSION:
+            present_v2 = [name for name in v2_only_fields if getattr(self, name) is not None]
+            if present_v2:
+                raise ValueError(
+                    f"ResolvedDelegationWave v1 does not permit v2 fields: {sorted(present_v2)}"
+                )
+        else:
+            if not (MIN_WAVE_CHILDREN <= len(clean_children) <= MAX_WAVE_CHILDREN):
+                raise ValueError(
+                    f"ResolvedDelegationWave v2 requires {MIN_WAVE_CHILDREN} to "
+                    f"{MAX_WAVE_CHILDREN} children, got {len(clean_children)}"
+                )
+            for req_v2 in (
+                "accepted_at",
+                "accepted_wave_fingerprint",
+                "child_outcomes",
+                "residual_child_task_ids",
+                "completed_count",
+                "terminal_count",
+                "unresolved_count",
+                "deadline_policy_id",
+                "deadline_policy_version",
+            ):
+                if getattr(self, req_v2) is None:
+                    raise ValueError(f"{req_v2} is required for ResolvedDelegationWave v2")
+
+            object.__setattr__(
+                self, "accepted_at", normalize_canonical_utc_timestamp(self.accepted_at)  # type: ignore[arg-type]
+            )
+            clean_fp = _require_utf8_bound(
+                _require_nonempty_str(self.accepted_wave_fingerprint, "accepted_wave_fingerprint"),
+                "accepted_wave_fingerprint",
+                MAX_WAVE_IDENTIFIER_BYTES,
+            )
+            object.__setattr__(self, "accepted_wave_fingerprint", clean_fp)
+
+            clean_outcomes = _normalize_child_outcomes(self.child_outcomes, clean_children)
+            object.__setattr__(self, "child_outcomes", clean_outcomes)
+
+            clean_residual = _normalize_optional_subset_child_ids(
+                self.residual_child_task_ids, clean_children, "residual_child_task_ids"
+            )
+            object.__setattr__(self, "residual_child_task_ids", clean_residual)
+
+            c_cnt = _require_int(self.completed_count, "completed_count", minimum=0)
+            t_cnt = _require_int(self.terminal_count, "terminal_count", minimum=0)
+            u_cnt = _require_int(self.unresolved_count, "unresolved_count", minimum=0)
+
+            actual_completed = sum(
+                1
+                for entry in clean_outcomes.values()
+                if entry["status"] == TaskLifecycleStatus.COMPLETED.value
+            )
+            actual_terminal = sum(
+                1
+                for entry in clean_outcomes.values()
+                if entry["status"] in TERMINAL_RESOLVED_CHILD_STATUSES
+            )
+            actual_residual = tuple(
+                cid
+                for cid in clean_children
+                if clean_outcomes[cid]["status"] == RESIDUAL_DISPOSITION_ENDED_BARRIER_RESOLVED
+            )
+            if clean_residual != actual_residual:
+                raise ValueError(
+                    f"residual_child_task_ids ({clean_residual}) does not match "
+                    f"residual entries in child_outcomes ({actual_residual})"
+                )
+            if c_cnt != actual_completed:
+                raise ValueError(
+                    f"completed_count ({c_cnt}) does not match child_outcomes ({actual_completed})"
+                )
+            if t_cnt != actual_terminal:
+                raise ValueError(
+                    f"terminal_count ({t_cnt}) does not match child_outcomes ({actual_terminal})"
+                )
+            if u_cnt != len(actual_residual) or t_cnt + u_cnt != len(clean_children):
+                raise ValueError(
+                    f"unresolved_count ({u_cnt}) inconsistent with terminal_count ({t_cnt}) "
+                    f"and required_child_count ({len(clean_children)})"
+                )
+
+            if clean_policy == BarrierPolicy.WAIT_ALL.value:
+                if clean_resolution == WaveResolution.UNSATISFIABLE.value:
+                    raise ValueError("WAIT_ALL wave cannot resolve as UNSATISFIABLE")
+                if clean_resolution == WaveResolution.SATISFIED.value and (
+                    t_cnt != len(clean_children) or u_cnt != 0 or clean_residual != ()
+                ):
+                    raise ValueError(
+                        "WAIT_ALL SATISFIED resolution requires all required children terminal with no residuals"
+                    )
+            else:
+                assert derived_count is not None
+                if clean_resolution == WaveResolution.SATISFIED.value and c_cnt < derived_count:
+                    raise ValueError(
+                        f"PARTIAL SATISFIED resolution requires completed_count ({c_cnt}) >= "
+                        f"required_success_count ({derived_count})"
+                    )
+                if clean_resolution == WaveResolution.UNSATISFIABLE.value and (
+                    c_cnt >= derived_count or c_cnt + u_cnt >= derived_count
+                ):
+                    raise ValueError(
+                        f"PARTIAL UNSATISFIABLE resolution inconsistent with counts "
+                        f"(completed={c_cnt}, unresolved={u_cnt}, required={derived_count})"
+                    )
+
+            clean_pid = _require_utf8_bound(
+                _require_nonempty_str(self.deadline_policy_id, "deadline_policy_id"),
+                "deadline_policy_id",
+                MAX_WAVE_IDENTIFIER_BYTES,
+            )
+            if clean_pid != WAVE_DEADLINE_POLICY_ID:
+                raise ValueError(f"Unsupported deadline_policy_id: '{clean_pid}'")
+            object.__setattr__(self, "deadline_policy_id", clean_pid)
+
+            dp_ver = _require_int(self.deadline_policy_version, "deadline_policy_version", minimum=1)
+            if dp_ver != WAVE_DEADLINE_POLICY_VERSION:
+                raise ValueError(f"Unsupported deadline_policy_version: {dp_ver}")
+
+            if clean_resolution in (
+                WaveResolution.SATISFIED.value,
+                WaveResolution.UNSATISFIABLE.value,
+            ):
+                clean_trig_child = _require_utf8_bound(
+                    _require_nonempty_str(
+                        self.triggering_child_task_id, "triggering_child_task_id"
+                    ),
+                    "triggering_child_task_id",
+                    MAX_WAVE_IDENTIFIER_BYTES,
+                )
+                if clean_trig_child not in clean_children:
+                    raise ValueError(
+                        f"triggering_child_task_id '{clean_trig_child}' is not in required_child_task_ids"
+                    )
+                if clean_outcomes[clean_trig_child]["status"] not in TERMINAL_RESOLVED_CHILD_STATUSES:
+                    raise ValueError(
+                        f"triggering_child_task_id '{clean_trig_child}' must have a canonical terminal outcome"
+                    )
+                object.__setattr__(self, "triggering_child_task_id", clean_trig_child)
+            elif self.triggering_child_task_id is not None:
+                clean_trig_child = _require_utf8_bound(
+                    _require_nonempty_str(
+                        self.triggering_child_task_id, "triggering_child_task_id"
+                    ),
+                    "triggering_child_task_id",
+                    MAX_WAVE_IDENTIFIER_BYTES,
+                )
+                if clean_trig_child not in clean_children:
+                    raise ValueError(
+                        f"triggering_child_task_id '{clean_trig_child}' is not in required_child_task_ids"
+                    )
+                object.__setattr__(self, "triggering_child_task_id", clean_trig_child)
+
+            if (self.triggering_assignment_id is None) != (self.triggering_fencing_epoch is None):
+                raise ValueError(
+                    "triggering_assignment_id and triggering_fencing_epoch must be paired"
+                )
+            if self.triggering_assignment_id is not None:
+                clean_trig_assign = _require_utf8_bound(
+                    _require_nonempty_str(
+                        self.triggering_assignment_id, "triggering_assignment_id"
+                    ),
+                    "triggering_assignment_id",
+                    MAX_WAVE_IDENTIFIER_BYTES,
+                )
+                object.__setattr__(self, "triggering_assignment_id", clean_trig_assign)
+                _require_int(
+                    self.triggering_fencing_epoch, "triggering_fencing_epoch", minimum=1
+                )
+
         _require_json_byte_bound(self.to_json(), "ResolvedDelegationWave")
 
     def to_dict(self) -> dict[str, Any]:
@@ -735,6 +1061,22 @@ class ResolvedDelegationWave:
             "wave_deadline": self.wave_deadline,
             "wave_id": self.wave_id,
         }
+        if self.version == RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION:
+            assert self.residual_child_task_ids is not None
+            data.update({
+                "accepted_at": self.accepted_at,
+                "accepted_wave_fingerprint": self.accepted_wave_fingerprint,
+                "child_outcomes": to_plain_json_structure(self.child_outcomes),
+                "completed_count": self.completed_count,
+                "deadline_policy_id": self.deadline_policy_id,
+                "deadline_policy_version": self.deadline_policy_version,
+                "residual_child_task_ids": list(self.residual_child_task_ids),
+                "terminal_count": self.terminal_count,
+                "triggering_assignment_id": self.triggering_assignment_id,
+                "triggering_child_task_id": self.triggering_child_task_id,
+                "triggering_fencing_epoch": self.triggering_fencing_epoch,
+                "unresolved_count": self.unresolved_count,
+            })
         check_no_credential_bearing_keys(data, "ResolvedDelegationWave.to_dict")
         return data
 
@@ -748,7 +1090,17 @@ class ResolvedDelegationWave:
     def from_dict(cls, data: dict[str, Any]) -> "ResolvedDelegationWave":
         if not isinstance(data, dict):
             raise TypeError("data must be a dict")
-        allowed = {
+        check_no_credential_bearing_keys(data, "ResolvedDelegationWave payload")
+
+        version = data.get("version", DELEGATION_WAVE_CONTRACT_VERSION)
+        ver = _require_int(version, "version", minimum=1)
+        if ver not in (
+            DELEGATION_WAVE_CONTRACT_VERSION,
+            RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION,
+        ):
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        v1_allowed = {
             "barrier_policy",
             "parent_task_id",
             "required_child_task_ids",
@@ -761,10 +1113,26 @@ class ResolvedDelegationWave:
             "wave_deadline",
             "wave_id",
         }
+        v2_fields = {
+            "accepted_at",
+            "accepted_wave_fingerprint",
+            "child_outcomes",
+            "completed_count",
+            "deadline_policy_id",
+            "deadline_policy_version",
+            "residual_child_task_ids",
+            "terminal_count",
+            "triggering_assignment_id",
+            "triggering_child_task_id",
+            "triggering_fencing_epoch",
+            "unresolved_count",
+        }
+        allowed = v1_allowed if ver == DELEGATION_WAVE_CONTRACT_VERSION else (v1_allowed | v2_fields)
         unexpected = data.keys() - allowed
         if unexpected:
             raise TypeError(f"unexpected ResolvedDelegationWave fields: {sorted(unexpected)}")
-        for req in (
+
+        v1_required = (
             "wave_id",
             "parent_task_id",
             "required_child_task_ids",
@@ -772,11 +1140,28 @@ class ResolvedDelegationWave:
             "resolution",
             "resolved_at",
             "wave_deadline",
-        ):
+        )
+        for req in v1_required:
             if req not in data:
                 raise ValueError(f"{req} is required")
 
-        version = data.get("version", DELEGATION_WAVE_CONTRACT_VERSION)
+        if ver == RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION:
+            v2_required = (
+                "accepted_at",
+                "accepted_wave_fingerprint",
+                "child_outcomes",
+                "completed_count",
+                "deadline_policy_id",
+                "deadline_policy_version",
+                "residual_child_task_ids",
+                "residual_disposition",
+                "terminal_count",
+                "unresolved_count",
+            )
+            for req in v2_required:
+                if req not in data:
+                    raise ValueError(f"{req} is required")
+
         return cls(
             wave_id=data["wave_id"],
             parent_task_id=data["parent_task_id"],
@@ -790,7 +1175,19 @@ class ResolvedDelegationWave:
             ),
             required_success_fraction=data.get("required_success_fraction"),
             required_success_count=data.get("required_success_count"),
-            version=version,
+            version=ver,
+            accepted_at=data.get("accepted_at"),
+            accepted_wave_fingerprint=data.get("accepted_wave_fingerprint"),
+            child_outcomes=data.get("child_outcomes"),
+            residual_child_task_ids=data.get("residual_child_task_ids"),
+            completed_count=data.get("completed_count"),
+            terminal_count=data.get("terminal_count"),
+            unresolved_count=data.get("unresolved_count"),
+            triggering_child_task_id=data.get("triggering_child_task_id"),
+            triggering_assignment_id=data.get("triggering_assignment_id"),
+            triggering_fencing_epoch=data.get("triggering_fencing_epoch"),
+            deadline_policy_id=data.get("deadline_policy_id"),
+            deadline_policy_version=data.get("deadline_policy_version"),
         )
 
     @classmethod

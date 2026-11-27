@@ -15,6 +15,7 @@ from .serialization import (
 )
 
 MAX_CONTINUATION_BYTES: int = 16 * 1024  # 16 KiB fixed canonical UTF-8 limit
+MAX_CONTINUATION_IDENTIFIER_BYTES: int = 256
 
 TASK_CONTINUATION_V2_CONTRACT_VERSION: int = 2
 
@@ -61,6 +62,14 @@ def _validate_nonempty_str(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value.strip()
+
+
+def _validate_identifier_utf8_bound(value: str, field_name: str) -> str:
+    if len(value.encode("utf-8")) > MAX_CONTINUATION_IDENTIFIER_BYTES:
+        raise ValueError(
+            f"{field_name} exceeds maximum UTF-8 byte bound of {MAX_CONTINUATION_IDENTIFIER_BYTES} bytes"
+        )
+    return value
 
 
 def _validate_stage_and_controls(
@@ -405,9 +414,18 @@ class TaskContinuationV2:
         _validate_int_at_least(self.continuation_version, "continuation_version", minimum=1)
         _validate_int_at_least(self.input_version, "input_version", minimum=1)
 
-        clean_parent = _validate_nonempty_str(self.parent_task_id, "parent_task_id")
-        clean_wave = _validate_nonempty_str(self.wave_id, "wave_id")
-        clean_cap = _validate_nonempty_str(self.continuation_capability, "continuation_capability")
+        clean_parent = _validate_identifier_utf8_bound(
+            _validate_nonempty_str(self.parent_task_id, "parent_task_id"),
+            "parent_task_id",
+        )
+        clean_wave = _validate_identifier_utf8_bound(
+            _validate_nonempty_str(self.wave_id, "wave_id"),
+            "wave_id",
+        )
+        clean_cap = _validate_identifier_utf8_bound(
+            _validate_nonempty_str(self.continuation_capability, "continuation_capability"),
+            "continuation_capability",
+        )
         object.__setattr__(self, "parent_task_id", clean_parent)
         object.__setattr__(self, "wave_id", clean_wave)
         object.__setattr__(self, "continuation_capability", clean_cap)
@@ -415,6 +433,8 @@ class TaskContinuationV2:
         clean_children = _normalize_required_child_ids(
             self.required_child_task_ids, clean_parent
         )
+        for idx, cid in enumerate(clean_children):
+            _validate_identifier_utf8_bound(cid, f"required_child_task_ids[{idx}]")
         object.__setattr__(self, "required_child_task_ids", clean_children)
 
         clean_stage, frozen_controls = _validate_stage_and_controls(

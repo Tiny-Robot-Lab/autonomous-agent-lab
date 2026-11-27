@@ -18,6 +18,7 @@ from agent_contracts import (
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
     RequiredCapabilityRecord,
+    ResolvedDelegationWave,
     RootAuthorityRecord,
     RoutingDecision,
     StageArtifact,
@@ -361,6 +362,21 @@ class AuthoritativeTaskStore(Protocol):
         wave_id: str,
     ) -> AcceptedDelegationWave | None:
         """Retrieve an accepted delegation wave record by parent_task_id and wave_id."""
+        ...
+
+    async def get_resolved_delegation_wave(
+        self,
+        parent_task_id: str,
+        wave_id: str,
+    ) -> ResolvedDelegationWave | None:
+        """Retrieve an immutable resolved delegation wave record by parent_task_id and wave_id."""
+        ...
+
+    async def get_child_completion_marker(
+        self,
+        child_task_id: str,
+    ) -> dict[str, Any] | None:
+        """Retrieve a child completion projection marker by child_task_id."""
         ...
 
     async def get_wave_yield(
