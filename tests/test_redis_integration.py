@@ -2219,6 +2219,7 @@ async def test_redis_continuation_version_numeric_hardening_and_zero_mutation(cl
             bound_agent_id="worker-1",
             assigned_capability="general",
             execution_kind="resumed_continuation",
+            continuation_version=1,
             fencing_epoch=1,
             proof_digest="a" * 64,
             request_id="req-resumed-001",

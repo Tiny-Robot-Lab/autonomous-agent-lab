@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from agent_contracts import (
+    RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION,
     AcceptedDelegationWave,
     ActiveClaim,
     AgentAvailability,
@@ -26,6 +27,7 @@ from agent_contracts import (
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
     RequiredCapabilityRecord,
+    ResolvedDelegationWave,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
@@ -40,6 +42,7 @@ from agent_contracts import (
     build_completion_audit,
     build_terminal_outcome,
     compute_proposal_fingerprint,
+    evaluate_barrier,
     normalize_canonical_utc_timestamp,
 )
 from fastapi import Request
@@ -106,6 +109,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.proposals: dict[tuple[str, str], DelegationProposalRecord] = {}
         self.wave_proposals: dict[tuple[str, str], DelegationWaveProposalRecord] = {}
         self.accepted_waves: dict[tuple[str, str], AcceptedDelegationWave] = {}
+        self.resolved_waves: dict[tuple[str, str], ResolvedDelegationWave] = {}
         self.yield_records: dict[tuple[str, str], AssignmentYieldRecord | WaveYieldRecord] = {}
         self.consumed_waves: dict[str, set[str]] = {}
         self.consumed_grants: dict[str, set[str]] = {}
@@ -116,7 +120,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.terminal_outcomes: dict[str, TerminalOutcome] = {}
         self.canonical_results: dict[str, TaskResult] = {}
         self.assignment_completions: dict[tuple[str, str], AssignmentCompletionRecord] = {}
-        self.child_markers: dict[str, dict[str, str]] = {}
+        self.child_markers: dict[str, dict[str, Any]] = {}
         self.claim_expiries: dict[str, ClaimExpiryRecord] = {}
         self.recovery_decisions: dict[tuple[str, str], RecoveryDecisionRecord] = {}
         self.fail_next_registration: bool = False
@@ -289,7 +293,12 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             else normalize_canonical_utc_timestamp(datetime.now(UTC))
         )
         deadline = self.claim_deadlines.get(clean_task_id)
-        if deadline and now_iso > deadline and clean_task_id not in self.terminal_outcomes:
+        if (
+            deadline
+            and now_iso > deadline
+            and clean_task_id not in self.terminal_outcomes
+            and self.statuses.get(clean_task_id) == "pending"
+        ):
             try:
                 await self.materialize_claim_timeout(clean_task_id, now_iso)
             except Exception:  # noqa: BLE001, S110
@@ -301,6 +310,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             and claim.execution_expires_at
             and now_iso > claim.execution_expires_at
             and clean_task_id not in self.terminal_outcomes
+            and self.statuses.get(clean_task_id) == "working"
         ):
             try:
                 await self.transition_expired_claim(clean_task_id, now_iso)
@@ -610,6 +620,52 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 raise CorruptAuthoritativeRecordError(f"Corrupt continuation latest record for task '{clean_task_id}'")
             if int(cur_latest) != int(expected_continuation_version):
                 raise TaskNotClaimableError(f"Continuation version mismatch for task '{clean_task_id}': latest={cur_latest}, expected={expected_continuation_version}")
+            if int(cur_latest) == 2:
+                if claim.continuation_version != expected_continuation_version:
+                    raise TaskNotClaimableError(
+                        f"Claim continuation version mismatch for task '{clean_task_id}': "
+                        f"claim={claim.continuation_version}, expected={expected_continuation_version}"
+                    )
+                sc = self.continuations.get((clean_task_id, 2))
+                if sc is None:
+                    raise TaskNotClaimableError(
+                        f"Task '{clean_task_id}' continuation v2 is not claimable (MISSING_CONTINUATION)"
+                    )
+                if (
+                    not isinstance(sc, TaskContinuationV2)
+                    or sc.version != 2
+                    or sc.continuation_version != 2
+                    or sc.parent_task_id != clean_task_id
+                    or sc.continuation_capability != claim.assigned_capability
+                    or sc.stage != "incorporate_analysis_child"
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"Authoritative continuation or resolved wave validation failed on task '{clean_task_id}': CORRUPT_CONTINUATION"
+                    )
+                if sc.state != "released":
+                    raise TaskNotClaimableError(
+                        f"Task '{clean_task_id}' continuation v2 is not claimable (CONTINUATION_NOT_CLAIMABLE: {sc.state})"
+                    )
+                if sc.wave_resolution not in ("SATISFIED", "UNSATISFIABLE"):
+                    raise TaskNotClaimableError(
+                        f"Task '{clean_task_id}' continuation v2 is not claimable (UNSUPPORTED_WAVE_RESOLUTION: {sc.wave_resolution})"
+                    )
+                rw = self.resolved_waves.get((clean_task_id, sc.wave_id))
+                if rw is None:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Authoritative continuation or resolved wave validation failed on task '{clean_task_id}': MISSING_RESOLVED_WAVE"
+                    )
+                if (
+                    not isinstance(rw, ResolvedDelegationWave)
+                    or rw.version != RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION
+                    or rw.parent_task_id != clean_task_id
+                    or rw.wave_id != sc.wave_id
+                    or rw.resolution != sc.wave_resolution
+                    or rw.required_child_task_ids != sc.required_child_task_ids
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"Authoritative continuation or resolved wave validation failed on task '{clean_task_id}': WAVE_RESOLUTION_MISMATCH"
+                    )
 
         cur_epoch = self.fences.get(clean_task_id, 0)
         expected_epoch = cur_epoch + 1
@@ -955,6 +1011,20 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
     ) -> AcceptedDelegationWave | None:
         return self.accepted_waves.get((parent_task_id.strip(), wave_id.strip()))
 
+    async def get_resolved_delegation_wave(
+        self,
+        parent_task_id: str,
+        wave_id: str,
+    ) -> ResolvedDelegationWave | None:
+        return self.resolved_waves.get((parent_task_id.strip(), wave_id.strip()))
+
+    async def get_child_completion_marker(
+        self,
+        child_task_id: str,
+    ) -> dict[str, Any] | None:
+        marker = self.child_markers.get(child_task_id.strip())
+        return dict(marker) if marker is not None else None
+
     async def get_wave_yield(
         self,
         parent_task_id: str,
@@ -995,12 +1065,16 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 and existing.proposal_id == proposal.proposal_id
                 and existing.proposal_fingerprint == proposal.proposal_fingerprint
                 and existing.fencing_epoch == expected_fencing_epoch
+                and existing.barrier_policy == proposal.barrier_policy
+                and existing.required_success_fraction == proposal.required_success_fraction
+                and existing.required_success_count == proposal.required_success_count
             ):
                 raise DelegationConflictError(
                     f"Conflicting wave proposal replay for proposal '{proposal.proposal_id}'"
                 )
 
             sw = self.accepted_waves.get((clean_parent, existing.wave_id))
+            sr = self.resolved_waves.get((clean_parent, existing.wave_id))
             sc = self.continuations.get((clean_parent, 2))
             sl = self.latest_continuation.get(clean_parent)
             sps = self.statuses.get(clean_parent)
@@ -1023,10 +1097,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 or sc.required_child_task_ids != existing.required_child_task_ids
                 or sc.continuation_version != 2
                 or sc.version != 2
-                or sc.state != "active"
-                or sc.wave_resolution is not None
                 or sl != 2
-                or sps != "waiting_for_children"
                 or not isinstance(sy, WaveYieldRecord)
                 or sy.wave_id != existing.wave_id
                 or sy.assignment_id != existing.assignment_id
@@ -1042,13 +1113,34 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 raise CorruptAuthoritativeRecordError(
                     f"Corrupt stored wave projection for proposal '{proposal.proposal_id}'"
                 )
+            if sr is None:
+                if sc.state != "active" or sc.wave_resolution is not None or sps != "waiting_for_children":
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt stored wave projection for proposal '{proposal.proposal_id}'"
+                    )
+            else:
+                if (
+                    sr.version != RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION
+                    or sr.parent_task_id != clean_parent
+                    or sr.wave_id != existing.wave_id
+                    or sr.required_child_task_ids != existing.required_child_task_ids
+                    or sr.barrier_policy != existing.barrier_policy
+                    or sr.resolution not in ("SATISFIED", "UNSATISFIABLE")
+                    or sc.state != "released"
+                    or sc.wave_resolution != sr.resolution
+                    or sps not in ("resumable", "working", "completed", "failed", "recovery_required")
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt resolved wave projection for proposal '{proposal.proposal_id}'"
+                    )
             for cid in existing.required_child_task_ids:
                 cl = self.lineages.get(cid)
                 cc = self.required_capabilities.get(cid)
                 ci = self.inputs.get((cid, 1))
+                cs = self.statuses.get(cid)
+                cf = self.fences.get(cid)
                 if (
-                    self.statuses.get(cid) != "pending"
-                    or cl is None
+                    cl is None
                     or cl.task_id != cid
                     or cl.parent_task_id != clean_parent
                     or cl.root_task_id != clean_parent
@@ -1058,10 +1150,73 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                     or ci.task_id != cid
                     or ci.input_version != 1
                     or self.claim_deadlines.get(cid) != existing.child_claim_deadline
-                    or self.fences.get(cid) != 0
+                    or cf is None
+                    or cf < 0
                 ):
                     raise CorruptAuthoritativeRecordError(
                         f"Corrupt child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                    )
+                if cs == "pending":
+                    if (
+                        sr is not None
+                        or cf != 0
+                        or cid in self.claims
+                        or cid in self.terminal_outcomes
+                        or cid in self.canonical_results
+                        or cid in self.child_markers
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Corrupt pending child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                        )
+                elif cs == "working":
+                    c_claim = self.claims.get(cid)
+                    if (
+                        sr is not None
+                        or cf < 1
+                        or c_claim is None
+                        or c_claim.task_id != cid
+                        or c_claim.fencing_epoch != cf
+                        or cid in self.terminal_outcomes
+                        or cid in self.canonical_results
+                        or cid in self.child_markers
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Corrupt working child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                        )
+                elif cs in ("completed", "failed", "claim_timed_out"):
+                    c_out = self.terminal_outcomes.get(cid)
+                    c_mrk = self.child_markers.get(cid)
+                    if (
+                        cf < 1
+                        or cid in self.claims
+                        or c_out is None
+                        or c_out.task_id != cid
+                        or c_out.terminal_status != cs
+                        or c_mrk is None
+                        or c_mrk.get("child_task_id") != cid
+                        or c_mrk.get("parent_task_id") != clean_parent
+                        or c_mrk.get("outcome_id") != c_out.outcome_id
+                        or c_mrk.get("continuation_version") != 2
+                        or (cs == "completed" and cid not in self.canonical_results)
+                        or (cs != "completed" and cid in self.canonical_results)
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Corrupt terminal child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                        )
+                elif cs == "ended / barrier_resolved":
+                    if (
+                        sr is None
+                        or cid in self.claims
+                        or cid in self.terminal_outcomes
+                        or cid in self.canonical_results
+                        or cid in self.child_markers
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Corrupt residual closed child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                        )
+                else:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Unsupported child progression status '{cs}' for '{cid}'"
                     )
             return (existing, True)
 
@@ -1296,6 +1451,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         record_key = (clean_task, command.completion_command_id.strip())
         existing_record = self.completion_records.get(record_key)
         if existing_record is not None:
+            latest_ver = self.latest_continuation.get(clean_parent) if is_child else None
             matches = (
                 existing_record.task_id == clean_task
                 and existing_record.assignment_id == command.assignment_id
@@ -1304,6 +1460,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
                 and existing_record.execution_kind == command.execution_kind
                 and existing_record.semantic_fingerprint == command.semantic_fingerprint()
                 and existing_record.continuation_version == command.continuation_version
+                and (not is_child or latest_ver != 2 or existing_record.proof_digest == clean_digest)
             )
             if matches:
                 stored_outcome = self.terminal_outcomes.get(clean_task)
@@ -1407,6 +1564,11 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             )
 
         parent_children: set[str] = set()
+        latest_ver: int | None = None
+        prepared_v2_marker: dict[str, Any] | None = None
+        prepared_resolved_wave: ResolvedDelegationWave | None = None
+        prepared_cont_released: TaskContinuationV2 | None = None
+        prepared_residual_ids: tuple[str, ...] = ()
         if is_child:
             parent_status = self.statuses.get(clean_parent)
             if parent_status is None:
@@ -1429,21 +1591,65 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             parent_children = self.children.get(clean_parent, set())
             if clean_task not in parent_children:
                 raise TaskNotClaimableError("Child not member of parent: CHILD_NOT_MEMBER")
-            continuation = self.continuations.get((clean_parent, 1))
-            if continuation is None:
-                raise TaskNotClaimableError("Parent continuation missing: MISSING_CONTINUATION")
-            if continuation.stage != "incorporate_analysis_child":
-                raise TaskNotClaimableError("Continuation stage mismatch: CONTINUATION_STAGE_MISMATCH")
-            if continuation.child_task_id != clean_task:
-                raise TaskNotClaimableError("Continuation child mismatch: CONTINUATION_CHILD_MISMATCH")
-            if continuation.continuation_version != 1:
-                raise TaskNotClaimableError("Continuation version mismatch: CONTINUATION_VERSION_MISMATCH")
-            if self.latest_continuation.get(clean_parent) != 1:
-                raise TaskNotClaimableError("Continuation latest mismatch: CONTINUATION_LATEST_MISMATCH")
+            latest_ver = self.latest_continuation.get(clean_parent)
             if clean_task in self.child_markers:
                 raise CompletionConflictError(
                     f"Child completion already projected for '{clean_task}': MARKER_CONFLICT"
                 )
+            has_v1_cont = (clean_parent, 1) in self.continuations
+            has_v2_cont = (clean_parent, 2) in self.continuations
+            if not has_v1_cont and not has_v2_cont and latest_ver is None:
+                raise TaskNotClaimableError("Parent continuation missing: MISSING_CONTINUATION")
+            use_v2_branch = has_v2_cont or (not has_v1_cont and latest_ver == 2)
+            if not use_v2_branch:
+                continuation = self.continuations.get((clean_parent, 1))
+                if continuation is None:
+                    raise TaskNotClaimableError("Parent continuation missing: MISSING_CONTINUATION")
+                if not isinstance(continuation, TaskContinuation):
+                    raise CorruptAuthoritativeRecordError("Corrupt v1 continuation")
+                if continuation.stage != "incorporate_analysis_child":
+                    raise TaskNotClaimableError("Continuation stage mismatch: CONTINUATION_STAGE_MISMATCH")
+                if continuation.child_task_id != clean_task:
+                    raise TaskNotClaimableError("Continuation child mismatch: CONTINUATION_CHILD_MISMATCH")
+                if continuation.continuation_version != 1:
+                    raise TaskNotClaimableError("Continuation version mismatch: CONTINUATION_VERSION_MISMATCH")
+                if latest_ver != 1:
+                    raise TaskNotClaimableError("Continuation latest mismatch: CONTINUATION_LATEST_MISMATCH")
+                latest_ver = 1
+            else:
+                if latest_ver != 2:
+                    raise TaskNotClaimableError("Continuation latest mismatch: CONTINUATION_LATEST_MISMATCH")
+                if command.continuation_version is not None:
+                    raise TaskNotClaimableError("Claimed continuation version mismatch: CONTINUATION_VERSION_MISMATCH")
+                cont_v2 = self.continuations.get((clean_parent, 2))
+                if cont_v2 is None:
+                    raise TaskNotClaimableError("Parent continuation missing: MISSING_CONTINUATION")
+                if (
+                    not isinstance(cont_v2, TaskContinuationV2)
+                    or cont_v2.version != 2
+                    or cont_v2.continuation_version != 2
+                    or cont_v2.parent_task_id != clean_parent
+                    or cont_v2.stage != "incorporate_analysis_child"
+                    or cont_v2.continuation_capability != "research"
+                ):
+                    raise CorruptAuthoritativeRecordError("CORRUPT_CONTINUATION")
+                if cont_v2.state != "active" or cont_v2.wave_resolution is not None:
+                    raise TaskNotClaimableError("CONTINUATION_NOT_ACTIVE")
+                if (clean_parent, cont_v2.wave_id) in self.resolved_waves:
+                    raise TaskNotClaimableError("WAVE_ALREADY_RESOLVED")
+                sw = self.accepted_waves.get((clean_parent, cont_v2.wave_id))
+                if sw is None:
+                    raise CorruptAuthoritativeRecordError("MISSING_ACCEPTED_WAVE")
+                if (
+                    sw.version != 1
+                    or sw.wave_id != cont_v2.wave_id
+                    or sw.parent_task_id != clean_parent
+                    or sw.state != "unresolved"
+                    or sw.required_child_task_ids != cont_v2.required_child_task_ids
+                    or set(parent_children) != set(sw.required_child_task_ids)
+                    or len(parent_children) != len(sw.required_child_task_ids)
+                ):
+                    raise CorruptAuthoritativeRecordError("WAVE_CONSISTENCY_MISMATCH")
 
         outcome, result = build_terminal_outcome(
             command=command,
@@ -1466,6 +1672,184 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             continuation_version=command.continuation_version,
         )
 
+        if is_child and latest_ver == 2:
+            cont_v2 = self.continuations[(clean_parent, 2)]
+            assert isinstance(cont_v2, TaskContinuationV2)
+            sw = self.accepted_waves[(clean_parent, cont_v2.wave_id)]
+            sibling_states: dict[str, str] = {}
+            sibling_outcomes: dict[str, str | None] = {}
+            for sid in sw.required_child_task_ids:
+                if sid not in parent_children:
+                    raise CorruptAuthoritativeRecordError("CHILD_NOT_MEMBER")
+                s_lin = self.lineages.get(sid)
+                s_cap = self.required_capabilities.get(sid)
+                s_inp = self.inputs.get((sid, 1))
+                s_fence = self.fences.get(sid)
+                s_st = self.statuses.get(sid)
+                if (
+                    s_lin is None
+                    or s_lin.task_id != sid
+                    or s_lin.parent_task_id != clean_parent
+                    or s_lin.root_task_id != clean_root
+                    or s_cap is None
+                    or s_cap.task_id != sid
+                    or s_cap.required_capability != "analysis"
+                    or s_inp is None
+                    or s_inp.task_id != sid
+                    or s_inp.input_version != 1
+                    or s_fence is None
+                    or s_fence < 0
+                    or not s_st
+                ):
+                    raise CorruptAuthoritativeRecordError(f"Corrupt sibling '{sid}' projection")
+                if sid == clean_task:
+                    sibling_states[sid] = outcome.terminal_status
+                    sibling_outcomes[sid] = outcome.outcome_id
+                    continue
+                s_claim = self.claims.get(sid)
+                s_out = self.terminal_outcomes.get(sid)
+                s_res = self.canonical_results.get(sid)
+                s_mrk = self.child_markers.get(sid)
+                if s_st == "completed":
+                    if (
+                        s_claim is not None
+                        or s_fence < 1
+                        or s_out is None
+                        or s_out.task_id != sid
+                        or s_out.terminal_status != "completed"
+                        or s_res is None
+                        or s_res.task_id != sid
+                        or s_res.status != "completed"
+                        or s_mrk is None
+                        or s_mrk.get("child_task_id") != sid
+                        or s_mrk.get("parent_task_id") != clean_parent
+                        or s_mrk.get("outcome_id") != s_out.outcome_id
+                        or s_mrk.get("continuation_version") != 2
+                    ):
+                        raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+                    sibling_states[sid] = "completed"
+                    sibling_outcomes[sid] = s_out.outcome_id
+                elif s_st in ("failed", "claim_timed_out"):
+                    if (
+                        s_claim is not None
+                        or s_out is None
+                        or s_out.task_id != sid
+                        or s_out.terminal_status != s_st
+                        or s_res is not None
+                        or s_mrk is None
+                        or s_mrk.get("child_task_id") != sid
+                        or s_mrk.get("parent_task_id") != clean_parent
+                        or s_mrk.get("outcome_id") != s_out.outcome_id
+                        or s_mrk.get("continuation_version") != 2
+                    ):
+                        raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+                    sibling_states[sid] = s_st
+                    sibling_outcomes[sid] = s_out.outcome_id
+                elif s_st == "pending":
+                    if s_claim is not None or s_out is not None or s_res is not None or s_mrk is not None:
+                        raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+                    sibling_states[sid] = "pending"
+                    sibling_outcomes[sid] = None
+                elif s_st == "working":
+                    if (
+                        s_claim is None
+                        or s_out is not None
+                        or s_res is not None
+                        or s_mrk is not None
+                        or s_fence < 1
+                        or s_claim.task_id != sid
+                        or s_claim.execution_kind != "delegated_child"
+                        or s_claim.fencing_epoch != s_fence
+                        or s_claim.assigned_capability != "analysis"
+                    ):
+                        raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+                    sibling_states[sid] = "working"
+                    sibling_outcomes[sid] = None
+                elif s_st == "recovery_required":
+                    if s_claim is not None or s_out is not None or s_res is not None or s_mrk is not None:
+                        raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+                    sibling_states[sid] = "recovery_required"
+                    sibling_outcomes[sid] = None
+                else:
+                    raise CorruptAuthoritativeRecordError(f"CORRUPT_CHILD_STATE on '{sid}'")
+
+            barrier = evaluate_barrier(
+                required_child_task_ids=sw.required_child_task_ids,
+                child_states=sibling_states,
+                barrier_policy=sw.barrier_policy,
+                required_success_fraction=sw.required_success_fraction,
+                required_success_count=sw.required_success_count,
+            )
+            prepared_v2_marker = {
+                "child_task_id": clean_task,
+                "completed_at": now_iso,
+                "completion_command_id": command.completion_command_id,
+                "continuation_version": 2,
+                "outcome_id": outcome.outcome_id,
+                "parent_task_id": clean_parent,
+                "status": outcome.terminal_status,
+                "wave_id": sw.wave_id,
+            }
+            if barrier.outcome.value in ("SATISFIED", "UNSATISFIABLE"):
+                resolution_str = barrier.outcome.value
+                child_outcomes_map: dict[str, dict[str, Any]] = {}
+                residual_ids: list[str] = []
+                for sid in sw.required_child_task_ids:
+                    st_val = sibling_states[sid]
+                    if st_val in ("completed", "failed", "claim_timed_out", "dispatch_failed"):
+                        child_outcomes_map[sid] = {
+                            "outcome_id": sibling_outcomes[sid],
+                            "status": st_val,
+                        }
+                    else:
+                        child_outcomes_map[sid] = {
+                            "outcome_id": None,
+                            "status": "ended / barrier_resolved",
+                        }
+                        residual_ids.append(sid)
+                prepared_residual_ids = tuple(residual_ids)
+                prepared_cont_released = TaskContinuationV2(
+                    parent_task_id=cont_v2.parent_task_id,
+                    wave_id=cont_v2.wave_id,
+                    required_child_task_ids=cont_v2.required_child_task_ids,
+                    created_at=cont_v2.created_at,
+                    updated_at=now_iso,
+                    input_version=cont_v2.input_version,
+                    continuation_capability=cont_v2.continuation_capability,
+                    stage=cont_v2.stage,
+                    control_fields=dict(cont_v2.control_fields),
+                    artifact_references=cont_v2.artifact_references,
+                    continuation_version=2,
+                    state="released",
+                    wave_resolution=resolution_str,
+                    version=2,
+                )
+                prepared_resolved_wave = ResolvedDelegationWave(
+                    version=RESOLVED_DELEGATION_WAVE_V2_CONTRACT_VERSION,
+                    wave_id=sw.wave_id,
+                    parent_task_id=clean_parent,
+                    required_child_task_ids=sw.required_child_task_ids,
+                    accepted_at=sw.accepted_at,
+                    accepted_wave_fingerprint=sw.semantic_fingerprint(),
+                    resolution=resolution_str,
+                    resolved_at=now_iso,
+                    barrier_policy=sw.barrier_policy,
+                    required_success_fraction=sw.required_success_fraction,
+                    required_success_count=sw.required_success_count,
+                    completed_count=barrier.completed_count,
+                    terminal_count=barrier.terminal_count,
+                    unresolved_count=barrier.unresolved_count,
+                    child_outcomes=child_outcomes_map,
+                    residual_child_task_ids=prepared_residual_ids,
+                    residual_disposition="ended / barrier_resolved",
+                    triggering_child_task_id=clean_task,
+                    triggering_assignment_id=command.assignment_id,
+                    triggering_fencing_epoch=fencing_epoch,
+                    wave_deadline=sw.wave_deadline,
+                    deadline_policy_id=sw.deadline_derivation.policy_id,
+                    deadline_policy_version=sw.deadline_derivation.policy_version,
+                )
+
         # Phase 2: mechanically non-failing commit
         self.completion_records[record_key] = record
         self.terminal_outcomes[clean_task] = outcome
@@ -1475,23 +1859,50 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.statuses[clean_task] = outcome.terminal_status
         del self.claims[clean_task]
         if is_child:
-            self.child_markers[clean_task] = {
-                "child_task_id": clean_task,
-                "completion_command_id": command.completion_command_id,
-                "completed_at": now_iso,
-                "outcome_id": outcome.outcome_id,
-            }
-            self.statuses[clean_parent] = "resumable"
-            self.hints.append(
-                WakeUpHint(
-                    hint_id=f"hint-{uuid4()}",
-                    capability="research",
-                    created_at=now_iso,
-                    execution_kind="resumed_continuation",
-                    task_id=clean_parent,
-                    expected_continuation_version=1,
+            if latest_ver == 1:
+                self.child_markers[clean_task] = {
+                    "child_task_id": clean_task,
+                    "completion_command_id": command.completion_command_id,
+                    "completed_at": now_iso,
+                    "outcome_id": outcome.outcome_id,
+                }
+                self.statuses[clean_parent] = "resumable"
+                self.hints.append(
+                    WakeUpHint(
+                        hint_id=f"hint-{uuid4()}",
+                        capability="research",
+                        created_at=now_iso,
+                        execution_kind="resumed_continuation",
+                        task_id=clean_parent,
+                        expected_continuation_version=1,
+                    )
                 )
-            )
+            elif latest_ver == 2:
+                assert prepared_v2_marker is not None
+                self.child_markers[clean_task] = prepared_v2_marker
+                if prepared_resolved_wave is not None and prepared_cont_released is not None:
+                    self.resolved_waves[(clean_parent, prepared_resolved_wave.wave_id)] = (
+                        prepared_resolved_wave
+                    )
+                    self.continuations[(clean_parent, 2)] = prepared_cont_released
+                    self.statuses[clean_parent] = "resumable"
+                    self.hints.append(
+                        WakeUpHint(
+                            hint_id=f"hint-{uuid4()}",
+                            capability="research",
+                            created_at=now_iso,
+                            execution_kind="resumed_continuation",
+                            task_id=clean_parent,
+                            expected_continuation_version=2,
+                        )
+                    )
+                    for sid in prepared_residual_ids:
+                        had_claim = sid in self.claims
+                        cur_s_fence = self.fences.get(sid, 0)
+                        self.statuses[sid] = "ended / barrier_resolved"
+                        self.claims.pop(sid, None)
+                        if cur_s_fence > 0 or had_claim:
+                            self.fences[sid] = cur_s_fence + 1
 
         return (outcome, result, False)
 

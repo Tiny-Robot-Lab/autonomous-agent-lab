@@ -1828,7 +1828,7 @@ def test_ast_all_eval_calls_in_try_blocks() -> None:
     visitor = EvalVisitor()
     visitor.visit(tree)
 
-    assert len(visitor.eval_calls) == 18, f"Expected 18 direct eval calls, found {len(visitor.eval_calls)}"
+    assert len(visitor.eval_calls) == 20, f"Expected 20 direct eval calls, found {len(visitor.eval_calls)}"
 
     messages: list[str] = []
     for call in visitor.eval_calls:
@@ -1869,7 +1869,7 @@ def test_ast_all_eval_calls_in_try_blocks() -> None:
                 break
         assert "ResponseError" in caught_types and handler_found, f"eval at line {call.lineno} does not catch ResponseError"
 
-    assert len(messages) == 18
+    assert len(messages) == 20
 
 
 @pytest.mark.anyio

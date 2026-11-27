@@ -1000,7 +1000,8 @@ async def test_v2_child_completion_and_timeout_fail_closed_without_parent_resump
     c1, c2 = resp.required_child_task_ids
     initial_hints = len(store.hints)
 
-    # Claim and acknowledge child 1, then attempt v1 CompleteTurn -> must fail closed
+    # Claim and acknowledge child 1, then complete child 1 via WAIT_ALL projection ->
+    # child 1 reaches failed outcome without releasing parent because child 2 is still pending.
     analysis_prin = _principal("prin-analysis-1", "agent-analysis-1", ("analysis",))
     claim_uc = ClaimTask(store, PEPPER, clock=lambda: dt + timedelta(seconds=5))
     c1_claim = await claim_uc.execute(
@@ -1016,19 +1017,20 @@ async def test_v2_child_completion_and_timeout_fail_closed_without_parent_resump
         execution_kind="delegated_child",
         failure_code="EXECUTION_FAILED",
     )
-    with pytest.raises((TaskNotClaimableError, CorruptAuthoritativeRecordError)):
-        await complete_uc.execute(
-            principal=analysis_prin,
-            task_id=c1,
-            assignment_proof=c1_claim.assignment_proof,
-            command_payload=cmd.to_dict(),
-        )
+    c1_resp = await complete_uc.execute(
+        principal=analysis_prin,
+        task_id=c1,
+        assignment_proof=c1_claim.assignment_proof,
+        command_payload=cmd.to_dict(),
+    )
+    assert c1_resp.outcome.terminal_status == "failed"
     assert store.statuses[parent_id] == "waiting_for_children"
-    assert store.statuses[c1] == "working"
-    assert c1 not in store.terminal_outcomes
+    assert store.statuses[c1] == "failed"
+    assert c1 in store.terminal_outcomes
+    assert (parent_id, resp.wave_id) not in store.resolved_waves
     assert len(store.hints) == initial_hints
 
-    # Attempt v1 claim_timeout on unclaimed child 2 after deadline -> must fail closed
+    # Attempt v1 claim_timeout on unclaimed child 2 after deadline -> must still fail closed (Increment 4)
     with pytest.raises((ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
         await store.materialize_claim_timeout(c2, now="2026-11-27T10:10:00Z")
     assert store.statuses[parent_id] == "waiting_for_children"
@@ -1143,7 +1145,7 @@ async def test_live_redis_gateway_wave_acceptance_claim_replay_and_fail_closed()
             with pytest.raises(ValueError, match="v1 only"):
                 await gw.save_continuation(cont)  # type: ignore[arg-type]
 
-        # 3. First v2 child completion and timeout fail closed on live Redis without parent resumption
+        # 3. First v2 WAIT_ALL child completion projects failed child without parent resumption; timeout fails closed
         p2 = "live-v2-root-2"
         children_p2 = await gw.get_children(p2)
         c1, c2 = sorted(children_p2)
@@ -1155,20 +1157,20 @@ async def test_live_redis_gateway_wave_acceptance_claim_replay_and_fail_closed()
             analysis_prin, c1, c1_claim.assignment.assignment_id, c1_claim.assignment_proof
         )
         complete_uc = CompleteTurn(gw, gw, PEPPER, clock=lambda: dt + timedelta(seconds=7))
-        with pytest.raises((TaskNotClaimableError, CorruptAuthoritativeRecordError)):
-            await complete_uc.execute(
-                principal=analysis_prin,
-                task_id=c1,
-                assignment_proof=c1_claim.assignment_proof,
-                command_payload=CompletionCommand(
-                    completion_command_id="cmd-live-c1",
-                    assignment_id=c1_claim.assignment.assignment_id,
-                    execution_kind="delegated_child",
-                    failure_code="EXECUTION_FAILED",
-                ).to_dict(),
-            )
+        c1_live_resp = await complete_uc.execute(
+            principal=analysis_prin,
+            task_id=c1,
+            assignment_proof=c1_claim.assignment_proof,
+            command_payload=CompletionCommand(
+                completion_command_id="cmd-live-c1",
+                assignment_id=c1_claim.assignment.assignment_id,
+                execution_kind="delegated_child",
+                failure_code="EXECUTION_FAILED",
+            ).to_dict(),
+        )
+        assert c1_live_resp.outcome.terminal_status == "failed"
         assert await gw.get_status(p2) == "waiting_for_children"
-        assert await gw.get_status(c1) == "working"
+        assert await gw.get_status(c1) == "failed"
 
         with pytest.raises((ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
             await gw.materialize_claim_timeout(c2, now="2026-11-27T10:10:00Z")

@@ -878,6 +878,46 @@ def _write_full_envelope_state(cluster: LiveRedisAclCluster) -> None:
                 expected_fencing_epoch=1,
                 now=t0,
             )
+            # Complete wave children -> task.delegation_wave_resolution:* + barrier resolution
+            for idx, w_cid in enumerate(wave_child_ids, start=1):
+                w_child_claim = ActiveClaim(
+                    task_id=w_cid,
+                    assignment_id=f"assign-env-wc-{idx}",
+                    claim_id=f"claim-env-wc-{idx}",
+                    root_task_id=wave_parent_id,
+                    turn_id=f"turn-env-wc-{idx}",
+                    runtime_principal_id="principal-analysis-1",
+                    bound_agent_id="analysis-agent-1",
+                    assigned_capability="analysis",
+                    execution_kind="delegated_child",
+                    fencing_epoch=1,
+                    proof_digest="e" * 64,
+                    request_id=f"req-env-wc-{idx}",
+                    claimed_at=t0,
+                    delivery_expires_at=future_lease,
+                    prior_claimable_status="pending",
+                )
+                await gw.atomic_claim_task(w_cid, w_child_claim, grant=None, now=t0, is_root=False)
+                await gw.acknowledge_claim(
+                    w_cid, f"assign-env-wc-{idx}", "principal-analysis-1", t0
+                )
+                w_child_cmd = CompletionCommand(
+                    completion_command_id=f"cmd-env-wc-{idx}",
+                    assignment_id=f"assign-env-wc-{idx}",
+                    execution_kind="delegated_child",
+                    completed_result=TaskResult(task_id=w_cid, output=f"Envelope wave child {idx} ok"),
+                )
+                await gw.complete_turn(
+                    w_cid,
+                    w_child_cmd,
+                    "e" * 64,
+                    1,
+                    wave_parent_id,
+                    wave_parent_id,
+                    t0,
+                    "principal-analysis-1",
+                    "analysis-agent-1",
+                )
         finally:
             await gw_legacy.aclose()
             await gw.aclose()

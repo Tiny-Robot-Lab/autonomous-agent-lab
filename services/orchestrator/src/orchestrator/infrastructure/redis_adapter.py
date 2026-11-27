@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import redis.asyncio as redis
 from agent_contracts import (
+    CONTINUATION_V2_STATE_RELEASED,
     MAX_WAVE_CHILDREN,
     MIN_WAVE_CHILDREN,
     AcceptedDelegationWave,
@@ -27,6 +28,7 @@ from agent_contracts import (
     RecoveryDecisionRecord,
     RedisConnectionConfig,
     RequiredCapabilityRecord,
+    ResolvedDelegationWave,
     RootAuthorityRecord,
     RoutingDecision,
     StageArtifact,
@@ -37,6 +39,7 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveResolution,
     WaveYieldRecord,
     build_claim_timed_out_terminal_outcome,
     build_completion_audit,
@@ -444,6 +447,8 @@ local continuation_latest_key = KEYS[5]
 local authority_key = KEYS[6]
 local deadline_key = KEYS[7]
 local grant_key = KEYS[8]
+local continuation_key = KEYS[9]
+local wave_resolution_key = KEYS[10]
 
 local task_id = ARGV[1]
 local now_iso = ARGV[2]
@@ -608,6 +613,79 @@ if execution_kind == 'resumed_continuation' then
     if cur_latest_ver ~= exp_cont_ver then
         return {'CONTINUATION_VERSION_MISMATCH', tostring(cur_latest_ver)}
     end
+    if exp_cont_ver == 2 then
+        if type(continuation_key) ~= 'string' or continuation_key == '' then
+            return {'MISSING_CONTINUATION'}
+        end
+        if redis.call('EXISTS', continuation_key) == 0 then
+            return {'MISSING_CONTINUATION'}
+        end
+        local cont_t = redis.call('TYPE', continuation_key)
+        if type(cont_t) == 'table' then cont_t = cont_t['ok'] else cont_t = tostring(cont_t) end
+        if cont_t ~= 'string' then
+            return {'CORRUPT_CONTINUATION'}
+        end
+        local ok_cnt, cont_tbl = pcall(cjson.decode, redis.call('GET', continuation_key))
+        if not ok_cnt or type(cont_tbl) ~= 'table' then
+            return {'CORRUPT_CONTINUATION'}
+        end
+        if cont_tbl['version'] ~= 2 or cont_tbl['continuation_version'] ~= 2 or
+           cont_tbl['parent_task_id'] ~= task_id or
+           cont_tbl['continuation_capability'] ~= requested_capability or
+           cont_tbl['stage'] ~= 'incorporate_analysis_child' then
+            return {'CORRUPT_CONTINUATION'}
+        end
+        local c_wave_id = cont_tbl['wave_id']
+        local c_children = cont_tbl['required_child_task_ids']
+        if type(c_wave_id) ~= 'string' or c_wave_id == '' or
+           type(c_children) ~= 'table' or #c_children < 2 or #c_children > 4 then
+            return {'CORRUPT_CONTINUATION'}
+        end
+        local c_state = cont_tbl['state']
+        if c_state ~= 'released' then
+            return {'CONTINUATION_NOT_CLAIMABLE', tostring(c_state)}
+        end
+        local c_res = cont_tbl['wave_resolution']
+        if c_res ~= 'SATISFIED' and c_res ~= 'UNSATISFIABLE' then
+            return {'UNSUPPORTED_WAVE_RESOLUTION', tostring(c_res)}
+        end
+        if type(wave_resolution_key) ~= 'string' or wave_resolution_key == '' then
+            return {'MISSING_RESOLVED_WAVE'}
+        end
+        if wave_resolution_key ~= ('task.delegation_wave_resolution:' .. task_id .. ':' .. c_wave_id) then
+            return {'WAVE_RESOLUTION_MISMATCH'}
+        end
+        if redis.call('EXISTS', wave_resolution_key) == 0 then
+            return {'MISSING_RESOLVED_WAVE'}
+        end
+        local res_t = redis.call('TYPE', wave_resolution_key)
+        if type(res_t) == 'table' then res_t = res_t['ok'] else res_t = tostring(res_t) end
+        if res_t ~= 'string' then
+            return {'CORRUPT_RESOLVED_WAVE'}
+        end
+        local ok_rw, rw_tbl = pcall(cjson.decode, redis.call('GET', wave_resolution_key))
+        if not ok_rw or type(rw_tbl) ~= 'table' then
+            return {'CORRUPT_RESOLVED_WAVE'}
+        end
+        if rw_tbl['version'] ~= 2 or rw_tbl['parent_task_id'] ~= task_id or
+           rw_tbl['wave_id'] ~= c_wave_id or rw_tbl['resolution'] ~= c_res or
+           (rw_tbl['resolution'] ~= 'SATISFIED' and rw_tbl['resolution'] ~= 'UNSATISFIABLE') then
+            return {'WAVE_RESOLUTION_MISMATCH'}
+        end
+        if (rw_tbl['barrier_policy'] ~= 'WAIT_ALL' and rw_tbl['barrier_policy'] ~= 'PARTIAL') or
+           type(rw_tbl['resolved_at']) ~= 'string' or rw_tbl['resolved_at'] == '' then
+            return {'CORRUPT_RESOLVED_WAVE'}
+        end
+        local rw_children = rw_tbl['required_child_task_ids']
+        if type(rw_children) ~= 'table' or #rw_children ~= #c_children then
+            return {'WAVE_RESOLUTION_MISMATCH'}
+        end
+        for idx = 1, #c_children do
+            if rw_children[idx] ~= c_children[idx] then
+                return {'WAVE_RESOLUTION_MISMATCH'}
+            end
+        end
+    end
 else
     if exp_cont_ver and exp_cont_ver > 0 then
         return {'UNEXPECTED_CONTINUATION_VERSION'}
@@ -637,7 +715,12 @@ end
 local has_grant_key = (type(grant_key) == "string" and grant_key ~= "")
 local has_grant_payload = (grant_payload ~= nil and grant_payload ~= '')
 
-if has_grant_key ~= has_grant_payload then
+if execution_kind == 'resumed_continuation' then
+    if has_grant_payload then
+        return {'CORRUPT_GRANT_INPUT'}
+    end
+    has_grant_key = false
+elseif has_grant_key ~= has_grant_payload then
     return {'CORRUPT_GRANT_INPUT'}
 end
 local has_grant = has_grant_key and has_grant_payload
@@ -746,6 +829,9 @@ if cand_claim['runtime_principal_id'] ~= principal_id or
    cand_claim['assigned_capability'] ~= requested_capability or
    cand_claim['execution_kind'] ~= execution_kind or
    cand_claim['prior_claimable_status'] ~= effective_status then
+    return {'CORRUPT_CLAIM_INPUT'}
+end
+if execution_kind == 'resumed_continuation' and cand_claim['continuation_version'] ~= exp_cont_ver then
     return {'CORRUPT_CLAIM_INPUT'}
 end
 if type(working_status_json) ~= 'string' or working_status_json == '' then
@@ -1327,10 +1413,41 @@ local c4_hint_json = ARGV[50]
 local c4_art_id = ARGV[51]
 local c4_art_ver = tonumber(ARGV[52])
 
+local expected_frac_num_raw = ARGV[53]
+local expected_frac_den_raw = ARGV[54]
+
 local function key_type(key)
     local t = redis.call('TYPE', key)
     if type(t) == 'table' then return t['ok'] end
     return tostring(t)
+end
+
+local function validate_fraction_value(frac_tbl, policy, exp_num_raw, exp_den_raw)
+    if policy == 'WAIT_ALL' then
+        if exp_num_raw ~= '' or exp_den_raw ~= '' then
+            return false
+        end
+        return frac_tbl == cjson.null or frac_tbl == nil
+    elseif policy == 'PARTIAL' then
+        local exp_num = tonumber(exp_num_raw)
+        local exp_den = tonumber(exp_den_raw)
+        if not exp_num or not exp_den or
+           math.floor(exp_num) ~= exp_num or math.floor(exp_den) ~= exp_den or
+           exp_num < 1 or exp_den < 1 or exp_num > exp_den or exp_den > 10000 then
+            return false
+        end
+        if type(frac_tbl) ~= 'table' then
+            return false
+        end
+        local f_num = frac_tbl['numerator']
+        local f_den = frac_tbl['denominator']
+        if type(f_num) ~= 'number' or type(f_den) ~= 'number' or
+           math.floor(f_num) ~= f_num or math.floor(f_den) ~= f_den then
+            return false
+        end
+        return f_num == exp_num and f_den == exp_den
+    end
+    return false
 end
 
 local function validate_artifact(akey, expected_id, expected_ver, claim_turn_id)
@@ -1454,10 +1571,33 @@ if redis.call('EXISTS', proposal_key) == 1 then
     if not ok_sw or type(sw) ~= 'table' then return {'CORRUPT_WAVE_PROJECTION'} end
     if sw['wave_id'] ~= s_wave_id or sw['parent_task_id'] ~= parent_task_id or
        sw['state'] ~= 'unresolved' or sw['barrier_policy'] ~= stored['barrier_policy'] or
+       stored['barrier_policy'] ~= barrier_policy or
        sw['required_success_count'] ~= stored['required_success_count'] or
+       not validate_fraction_value(stored['required_success_fraction'], barrier_policy, expected_frac_num_raw, expected_frac_den_raw) or
+       not validate_fraction_value(sw['required_success_fraction'], barrier_policy, expected_frac_num_raw, expected_frac_den_raw) or
        sw['accepted_at'] ~= stored['accepted_at'] or sw['wave_deadline'] ~= stored['wave_deadline'] or
        type(sw['required_child_task_ids']) ~= 'table' or #sw['required_child_task_ids'] ~= #s_children then
         return {'CORRUPT_WAVE_PROJECTION'}
+    end
+
+    local s_resolved_key = 'task.delegation_wave_resolution:' .. parent_task_id .. ':' .. s_wave_id
+    local has_resolved = (redis.call('EXISTS', s_resolved_key) == 1)
+    local srw = nil
+    if has_resolved then
+        if key_type(s_resolved_key) ~= 'string' then return {'WRONG_KEY_TYPE_RESOLVED_WAVE'} end
+        local ok_srw, decoded_srw = pcall(cjson.decode, redis.call('GET', s_resolved_key))
+        if not ok_srw or type(decoded_srw) ~= 'table' then return {'CORRUPT_RESOLVED_WAVE'} end
+        srw = decoded_srw
+        if srw['version'] ~= 2 or srw['wave_id'] ~= s_wave_id or srw['parent_task_id'] ~= parent_task_id or
+           srw['barrier_policy'] ~= stored['barrier_policy'] or
+           srw['required_success_count'] ~= stored['required_success_count'] or
+           not validate_fraction_value(srw['required_success_fraction'], barrier_policy, expected_frac_num_raw, expected_frac_den_raw) or
+           srw['accepted_at'] ~= stored['accepted_at'] or srw['wave_deadline'] ~= stored['wave_deadline'] or
+           (srw['resolution'] ~= 'SATISFIED' and srw['resolution'] ~= 'UNSATISFIABLE') or
+           type(srw['required_child_task_ids']) ~= 'table' or #srw['required_child_task_ids'] ~= #s_children or
+           type(srw['child_outcomes']) ~= 'table' then
+            return {'CORRUPT_RESOLVED_WAVE'}
+        end
     end
 
     if redis.call('EXISTS', continuation_key) == 0 then return {'CORRUPT_CONTINUATION'} end
@@ -1466,9 +1606,17 @@ if redis.call('EXISTS', proposal_key) == 1 then
     if not ok_sc or type(sc) ~= 'table' then return {'CORRUPT_CONTINUATION'} end
     if sc['parent_task_id'] ~= parent_task_id or sc['wave_id'] ~= s_wave_id or
        sc['continuation_version'] ~= 2 or sc['version'] ~= 2 or
-       sc['state'] ~= 'active' or sc['wave_resolution'] ~= cjson.null or
        type(sc['required_child_task_ids']) ~= 'table' or #sc['required_child_task_ids'] ~= #s_children then
         return {'CORRUPT_CONTINUATION'}
+    end
+    if not has_resolved then
+        if sc['state'] ~= 'active' or sc['wave_resolution'] ~= cjson.null then
+            return {'CORRUPT_CONTINUATION'}
+        end
+    else
+        if sc['state'] ~= 'released' or sc['wave_resolution'] ~= srw['resolution'] then
+            return {'CORRUPT_CONTINUATION'}
+        end
     end
 
     if redis.call('EXISTS', continuation_latest_key) == 0 then return {'CORRUPT_CONTINUATION_LATEST'} end
@@ -1478,8 +1626,18 @@ if redis.call('EXISTS', proposal_key) == 1 then
     if redis.call('EXISTS', parent_status_key) == 0 then return {'CORRUPT_PARENT_STATUS'} end
     if key_type(parent_status_key) ~= 'string' then return {'WRONG_KEY_TYPE_PARENT_STATUS'} end
     local ok_sps, sps = pcall(cjson.decode, redis.call('GET', parent_status_key))
-    if not ok_sps or type(sps) ~= 'table' or sps['task_id'] ~= parent_task_id or sps['status'] ~= 'waiting_for_children' then
+    if not ok_sps or type(sps) ~= 'table' or sps['task_id'] ~= parent_task_id then
         return {'CORRUPT_PARENT_STATUS'}
+    end
+    local p_st = sps['status']
+    if not has_resolved then
+        if p_st ~= 'waiting_for_children' then
+            return {'CORRUPT_PARENT_STATUS'}
+        end
+    else
+        if p_st ~= 'resumable' and p_st ~= 'working' and p_st ~= 'completed' and p_st ~= 'failed' and p_st ~= 'recovery_required' then
+            return {'CORRUPT_PARENT_STATUS'}
+        end
     end
 
     local s_yield_key = 'task.assignment_yield:' .. parent_task_id .. ':' .. stored['assignment_id']
@@ -1504,7 +1662,8 @@ if redis.call('EXISTS', proposal_key) == 1 then
         if type(cid) ~= 'string' or cid == '' or
            sw['required_child_task_ids'][idx] ~= cid or
            sc['required_child_task_ids'][idx] ~= cid or
-           sy['required_child_task_ids'][idx] ~= cid then
+           sy['required_child_task_ids'][idx] ~= cid or
+           (has_resolved and srw['required_child_task_ids'][idx] ~= cid) then
             return {'CORRUPT_WAVE_PROJECTION'}
         end
         if redis.call('SISMEMBER', parent_children_key, cid) ~= 1 then return {'CORRUPT_CHILDREN'} end
@@ -1515,6 +1674,10 @@ if redis.call('EXISTS', proposal_key) == 1 then
         local ci_k = 'task.input:' .. cid .. ':1'
         local cd_k = 'task.claim_deadline:' .. cid
         local cf_k = 'task.fence:' .. cid
+        local co_k = 'task.outcome:' .. cid
+        local cr_k = 'task.result:' .. cid
+        local ccl_k = 'task.claim:' .. cid
+        local cm_k = 'task.child_completion:' .. cid
         if redis.call('EXISTS', cs_k) == 0 or key_type(cs_k) ~= 'string' or
            redis.call('EXISTS', cl_k) == 0 or key_type(cl_k) ~= 'string' or
            redis.call('EXISTS', cc_k) == 0 or key_type(cc_k) ~= 'string' or
@@ -1527,12 +1690,80 @@ if redis.call('EXISTS', proposal_key) == 1 then
         local ok_cl2, cl2 = pcall(cjson.decode, redis.call('GET', cl_k))
         local ok_cc, cc = pcall(cjson.decode, redis.call('GET', cc_k))
         local ok_ci, ci = pcall(cjson.decode, redis.call('GET', ci_k))
-        if not ok_cs or type(cs) ~= 'table' or cs['task_id'] ~= cid or cs['status'] ~= 'pending' or
+        local cf_num = tonumber(redis.call('GET', cf_k))
+        if not ok_cs or type(cs) ~= 'table' or cs['task_id'] ~= cid or type(cs['status']) ~= 'string' or
            not ok_cl2 or type(cl2) ~= 'table' or cl2['task_id'] ~= cid or cl2['parent_task_id'] ~= parent_task_id or cl2['root_task_id'] ~= parent_task_id or
            not ok_cc or type(cc) ~= 'table' or cc['task_id'] ~= cid or cc['required_capability'] ~= 'analysis' or
            not ok_ci or type(ci) ~= 'table' or ci['task_id'] ~= cid or ci['input_version'] ~= 1 or
+           type(ci['artifact_references']) ~= 'table' or #ci['artifact_references'] < 1 or
+           type(ci['artifact_references'][1]) ~= 'table' or ci['artifact_references'][1]['producing_task_id'] ~= parent_task_id or
            redis.call('GET', cd_k) ~= s_deadline or
-           redis.call('GET', cf_k) ~= '0' then
+           not cf_num or cf_num < 0 or math.floor(cf_num) ~= cf_num then
+            return {'CORRUPT_CHILD_PROJECTION'}
+        end
+
+        local c_st = cs['status']
+        local claim_exists = (redis.call('EXISTS', ccl_k) == 1)
+        local outcome_exists = (redis.call('EXISTS', co_k) == 1)
+        local result_exists = (redis.call('EXISTS', cr_k) == 1)
+        local marker_exists = (redis.call('EXISTS', cm_k) == 1)
+
+        if c_st == 'pending' then
+            if has_resolved or cf_num ~= 0 or claim_exists or outcome_exists or result_exists or marker_exists then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+        elseif c_st == 'working' then
+            if has_resolved or cf_num < 1 or not claim_exists or outcome_exists or result_exists or marker_exists then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            if key_type(ccl_k) ~= 'string' then return {'CORRUPT_CHILD_PROJECTION'} end
+            local ok_ccl, ccl = pcall(cjson.decode, redis.call('GET', ccl_k))
+            if not ok_ccl or type(ccl) ~= 'table' or ccl['task_id'] ~= cid or
+               ccl['fencing_epoch'] ~= cf_num or ccl['execution_kind'] ~= 'delegated_child' or
+               ccl['assigned_capability'] ~= 'analysis' then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+        elseif c_st == 'completed' or c_st == 'failed' or c_st == 'claim_timed_out' then
+            if claim_exists or not outcome_exists or not marker_exists then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            if key_type(co_k) ~= 'string' or key_type(cm_k) ~= 'string' then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            local ok_co, co = pcall(cjson.decode, redis.call('GET', co_k))
+            local ok_cm, cm = pcall(cjson.decode, redis.call('GET', cm_k))
+            if not ok_co or type(co) ~= 'table' or co['task_id'] ~= cid or co['terminal_status'] ~= c_st or
+               not ok_cm or type(cm) ~= 'table' or cm['child_task_id'] ~= cid or
+               cm['parent_task_id'] ~= parent_task_id or cm['outcome_id'] ~= co['outcome_id'] or
+               cm['continuation_version'] ~= 2 then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            if c_st == 'completed' then
+                if cf_num < 1 or not result_exists or key_type(cr_k) ~= 'string' then
+                    return {'CORRUPT_CHILD_PROJECTION'}
+                end
+                local ok_cr, cr = pcall(cjson.decode, redis.call('GET', cr_k))
+                if not ok_cr or type(cr) ~= 'table' or cr['task_id'] ~= cid or cr['status'] ~= 'completed' then
+                    return {'CORRUPT_CHILD_PROJECTION'}
+                end
+            elseif result_exists then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            if has_resolved then
+                local snap = srw['child_outcomes'][cid]
+                if type(snap) ~= 'table' or snap['status'] ~= c_st or snap['outcome_id'] ~= co['outcome_id'] then
+                    return {'CORRUPT_CHILD_PROJECTION'}
+                end
+            end
+        elseif c_st == 'ended / barrier_resolved' then
+            if not has_resolved or claim_exists or outcome_exists or result_exists or marker_exists then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+            local snap = srw['child_outcomes'][cid]
+            if type(snap) ~= 'table' or snap['status'] ~= 'ended / barrier_resolved' or snap['outcome_id'] ~= cjson.null then
+                return {'CORRUPT_CHILD_PROJECTION'}
+            end
+        else
             return {'CORRUPT_CHILD_PROJECTION'}
         end
     end
@@ -1581,9 +1812,13 @@ for idx = 1, child_count do
 end
 if barrier_policy == 'PARTIAL' then
     local req_sc = tonumber(req_success_count_raw)
-    if not req_sc or req_sc < 1 or req_sc > child_count or w_pre['required_success_count'] ~= req_sc then
+    if not req_sc or req_sc < 1 or req_sc > child_count or w_pre['required_success_count'] ~= req_sc or p_pre['required_success_count'] ~= req_sc then
         return {'POLICY_BOUNDS_VIOLATION'}
     end
+end
+if not validate_fraction_value(w_pre['required_success_fraction'], barrier_policy, expected_frac_num_raw, expected_frac_den_raw) or
+   not validate_fraction_value(p_pre['required_success_fraction'], barrier_policy, expected_frac_num_raw, expected_frac_den_raw) then
+    return {'POLICY_BOUNDS_VIOLATION'}
 end
 
 local cand_err = validate_candidate_child(c1_id, w_pre['required_child_task_ids'][1], c1_status_json, c1_lineage_json, c1_cap_json, c1_input_json, c1_hint_json, c1_art_id, c1_art_ver)
@@ -2155,6 +2390,739 @@ if is_child then
     redis.call('SET', child_marker_key, marker_json)
     redis.call('SET', parent_status_key, parent_status_json)
     redis.call('RPUSH', hint_queue_key, hint_json)
+end
+
+return {'OK', outcome_json, result_json}
+"""
+
+COMPLETE_WAVE_CHILD_TURN_LUA = """
+local completion_key = KEYS[1]
+local status_key = KEYS[2]
+local claim_key = KEYS[3]
+local fence_key = KEYS[4]
+local outcome_key = KEYS[5]
+local result_key = KEYS[6]
+local audit_key = KEYS[7]
+local lineage_key = KEYS[8]
+local child_marker_key = KEYS[9]
+local parent_status_key = KEYS[10]
+local parent_children_key = KEYS[11]
+local parent_lineage_key = KEYS[12]
+local continuation_key = KEYS[13]
+local continuation_latest_key = KEYS[14]
+local wave_key = KEYS[15]
+local resolved_wave_key = KEYS[16]
+local hint_queue_key = KEYS[17]
+
+local s1_status_key = KEYS[18]
+local s1_claim_key = KEYS[19]
+local s1_fence_key = KEYS[20]
+local s1_outcome_key = KEYS[21]
+local s1_result_key = KEYS[22]
+local s1_lineage_key = KEYS[23]
+local s1_cap_key = KEYS[24]
+local s1_input_key = KEYS[25]
+local s1_marker_key = KEYS[26]
+
+local s2_status_key = KEYS[27]
+local s2_claim_key = KEYS[28]
+local s2_fence_key = KEYS[29]
+local s2_outcome_key = KEYS[30]
+local s2_result_key = KEYS[31]
+local s2_lineage_key = KEYS[32]
+local s2_cap_key = KEYS[33]
+local s2_input_key = KEYS[34]
+local s2_marker_key = KEYS[35]
+
+local s3_status_key = KEYS[36]
+local s3_claim_key = KEYS[37]
+local s3_fence_key = KEYS[38]
+local s3_outcome_key = KEYS[39]
+local s3_result_key = KEYS[40]
+local s3_lineage_key = KEYS[41]
+local s3_cap_key = KEYS[42]
+local s3_input_key = KEYS[43]
+local s3_marker_key = KEYS[44]
+
+local s4_status_key = KEYS[45]
+local s4_claim_key = KEYS[46]
+local s4_fence_key = KEYS[47]
+local s4_outcome_key = KEYS[48]
+local s4_result_key = KEYS[49]
+local s4_lineage_key = KEYS[50]
+local s4_cap_key = KEYS[51]
+local s4_input_key = KEYS[52]
+local s4_marker_key = KEYS[53]
+
+local task_id = ARGV[1]
+local assignment_id = ARGV[2]
+local principal_id = ARGV[3]
+local bound_agent_id = ARGV[4]
+local execution_kind = ARGV[5]
+local cont_ver_raw = ARGV[6]
+local epoch_raw = ARGV[7]
+local completion_command_id = ARGV[8]
+local semantic_fingerprint = ARGV[9]
+local proof_digest = ARGV[10]
+local terminal_status = ARGV[11]
+local failure_code = ARGV[12]
+local outcome_json = ARGV[13]
+local result_json = ARGV[14]
+local audit_json = ARGV[15]
+local parent_task_id = ARGV[16]
+local root_task_id = ARGV[17]
+local binding_json = ARGV[18]
+local hint_json = ARGV[19]
+local marker_json = ARGV[20]
+local status_json = ARGV[21]
+local parent_status_json = ARGV[22]
+local wave_id = ARGV[23]
+local completed_at = ARGV[24]
+local child_count = tonumber(ARGV[25])
+local accepted_wave_fp = ARGV[26]
+local pre_cont_sat_json = ARGV[27]
+local pre_cont_unsat_json = ARGV[28]
+local s1_id = ARGV[29]
+local s2_id = ARGV[30]
+local s3_id = ARGV[31]
+local s4_id = ARGV[32]
+
+local function key_type(key)
+    local t = redis.call('TYPE', key)
+    if type(t) == 'table' then return t['ok'] end
+    return tostring(t)
+end
+
+local function decode_object(raw)
+    local ok, tbl = pcall(cjson.decode, raw)
+    if not ok or type(tbl) ~= 'table' then return nil end
+    return tbl
+end
+
+local function validate_sibling_readonly(
+    sid,
+    st_k, cl_k, fn_k, out_k, res_k, lin_k, cap_k, inp_k, mrk_k,
+    trig_outcome_id
+)
+    if redis.call('SISMEMBER', parent_children_key, sid) ~= 1 then
+        return 'CHILD_NOT_MEMBER', nil, nil, 0, false
+    end
+
+    if redis.call('EXISTS', lin_k) == 0 then return 'LINEAGE_NOT_FOUND', nil, nil, 0, false end
+    if key_type(lin_k) ~= 'string' then return 'WRONG_KEY_TYPE_LINEAGE', nil, nil, 0, false end
+    local lin = decode_object(redis.call('GET', lin_k))
+    if not lin or lin['task_id'] ~= sid or lin['parent_task_id'] ~= parent_task_id or lin['root_task_id'] ~= root_task_id then
+        return 'CHILD_LINEAGE_MISMATCH', nil, nil, 0, false
+    end
+
+    if redis.call('EXISTS', cap_k) == 0 then return 'MISSING_REQUIRED_CAPABILITY', nil, nil, 0, false end
+    if key_type(cap_k) ~= 'string' then return 'WRONG_KEY_TYPE_CAPABILITY', nil, nil, 0, false end
+    local cap = decode_object(redis.call('GET', cap_k))
+    if not cap or cap['task_id'] ~= sid or cap['required_capability'] ~= 'analysis' then
+        return 'CORRUPT_CHILD_CAPABILITY', nil, nil, 0, false
+    end
+
+    if redis.call('EXISTS', inp_k) == 0 then return 'MISSING_CHILD_INPUT', nil, nil, 0, false end
+    if key_type(inp_k) ~= 'string' then return 'WRONG_KEY_TYPE_INPUT', nil, nil, 0, false end
+    local inp = decode_object(redis.call('GET', inp_k))
+    if not inp or inp['task_id'] ~= sid or inp['input_version'] ~= 1 or
+       type(inp['prompt']) ~= 'string' or string.match(inp['prompt'], '^%s*$') or
+       type(inp['artifact_references']) ~= 'table' or #inp['artifact_references'] < 1 then
+        return 'CORRUPT_CHILD_INPUT', nil, nil, 0, false
+    end
+
+    if redis.call('EXISTS', fn_k) == 0 then return 'FENCE_NOT_FOUND', nil, nil, 0, false end
+    if key_type(fn_k) ~= 'string' then return 'WRONG_KEY_TYPE_FENCE', nil, nil, 0, false end
+    local s_fence = tonumber(redis.call('GET', fn_k))
+    if not s_fence or s_fence < 0 or math.floor(s_fence) ~= s_fence then
+        return 'CORRUPT_FENCE', nil, nil, 0, false
+    end
+
+    if redis.call('EXISTS', st_k) == 0 then return 'TASK_NOT_FOUND', nil, nil, 0, false end
+    if key_type(st_k) ~= 'string' then return 'WRONG_KEY_TYPE_STATUS', nil, nil, 0, false end
+    local st = decode_object(redis.call('GET', st_k))
+    if not st or st['task_id'] ~= sid or type(st['status']) ~= 'string' or st['status'] == '' then
+        return 'CORRUPT_STATUS', nil, nil, 0, false
+    end
+    local cur_st = st['status']
+
+    if sid == task_id then
+        return nil, terminal_status, trig_outcome_id, s_fence, true
+    end
+
+    local claim_exists = (redis.call('EXISTS', cl_k) == 1)
+    local outcome_exists = (redis.call('EXISTS', out_k) == 1)
+    local result_exists = (redis.call('EXISTS', res_k) == 1)
+    local marker_exists = (redis.call('EXISTS', mrk_k) == 1)
+
+    if cur_st == 'completed' then
+        if claim_exists or s_fence < 1 or not outcome_exists or not result_exists or not marker_exists then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        if key_type(out_k) ~= 'string' or key_type(res_k) ~= 'string' or key_type(mrk_k) ~= 'string' then
+            return 'WRONG_KEY_TYPE_CHILD_OUTCOME', nil, nil, 0, false
+        end
+        local out_tbl = decode_object(redis.call('GET', out_k))
+        local res_tbl = decode_object(redis.call('GET', res_k))
+        local mrk_tbl = decode_object(redis.call('GET', mrk_k))
+        if not out_tbl or out_tbl['task_id'] ~= sid or out_tbl['terminal_status'] ~= 'completed' or
+           type(out_tbl['outcome_id']) ~= 'string' or out_tbl['outcome_id'] == '' or
+           not res_tbl or res_tbl['task_id'] ~= sid or res_tbl['status'] ~= 'completed' or
+           not mrk_tbl or mrk_tbl['child_task_id'] ~= sid or mrk_tbl['parent_task_id'] ~= parent_task_id or
+           mrk_tbl['outcome_id'] ~= out_tbl['outcome_id'] or mrk_tbl['continuation_version'] ~= 2 then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        return nil, 'completed', out_tbl['outcome_id'], s_fence, false
+    elseif cur_st == 'failed' or cur_st == 'claim_timed_out' then
+        if claim_exists or not outcome_exists or result_exists or not marker_exists then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        if key_type(out_k) ~= 'string' or key_type(mrk_k) ~= 'string' then
+            return 'WRONG_KEY_TYPE_CHILD_OUTCOME', nil, nil, 0, false
+        end
+        local out_tbl = decode_object(redis.call('GET', out_k))
+        local mrk_tbl = decode_object(redis.call('GET', mrk_k))
+        if not out_tbl or out_tbl['task_id'] ~= sid or out_tbl['terminal_status'] ~= cur_st or
+           type(out_tbl['outcome_id']) ~= 'string' or out_tbl['outcome_id'] == '' or
+           not mrk_tbl or mrk_tbl['child_task_id'] ~= sid or mrk_tbl['parent_task_id'] ~= parent_task_id or
+           mrk_tbl['outcome_id'] ~= out_tbl['outcome_id'] or mrk_tbl['continuation_version'] ~= 2 then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        return nil, cur_st, out_tbl['outcome_id'], s_fence, false
+    elseif cur_st == 'pending' then
+        if claim_exists or outcome_exists or result_exists or marker_exists then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        return nil, 'pending', nil, s_fence, false
+    elseif cur_st == 'working' then
+        if not claim_exists or outcome_exists or result_exists or marker_exists or s_fence < 1 then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        if key_type(cl_k) ~= 'string' then return 'WRONG_KEY_TYPE_CLAIM', nil, nil, 0, false end
+        local cl_tbl = decode_object(redis.call('GET', cl_k))
+        if not cl_tbl or cl_tbl['task_id'] ~= sid or cl_tbl['execution_kind'] ~= 'delegated_child' or
+           cl_tbl['fencing_epoch'] ~= s_fence or cl_tbl['assigned_capability'] ~= 'analysis' then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        return nil, 'working', nil, s_fence, true
+    elseif cur_st == 'recovery_required' then
+        if claim_exists or outcome_exists or result_exists or marker_exists then
+            return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+        end
+        return nil, 'recovery_required', nil, s_fence, false
+    end
+    return 'CORRUPT_CHILD_STATE', nil, nil, 0, false
+end
+
+-- =============================================================================
+-- PHASE 1: Replay Check & Strictly Read-Only Validations (Zero Mutations)
+-- =============================================================================
+
+if redis.call('EXISTS', completion_key) == 1 then
+    if key_type(completion_key) ~= 'string' then return {'WRONG_KEY_TYPE_COMPLETION'} end
+    local stored = decode_object(redis.call('GET', completion_key))
+    if not stored then return {'CORRUPT_COMPLETION'} end
+    local stored_cv = stored['continuation_version']
+    local matches = (
+        stored['completion_command_id'] == completion_command_id and
+        stored['task_id'] == task_id and
+        stored['assignment_id'] == assignment_id and
+        stored['runtime_principal_id'] == principal_id and
+        stored['bound_agent_id'] == bound_agent_id and
+        stored['execution_kind'] == 'delegated_child' and
+        stored['semantic_fingerprint'] == semantic_fingerprint and
+        stored['proof_digest'] == proof_digest and
+        (stored_cv == nil or stored_cv == cjson.null)
+    )
+    if matches then
+        if redis.call('EXISTS', outcome_key) == 0 or key_type(outcome_key) ~= 'string' then
+            return {'CORRUPT_OUTCOME'}
+        end
+        local stored_outcome = decode_object(redis.call('GET', outcome_key))
+        if not stored_outcome or stored_outcome['task_id'] ~= task_id or
+           stored_outcome['outcome_id'] ~= stored['outcome_id'] then
+            return {'CORRUPT_OUTCOME'}
+        end
+        local stored_status = stored_outcome['terminal_status']
+        if stored_status ~= 'completed' and stored_status ~= 'failed' then
+            return {'CORRUPT_OUTCOME'}
+        end
+        local result_exists = (redis.call('EXISTS', result_key) == 1)
+        if stored_status == 'completed' and not result_exists then
+            return {'CORRUPT_RESULT'}
+        end
+        if stored_status == 'failed' and result_exists then
+            return {'CORRUPT_RESULT'}
+        end
+        local stored_result_raw = ''
+        if result_exists then
+            if key_type(result_key) ~= 'string' then return {'CORRUPT_RESULT'} end
+            stored_result_raw = redis.call('GET', result_key)
+            local stored_result_tbl = decode_object(stored_result_raw)
+            if not stored_result_tbl or stored_result_tbl['task_id'] ~= task_id or stored_result_tbl['status'] ~= 'completed' then
+                return {'CORRUPT_RESULT'}
+            end
+        end
+        if redis.call('EXISTS', child_marker_key) == 0 or key_type(child_marker_key) ~= 'string' then
+            return {'CORRUPT_CHILD_MARKER'}
+        end
+        local stored_mrk = decode_object(redis.call('GET', child_marker_key))
+        if not stored_mrk or stored_mrk['child_task_id'] ~= task_id or
+           stored_mrk['parent_task_id'] ~= parent_task_id or
+           stored_mrk['outcome_id'] ~= stored['outcome_id'] or
+           stored_mrk['continuation_version'] ~= 2 then
+            return {'CORRUPT_CHILD_MARKER'}
+        end
+        return {'IDEMPOTENT', redis.call('GET', outcome_key), stored_result_raw}
+    end
+    return {'COMMAND_CONFLICT'}
+end
+
+-- Candidate inputs validation
+if execution_kind ~= 'delegated_child' or cont_ver_raw ~= '' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+local exp_epoch = tonumber(epoch_raw)
+if not exp_epoch or exp_epoch < 1 or math.floor(exp_epoch) ~= exp_epoch then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if not child_count or math.floor(child_count) ~= child_count or child_count < 2 or child_count > 4 then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+local has_result = (result_json ~= '')
+if has_result and terminal_status ~= 'completed' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if (not has_result) and terminal_status ~= 'failed' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+local cand_outcome = decode_object(outcome_json)
+if not cand_outcome or type(cand_outcome['outcome_id']) ~= 'string' or cand_outcome['outcome_id'] == '' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if not decode_object(audit_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(binding_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(status_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(hint_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(marker_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+if not decode_object(parent_status_json) then return {'CORRUPT_COMPLETION_INPUT'} end
+local pre_cont_sat = decode_object(pre_cont_sat_json)
+local pre_cont_unsat = decode_object(pre_cont_unsat_json)
+if not pre_cont_sat or not pre_cont_unsat or
+   pre_cont_sat['state'] ~= 'released' or pre_cont_sat['wave_resolution'] ~= 'SATISFIED' or
+   pre_cont_unsat['state'] ~= 'released' or pre_cont_unsat['wave_resolution'] ~= 'UNSATISFIABLE' then
+    return {'CORRUPT_COMPLETION_INPUT'}
+end
+if has_result then
+    local result_tbl = decode_object(result_json)
+    if not result_tbl then return {'CORRUPT_COMPLETION_INPUT'} end
+    if result_tbl['task_id'] ~= task_id then return {'RESULT_TASK_MISMATCH'} end
+    if result_tbl['status'] ~= 'completed' then return {'RESULT_STATUS_MISMATCH'} end
+end
+
+-- Triggering child status, claim, fence, lineage, and conflict checks
+if redis.call('EXISTS', status_key) == 0 then return {'TASK_NOT_FOUND'} end
+if key_type(status_key) ~= 'string' then return {'WRONG_KEY_TYPE_STATUS'} end
+local status_tbl = decode_object(redis.call('GET', status_key))
+if not status_tbl or status_tbl['task_id'] ~= task_id or type(status_tbl['status']) ~= 'string' or status_tbl['status'] == '' then
+    return {'CORRUPT_STATUS'}
+end
+if status_tbl['status'] ~= 'working' then
+    return {'NOT_WORKING', status_tbl['status']}
+end
+
+if redis.call('EXISTS', claim_key) == 0 then return {'CLAIM_NOT_FOUND'} end
+if key_type(claim_key) ~= 'string' then return {'WRONG_KEY_TYPE_CLAIM'} end
+local claim = decode_object(redis.call('GET', claim_key))
+if not claim then return {'CORRUPT_CLAIM'} end
+if claim['assignment_id'] ~= assignment_id then return {'ASSIGNMENT_MISMATCH'} end
+if claim['task_id'] ~= task_id then return {'TASK_MISMATCH'} end
+if claim['runtime_principal_id'] ~= principal_id then return {'PRINCIPAL_MISMATCH'} end
+if claim['bound_agent_id'] ~= bound_agent_id then return {'BOUND_AGENT_MISMATCH'} end
+if claim['execution_kind'] ~= 'delegated_child' then return {'EXECUTION_KIND_MISMATCH'} end
+local claim_cv = claim['continuation_version']
+if claim_cv ~= nil and claim_cv ~= cjson.null then return {'CONTINUATION_VERSION_MISMATCH'} end
+if claim['state'] ~= 'acknowledged' then return {'CLAIM_NOT_ACKNOWLEDGED'} end
+if claim['proof_digest'] ~= proof_digest then return {'PROOF_MISMATCH'} end
+
+if redis.call('EXISTS', fence_key) == 0 then return {'FENCE_NOT_FOUND'} end
+if key_type(fence_key) ~= 'string' then return {'WRONG_KEY_TYPE_FENCE'} end
+local cur_fence = tonumber(redis.call('GET', fence_key))
+if not cur_fence or cur_fence ~= exp_epoch or tonumber(claim['fencing_epoch']) ~= exp_epoch then
+    return {'FENCE_MISMATCH', tostring(cur_fence)}
+end
+
+if redis.call('EXISTS', lineage_key) == 0 then return {'LINEAGE_NOT_FOUND'} end
+if key_type(lineage_key) ~= 'string' then return {'WRONG_KEY_TYPE_LINEAGE'} end
+local lineage = decode_object(redis.call('GET', lineage_key))
+if not lineage or lineage['task_id'] ~= task_id or lineage['root_task_id'] ~= root_task_id then
+    return {'CORRUPT_LINEAGE'}
+end
+if lineage['parent_task_id'] ~= parent_task_id then return {'CHILD_LINEAGE_MISMATCH'} end
+
+if redis.call('EXISTS', outcome_key) == 1 then return {'OUTCOME_CONFLICT'} end
+if redis.call('EXISTS', result_key) == 1 then return {'RESULT_CONFLICT'} end
+if redis.call('EXISTS', audit_key) == 1 then return {'AUDIT_CONFLICT'} end
+if redis.call('EXISTS', child_marker_key) == 1 then return {'MARKER_CONFLICT'} end
+
+-- Parent, continuation v2, accepted wave, and resolved wave checks
+if redis.call('EXISTS', resolved_wave_key) == 1 then
+    if key_type(resolved_wave_key) ~= 'string' then return {'WRONG_KEY_TYPE_RESOLVED_WAVE'} end
+    return {'WAVE_ALREADY_RESOLVED'}
+end
+
+if redis.call('EXISTS', parent_status_key) == 0 then return {'PARENT_STATUS_NOT_FOUND'} end
+if key_type(parent_status_key) ~= 'string' then return {'WRONG_KEY_TYPE_PARENT_STATUS'} end
+local parent_status = decode_object(redis.call('GET', parent_status_key))
+if not parent_status or parent_status['task_id'] ~= parent_task_id then return {'CORRUPT_PARENT_STATUS'} end
+if parent_status['status'] ~= 'waiting_for_children' then
+    return {'PARENT_NOT_WAITING', tostring(parent_status['status'])}
+end
+
+if redis.call('EXISTS', parent_lineage_key) == 0 then return {'PARENT_LINEAGE_NOT_FOUND'} end
+if key_type(parent_lineage_key) ~= 'string' then return {'WRONG_KEY_TYPE_PARENT_LINEAGE'} end
+local p_lin = decode_object(redis.call('GET', parent_lineage_key))
+if not p_lin or p_lin['task_id'] ~= parent_task_id or p_lin['root_task_id'] ~= root_task_id or
+   p_lin['parent_task_id'] ~= cjson.null then
+    return {'CORRUPT_PARENT_LINEAGE'}
+end
+
+if redis.call('EXISTS', parent_children_key) == 0 then return {'CHILD_NOT_MEMBER'} end
+if key_type(parent_children_key) ~= 'set' then return {'WRONG_KEY_TYPE_CHILDREN'} end
+if redis.call('SCARD', parent_children_key) ~= child_count then return {'CORRUPT_CHILDREN'} end
+if redis.call('SISMEMBER', parent_children_key, task_id) == 0 then return {'CHILD_NOT_MEMBER'} end
+
+if redis.call('EXISTS', continuation_latest_key) == 0 then return {'CONTINUATION_LATEST_MISMATCH'} end
+if key_type(continuation_latest_key) ~= 'string' then return {'WRONG_KEY_TYPE_CONTINUATION_LATEST'} end
+if redis.call('GET', continuation_latest_key) ~= '2' then return {'CONTINUATION_LATEST_MISMATCH'} end
+
+if redis.call('EXISTS', continuation_key) == 0 then return {'MISSING_CONTINUATION'} end
+if key_type(continuation_key) ~= 'string' then return {'WRONG_KEY_TYPE_CONTINUATION'} end
+local sc = decode_object(redis.call('GET', continuation_key))
+if not sc or sc['version'] ~= 2 or sc['continuation_version'] ~= 2 or
+   sc['parent_task_id'] ~= parent_task_id or sc['wave_id'] ~= wave_id or
+   sc['stage'] ~= 'incorporate_analysis_child' or sc['continuation_capability'] ~= 'research' or
+   sc['created_at'] ~= pre_cont_sat['created_at'] or
+   sc['input_version'] ~= pre_cont_sat['input_version'] then
+    return {'CORRUPT_CONTINUATION'}
+end
+if sc['state'] ~= 'active' or sc['wave_resolution'] ~= cjson.null then
+    return {'CONTINUATION_NOT_ACTIVE', tostring(sc['state'])}
+end
+if type(sc['required_child_task_ids']) ~= 'table' or #sc['required_child_task_ids'] ~= child_count then
+    return {'CORRUPT_CONTINUATION'}
+end
+
+if redis.call('EXISTS', wave_key) == 0 then return {'MISSING_ACCEPTED_WAVE'} end
+if key_type(wave_key) ~= 'string' then return {'WRONG_KEY_TYPE_WAVE'} end
+local sw = decode_object(redis.call('GET', wave_key))
+if not sw or sw['version'] ~= 1 or sw['wave_id'] ~= wave_id or sw['parent_task_id'] ~= parent_task_id or
+   sw['state'] ~= 'unresolved' or type(sw['accepted_at']) ~= 'string' or sw['accepted_at'] == '' or
+   type(sw['wave_deadline']) ~= 'string' or sw['wave_deadline'] == '' or
+   type(sw['required_child_task_ids']) ~= 'table' or #sw['required_child_task_ids'] ~= child_count then
+    return {'CORRUPT_WAVE_PROJECTION'}
+end
+
+local dd = sw['deadline_derivation']
+if type(dd) ~= 'table' or dd['policy_id'] ~= 'deterministic_bounded_baseline_v1' or
+   dd['policy_version'] ~= 1 or dd['required_child_count'] ~= child_count or
+   dd['accepted_at'] ~= sw['accepted_at'] or dd['wave_deadline'] ~= sw['wave_deadline'] then
+    return {'CORRUPT_WAVE_PROJECTION'}
+end
+
+local policy = sw['barrier_policy']
+local frac_num = nil
+local frac_den = nil
+local derived_req_count = nil
+if policy == 'WAIT_ALL' then
+    if sw['required_success_fraction'] ~= cjson.null or sw['required_success_count'] ~= cjson.null then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+elseif policy == 'PARTIAL' then
+    local rf = sw['required_success_fraction']
+    if type(rf) ~= 'table' or type(rf['numerator']) ~= 'number' or type(rf['denominator']) ~= 'number' then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+    frac_num = rf['numerator']
+    frac_den = rf['denominator']
+    if math.floor(frac_num) ~= frac_num or math.floor(frac_den) ~= frac_den or
+       frac_num < 1 or frac_den < 1 or frac_num > frac_den or frac_den > 10000 then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+    derived_req_count = math.floor((child_count * frac_num + frac_den - 1) / frac_den)
+    if derived_req_count < 1 or derived_req_count > child_count or sw['required_success_count'] ~= derived_req_count then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+else
+    return {'CORRUPT_WAVE_PROJECTION'}
+end
+
+if redis.call('EXISTS', hint_queue_key) == 1 and key_type(hint_queue_key) ~= 'list' then
+    return {'WRONG_KEY_TYPE_HINT_QUEUE'}
+end
+
+-- Check exact sibling membership order matches wave & continuation
+local slot_ids = {s1_id, s2_id}
+if child_count >= 3 then slot_ids[3] = s3_id end
+if child_count >= 4 then slot_ids[4] = s4_id end
+local trig_found = false
+for idx = 1, child_count do
+    local sid = slot_ids[idx]
+    if type(sid) ~= 'string' or sid == '' or
+       sw['required_child_task_ids'][idx] ~= sid or
+       sc['required_child_task_ids'][idx] ~= sid then
+        return {'WAVE_CONSISTENCY_MISMATCH'}
+    end
+    if sid == task_id then trig_found = true end
+end
+if not trig_found then return {'CHILD_NOT_MEMBER'} end
+
+-- Per-sibling authoritative validation
+local trig_outcome_id = cand_outcome['outcome_id']
+local e1, st1, oid1, fn1, hc1 = validate_sibling_readonly(
+    s1_id, s1_status_key, s1_claim_key, s1_fence_key, s1_outcome_key, s1_result_key, s1_lineage_key, s1_cap_key, s1_input_key, s1_marker_key, trig_outcome_id
+)
+if e1 then return {e1} end
+local e2, st2, oid2, fn2, hc2 = validate_sibling_readonly(
+    s2_id, s2_status_key, s2_claim_key, s2_fence_key, s2_outcome_key, s2_result_key, s2_lineage_key, s2_cap_key, s2_input_key, s2_marker_key, trig_outcome_id
+)
+if e2 then return {e2} end
+local st3, oid3, fn3, hc3 = nil, nil, 0, false
+if child_count >= 3 then
+    local e3
+    e3, st3, oid3, fn3, hc3 = validate_sibling_readonly(
+        s3_id, s3_status_key, s3_claim_key, s3_fence_key, s3_outcome_key, s3_result_key, s3_lineage_key, s3_cap_key, s3_input_key, s3_marker_key, trig_outcome_id
+    )
+    if e3 then return {e3} end
+end
+local st4, oid4, fn4, hc4 = nil, nil, 0, false
+if child_count >= 4 then
+    local e4
+    e4, st4, oid4, fn4, hc4 = validate_sibling_readonly(
+        s4_id, s4_status_key, s4_claim_key, s4_fence_key, s4_outcome_key, s4_result_key, s4_lineage_key, s4_cap_key, s4_input_key, s4_marker_key, trig_outcome_id
+    )
+    if e4 then return {e4} end
+end
+
+-- Pure canonical barrier evaluation over post-commit child states
+local slot_statuses = {st1, st2}
+local slot_outcomes = {oid1, oid2}
+local slot_fences = {fn1, fn2}
+local slot_has_claim = {hc1, hc2}
+if child_count >= 3 then
+    slot_statuses[3] = st3
+    slot_outcomes[3] = oid3
+    slot_fences[3] = fn3
+    slot_has_claim[3] = hc3
+end
+if child_count >= 4 then
+    slot_statuses[4] = st4
+    slot_outcomes[4] = oid4
+    slot_fences[4] = fn4
+    slot_has_claim[4] = hc4
+end
+
+local completed_count = 0
+local terminal_count = 0
+local unresolved_count = 0
+local potentially_successful_count = 0
+for idx = 1, child_count do
+    local st_val = slot_statuses[idx]
+    if st_val == 'completed' then
+        completed_count = completed_count + 1
+        terminal_count = terminal_count + 1
+    elseif st_val == 'failed' or st_val == 'claim_timed_out' or st_val == 'dispatch_failed' then
+        terminal_count = terminal_count + 1
+    elseif st_val == 'pending' or st_val == 'working' or st_val == 'recovery_required' or st_val == 'pending_dispatch' then
+        unresolved_count = unresolved_count + 1
+        potentially_successful_count = potentially_successful_count + 1
+    else
+        return {'CORRUPT_CHILD_STATE'}
+    end
+end
+
+local wave_resolution = 'UNRESOLVED'
+if policy == 'WAIT_ALL' then
+    if terminal_count == child_count then
+        wave_resolution = 'SATISFIED'
+    end
+else
+    if completed_count >= derived_req_count then
+        wave_resolution = 'SATISFIED'
+    elseif completed_count + potentially_successful_count < derived_req_count then
+        wave_resolution = 'UNSATISFIABLE'
+    end
+end
+
+local resolve_now = (wave_resolution ~= 'UNRESOLVED')
+local resolved_wave_json = ''
+local released_cont_json = ''
+
+local s1_close = false
+local s1_del_claim = false
+local s1_inc_fence = false
+local s1_next_fence = ''
+local s1_res_status_json = ''
+
+local s2_close = false
+local s2_del_claim = false
+local s2_inc_fence = false
+local s2_next_fence = ''
+local s2_res_status_json = ''
+
+local s3_close = false
+local s3_del_claim = false
+local s3_inc_fence = false
+local s3_next_fence = ''
+local s3_res_status_json = ''
+
+local s4_close = false
+local s4_del_claim = false
+local s4_inc_fence = false
+local s4_next_fence = ''
+local s4_res_status_json = ''
+
+if resolve_now then
+    if wave_resolution == 'SATISFIED' then
+        released_cont_json = pre_cont_sat_json
+    else
+        released_cont_json = pre_cont_unsat_json
+    end
+
+    local child_outcomes_tbl = {}
+    local residual_ids_tbl = {}
+    local close_flags = {false, false, false, false}
+    local del_claim_flags = {false, false, false, false}
+    local inc_fence_flags = {false, false, false, false}
+    local next_fences = {'', '', '', ''}
+    local res_status_jsons = {'', '', '', ''}
+
+    for idx = 1, child_count do
+        local sid = slot_ids[idx]
+        local st_val = slot_statuses[idx]
+        if st_val == 'completed' or st_val == 'failed' or st_val == 'claim_timed_out' or st_val == 'dispatch_failed' then
+            child_outcomes_tbl[sid] = {
+                outcome_id = slot_outcomes[idx],
+                status = st_val,
+            }
+        else
+            child_outcomes_tbl[sid] = {
+                outcome_id = cjson.null,
+                status = 'ended / barrier_resolved',
+            }
+            table.insert(residual_ids_tbl, sid)
+            close_flags[idx] = true
+            del_claim_flags[idx] = slot_has_claim[idx]
+            if slot_fences[idx] > 0 or slot_has_claim[idx] then
+                inc_fence_flags[idx] = true
+                next_fences[idx] = tostring(slot_fences[idx] + 1)
+            end
+            res_status_jsons[idx] = cjson.encode({
+                status = 'ended / barrier_resolved',
+                task_id = sid,
+                updated_at = completed_at,
+                wave_id = wave_id,
+            })
+        end
+    end
+
+    s1_close, s1_del_claim, s1_inc_fence, s1_next_fence, s1_res_status_json = close_flags[1], del_claim_flags[1], inc_fence_flags[1], next_fences[1], res_status_jsons[1]
+    s2_close, s2_del_claim, s2_inc_fence, s2_next_fence, s2_res_status_json = close_flags[2], del_claim_flags[2], inc_fence_flags[2], next_fences[2], res_status_jsons[2]
+    s3_close, s3_del_claim, s3_inc_fence, s3_next_fence, s3_res_status_json = close_flags[3], del_claim_flags[3], inc_fence_flags[3], next_fences[3], res_status_jsons[3]
+    s4_close, s4_del_claim, s4_inc_fence, s4_next_fence, s4_res_status_json = close_flags[4], del_claim_flags[4], inc_fence_flags[4], next_fences[4], res_status_jsons[4]
+
+    local req_count_val = cjson.null
+    local req_frac_val = cjson.null
+    if policy == 'PARTIAL' then
+        req_count_val = derived_req_count
+        req_frac_val = {
+            denominator = frac_den,
+            numerator = frac_num,
+        }
+    end
+
+    local rw_residual_val = residual_ids_tbl
+    if #residual_ids_tbl == 0 then
+        rw_residual_val = '__TAL_EMPTY_ARRAY_SENTINEL__'
+    end
+
+    local rw_tbl = {
+        accepted_at = sw['accepted_at'],
+        accepted_wave_fingerprint = accepted_wave_fp,
+        barrier_policy = policy,
+        child_outcomes = child_outcomes_tbl,
+        completed_count = completed_count,
+        deadline_policy_id = dd['policy_id'],
+        deadline_policy_version = dd['policy_version'],
+        parent_task_id = parent_task_id,
+        required_child_task_ids = sw['required_child_task_ids'],
+        required_success_count = req_count_val,
+        required_success_fraction = req_frac_val,
+        residual_child_task_ids = rw_residual_val,
+        residual_disposition = 'ended / barrier_resolved',
+        resolution = wave_resolution,
+        resolved_at = completed_at,
+        terminal_count = terminal_count,
+        triggering_assignment_id = assignment_id,
+        triggering_child_task_id = task_id,
+        triggering_fencing_epoch = exp_epoch,
+        unresolved_count = unresolved_count,
+        version = 2,
+        wave_deadline = sw['wave_deadline'],
+        wave_id = wave_id,
+    }
+    local ok_rw_enc, encoded_rw = pcall(cjson.encode, rw_tbl)
+    if not ok_rw_enc or type(encoded_rw) ~= 'string' then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+    if #residual_ids_tbl == 0 then
+        encoded_rw = string.gsub(encoded_rw, '"residual_child_task_ids":"__TAL_EMPTY_ARRAY_SENTINEL__"', '"residual_child_task_ids":[]', 1)
+    end
+    if #encoded_rw > 16384 then
+        return {'CORRUPT_WAVE_PROJECTION'}
+    end
+    resolved_wave_json = encoded_rw
+end
+
+-- =============================================================================
+-- PHASE 2: Write Commit (Prevalidated Writes Only; Mechanically Non-Failing)
+-- =============================================================================
+redis.call('SET', completion_key, binding_json)
+redis.call('SET', outcome_key, outcome_json)
+if has_result then
+    redis.call('SET', result_key, result_json)
+end
+redis.call('SET', audit_key, audit_json)
+redis.call('SET', status_key, status_json)
+redis.call('DEL', claim_key)
+redis.call('SET', child_marker_key, marker_json)
+
+if resolve_now then
+    redis.call('SET', resolved_wave_key, resolved_wave_json)
+    redis.call('SET', continuation_key, released_cont_json)
+    redis.call('SET', parent_status_key, parent_status_json)
+    redis.call('RPUSH', hint_queue_key, hint_json)
+
+    if s1_close then
+        redis.call('SET', s1_status_key, s1_res_status_json)
+        if s1_del_claim then redis.call('DEL', s1_claim_key) end
+        if s1_inc_fence then redis.call('SET', s1_fence_key, s1_next_fence) end
+    end
+    if s2_close then
+        redis.call('SET', s2_status_key, s2_res_status_json)
+        if s2_del_claim then redis.call('DEL', s2_claim_key) end
+        if s2_inc_fence then redis.call('SET', s2_fence_key, s2_next_fence) end
+    end
+    if child_count >= 3 and s3_close then
+        redis.call('SET', s3_status_key, s3_res_status_json)
+        if s3_del_claim then redis.call('DEL', s3_claim_key) end
+        if s3_inc_fence then redis.call('SET', s3_fence_key, s3_next_fence) end
+    end
+    if child_count >= 4 and s4_close then
+        redis.call('SET', s4_status_key, s4_res_status_json)
+        if s4_del_claim then redis.call('DEL', s4_claim_key) end
+        if s4_inc_fence then redis.call('SET', s4_fence_key, s4_next_fence) end
+    end
 end
 
 return {'OK', outcome_json, result_json}
@@ -3691,6 +4659,82 @@ class RedisGateway:
                 f"Corrupt fencing epoch at key 'task.fence:{clean_task_id}': {exc}"
             ) from exc
 
+    async def _peek_wave_id_for_resumed_claim(self, task_id: str) -> str:
+        """Best-effort read of wave_id so static KEYS can bind task.delegation_wave_resolution.
+
+        All authoritative validation occurs inside CLAIM_TASK_LUA; missing or
+        wrongly typed continuation keys fall back to '_missing' so Lua handles
+        the rejection atomically without Python-side TOCTOU.
+        """
+        key = f"task.continuation:{task_id}:2"
+        try:
+            ktype = await self._client.type(key)
+            ktype_str = ktype if isinstance(ktype, str) else ktype.decode("utf-8")
+            if ktype_str != "string":
+                return "_missing"
+            raw = await self._client.get(key)
+            if raw is None:
+                return "_missing"
+            text = raw if isinstance(raw, str) else raw.decode("utf-8")
+            data = json.loads(text)
+            if isinstance(data, dict):
+                wid = data.get("wave_id")
+                if isinstance(wid, str) and wid.strip():
+                    return wid.strip()
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except Exception:  # noqa: BLE001, S110
+            pass
+        return "_missing"
+
+    async def _eval_claim_resumed_v2(
+        self,
+        clean_task_id: str,
+        claim: ActiveClaim,
+        now_iso: str,
+        working_status_json: str,
+        claim_payload: str,
+        expected_continuation_version: int,
+        is_root: bool,
+    ) -> Any:
+        wave_id = await self._peek_wave_id_for_resumed_claim(clean_task_id)
+        v2_keys = [
+            f"task.status:{clean_task_id}",
+            f"task.claim:{clean_task_id}",
+            f"task.fence:{clean_task_id}",
+            f"task.required_capability:{clean_task_id}",
+            f"task.continuation_latest:{clean_task_id}",
+            f"task.authority:{claim.root_task_id}",
+            f"task.claim_deadline:{clean_task_id}",
+            f"task.authority_grant:{claim.root_task_id}:unused",
+            f"task.continuation:{clean_task_id}:2",
+            f"task.delegation_wave_resolution:{clean_task_id}:{wave_id}",
+        ]
+        try:
+            return await self._client.eval(
+                CLAIM_TASK_LUA,
+                len(v2_keys),
+                *v2_keys,
+                clean_task_id,
+                now_iso,
+                claim.runtime_principal_id,
+                claim.request_id,
+                working_status_json,
+                claim_payload,
+                "",
+                str(claim.fencing_epoch),
+                claim.assigned_capability,
+                claim.execution_kind,
+                "1" if is_root else "0",
+                str(expected_continuation_version),
+            )
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during atomic_claim_task"
+            ) from exc
+
     async def atomic_claim_task(
         self,
         task_id: str,
@@ -3739,23 +4783,38 @@ class RedisGateway:
             keys.append(f"task.authority_grant:{claim.root_task_id}:{grant.grant_id}")
 
         try:
-            raw_res = await self._client.eval(
-                CLAIM_TASK_LUA,
-                len(keys),
-                *keys,
-                clean_task_id,
-                now_iso,
-                claim.runtime_principal_id,
-                claim.request_id,
-                working_status_json,
-                claim_payload,
-                grant_payload,
-                str(claim.fencing_epoch),
-                claim.assigned_capability,
-                claim.execution_kind,
-                "1" if is_root else "0",
-                str(expected_continuation_version),
-            )
+            if (
+                claim.execution_kind == "resumed_continuation"
+                and expected_continuation_version == 2
+                and grant is None
+            ):
+                raw_res = await self._eval_claim_resumed_v2(
+                    clean_task_id=clean_task_id,
+                    claim=claim,
+                    now_iso=now_iso,
+                    working_status_json=working_status_json,
+                    claim_payload=claim_payload,
+                    expected_continuation_version=expected_continuation_version,
+                    is_root=is_root,
+                )
+            else:
+                raw_res = await self._client.eval(
+                    CLAIM_TASK_LUA,
+                    len(keys),
+                    *keys,
+                    clean_task_id,
+                    now_iso,
+                    claim.runtime_principal_id,
+                    claim.request_id,
+                    working_status_json,
+                    claim_payload,
+                    grant_payload,
+                    str(claim.fencing_epoch),
+                    claim.assigned_capability,
+                    claim.execution_kind,
+                    "1" if is_root else "0",
+                    str(expected_continuation_version),
+                )
         except (NoPermissionError, AuthenticationError):
             raise
         except ResponseError as exc:
@@ -3832,6 +4891,19 @@ class RedisGateway:
 
         if code == "UNEXPECTED_CONTINUATION_VERSION":
             raise ValueError("continuation_version must remain absent for non-resumed claims")
+
+        if code in ("MISSING_CONTINUATION", "CONTINUATION_NOT_CLAIMABLE", "UNSUPPORTED_WAVE_RESOLUTION"):
+            detail = raw_res[1] if len(raw_res) > 1 else code
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8")
+            raise TaskNotClaimableError(
+                f"Task '{clean_task_id}' continuation v2 is not claimable ({code}: {detail})"
+            )
+
+        if code in ("CORRUPT_CONTINUATION", "MISSING_RESOLVED_WAVE", "CORRUPT_RESOLVED_WAVE", "WAVE_RESOLUTION_MISMATCH"):
+            raise CorruptAuthoritativeRecordError(
+                f"Authoritative continuation or resolved wave validation failed on task '{clean_task_id}': {code}"
+            )
 
         if code == "ALREADY_CLAIMED":
             raise TaskAlreadyClaimedError(f"Task '{clean_task_id}' has an active claim by another runtime")
@@ -4241,7 +5313,14 @@ class RedisGateway:
         if not clean_parent or not clean_wave_id:
             return None
         key = f"task.delegation_wave:{clean_parent}:{clean_wave_id}"
-        raw = await self._client.get(key)
+        try:
+            raw = await self._client.get(key)
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt AcceptedDelegationWave at key '{key}': {exc}"
+            ) from exc
         if raw is None:
             return None
         try:
@@ -4252,6 +5331,67 @@ class RedisGateway:
         except Exception as exc:
             raise CorruptAuthoritativeRecordError(
                 f"Corrupt AcceptedDelegationWave at key '{key}': {exc}"
+            ) from exc
+
+    async def get_resolved_delegation_wave(
+        self,
+        parent_task_id: str,
+        wave_id: str,
+    ) -> ResolvedDelegationWave | None:
+        clean_parent = str(parent_task_id).strip()
+        clean_wave_id = str(wave_id).strip()
+        if not clean_parent or not clean_wave_id:
+            return None
+        key = f"task.delegation_wave_resolution:{clean_parent}:{clean_wave_id}"
+        try:
+            raw = await self._client.get(key)
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt ResolvedDelegationWave at key '{key}': {exc}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            text = raw if isinstance(raw, str) else raw.decode("utf-8")
+            return ResolvedDelegationWave.from_json(text)
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt ResolvedDelegationWave at key '{key}': {exc}"
+            ) from exc
+
+    async def get_child_completion_marker(
+        self,
+        child_task_id: str,
+    ) -> dict[str, Any] | None:
+        clean_child = str(child_task_id).strip()
+        if not clean_child:
+            return None
+        key = f"task.child_completion:{clean_child}"
+        try:
+            raw = await self._client.get(key)
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt child completion marker at key '{key}': {exc}"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            text = raw if isinstance(raw, str) else raw.decode("utf-8")
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise TypeError("Child completion marker must be a JSON object")
+            return parsed
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except Exception as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt child completion marker at key '{key}': {exc}"
             ) from exc
 
     async def get_wave_yield(
@@ -4471,6 +5611,8 @@ class RedisGateway:
             c2_id, c2_status_json, c2_lineage_json, c2_cap_json, c2_input_json, c2_hint_json, c2_art_id, c2_art_ver,
             c3_id, c3_status_json, c3_lineage_json, c3_cap_json, c3_input_json, c3_hint_json, c3_art_id, c3_art_ver,
             c4_id, c4_status_json, c4_lineage_json, c4_cap_json, c4_input_json, c4_hint_json, c4_art_id, c4_art_ver,
+            "" if accepted_wave.required_success_fraction is None else str(accepted_wave.required_success_fraction.numerator),
+            "" if accepted_wave.required_success_fraction is None else str(accepted_wave.required_success_fraction.denominator),
         ]
 
         try:
@@ -4668,6 +5810,48 @@ class RedisGateway:
         })
 
         if is_child:
+            latest_key = f"task.continuation_latest:{clean_parent}"
+            try:
+                raw_latest = await self._client.get(latest_key)
+            except (NoPermissionError, AuthenticationError):
+                raise
+            except ResponseError as exc:
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt continuation_latest at key '{latest_key}'"
+                ) from exc
+            if raw_latest is not None:
+                latest_text = raw_latest if isinstance(raw_latest, str) else raw_latest.decode("utf-8")
+                try:
+                    latest_ver = int(latest_text)
+                    if latest_ver < 1 or str(latest_ver) != latest_text.strip():
+                        raise ValueError("non-canonical continuation_latest")
+                except ValueError as exc:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt continuation_latest at key '{latest_key}': {latest_text!r}"
+                    ) from exc
+                if latest_ver == 2:
+                    return await self._complete_wave_child_turn(
+                        clean_task=clean_task,
+                        clean_parent=clean_parent,
+                        clean_root=clean_root,
+                        clean_principal=clean_principal,
+                        clean_agent=clean_agent,
+                        clean_digest=clean_digest,
+                        fencing_epoch=fencing_epoch,
+                        now_iso=now_iso,
+                        command=command,
+                        outcome=outcome,
+                        result=result,
+                        audit=audit,
+                        record=record,
+                        status_json=status_json,
+                    )
+                if latest_ver != 1:
+                    raise CorruptAuthoritativeRecordError(
+                        f"Unsupported continuation_latest '{latest_ver}' for parent '{clean_parent}'"
+                    )
+
+        if is_child:
             parent_status_key = f"task.status:{clean_parent}"
             parent_children_key = f"task.children:{clean_parent}"
             continuation_key = f"task.continuation:{clean_parent}:1"
@@ -4758,6 +5942,200 @@ class RedisGateway:
             raise CorruptAuthoritativeRecordError(
                 "Redis command failed during complete_turn"
             ) from exc
+        return self._handle_complete_turn_response(clean_task, command, raw_res)
+
+    async def _complete_wave_child_turn(
+        self,
+        *,
+        clean_task: str,
+        clean_parent: str,
+        clean_root: str,
+        clean_principal: str,
+        clean_agent: str,
+        clean_digest: str,
+        fencing_epoch: int,
+        now_iso: str,
+        command: CompletionCommand,
+        outcome: TerminalOutcome,
+        result: TaskResult | None,
+        audit: AssignmentCompletionRecord,
+        record: CompletionRecord,
+        status_json: str,
+    ) -> tuple[TerminalOutcome, TaskResult | None, bool]:
+        cont = await self.get_continuation(clean_parent, 2)
+        if cont is None or not isinstance(cont, TaskContinuationV2):
+            raise CorruptAuthoritativeRecordError(
+                f"Missing or invalid TaskContinuationV2 for parent '{clean_parent}'"
+            )
+        ordered_children = cont.required_child_task_ids
+        child_count = len(ordered_children)
+        if not (MIN_WAVE_CHILDREN <= child_count <= MAX_WAVE_CHILDREN):
+            raise CorruptAuthoritativeRecordError(
+                f"TaskContinuationV2 child count {child_count} out of bounds for parent '{clean_parent}'"
+            )
+        wave = await self.get_accepted_delegation_wave(clean_parent, cont.wave_id)
+        if wave is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Missing AcceptedDelegationWave '{cont.wave_id}' for parent '{clean_parent}'"
+            )
+        accepted_wave_fp = wave.semantic_fingerprint()
+        try:
+            cont_base = cont.to_dict()
+            cont_sat = TaskContinuationV2.from_dict({
+                **cont_base,
+                "state": CONTINUATION_V2_STATE_RELEASED,
+                "updated_at": now_iso,
+                "wave_resolution": WaveResolution.SATISFIED.value,
+            })
+            cont_unsat = TaskContinuationV2.from_dict({
+                **cont_base,
+                "state": CONTINUATION_V2_STATE_RELEASED,
+                "updated_at": now_iso,
+                "wave_resolution": WaveResolution.UNSATISFIABLE.value,
+            })
+        except (ValueError, TypeError) as exc:
+            raise CorruptAuthoritativeRecordError(
+                f"Corrupt TaskContinuationV2 for parent '{clean_parent}': {exc}"
+            ) from exc
+
+        hint = WakeUpHint(
+            hint_id=f"hint-{uuid4()}",
+            capability="research",
+            created_at=now_iso,
+            execution_kind="resumed_continuation",
+            task_id=clean_parent,
+            expected_continuation_version=2,
+        )
+        marker_json = canonical_json_dumps({
+            "child_task_id": clean_task,
+            "completed_at": now_iso,
+            "completion_command_id": command.completion_command_id,
+            "continuation_version": 2,
+            "outcome_id": outcome.outcome_id,
+            "parent_task_id": clean_parent,
+            "status": outcome.terminal_status,
+            "wave_id": cont.wave_id,
+        })
+        parent_status_json = canonical_json_dumps({
+            "status": "resumable",
+            "task_id": clean_parent,
+            "updated_at": now_iso,
+        })
+
+        s1_id = ordered_children[0]
+        s2_id = ordered_children[1]
+        s3_id = ordered_children[2] if child_count >= 3 else ordered_children[0]
+        s4_id = ordered_children[3] if child_count >= 4 else ordered_children[0]
+
+        keys = [
+            f"task.completion:{clean_task}:{command.completion_command_id}",
+            f"task.status:{clean_task}",
+            f"task.claim:{clean_task}",
+            f"task.fence:{clean_task}",
+            f"task.outcome:{clean_task}",
+            f"task.result:{clean_task}",
+            f"task.assignment_completion:{clean_task}:{command.assignment_id}",
+            f"task.lineage:{clean_task}",
+            f"task.child_completion:{clean_task}",
+            f"task.status:{clean_parent}",
+            f"task.children:{clean_parent}",
+            f"task.lineage:{clean_parent}",
+            f"task.continuation:{clean_parent}:2",
+            f"task.continuation_latest:{clean_parent}",
+            f"task.delegation_wave:{clean_parent}:{cont.wave_id}",
+            f"task.delegation_wave_resolution:{clean_parent}:{cont.wave_id}",
+            "agent.hints.research",
+            f"task.status:{s1_id}",
+            f"task.claim:{s1_id}",
+            f"task.fence:{s1_id}",
+            f"task.outcome:{s1_id}",
+            f"task.result:{s1_id}",
+            f"task.lineage:{s1_id}",
+            f"task.required_capability:{s1_id}",
+            f"task.input:{s1_id}:1",
+            f"task.child_completion:{s1_id}",
+            f"task.status:{s2_id}",
+            f"task.claim:{s2_id}",
+            f"task.fence:{s2_id}",
+            f"task.outcome:{s2_id}",
+            f"task.result:{s2_id}",
+            f"task.lineage:{s2_id}",
+            f"task.required_capability:{s2_id}",
+            f"task.input:{s2_id}:1",
+            f"task.child_completion:{s2_id}",
+            f"task.status:{s3_id}",
+            f"task.claim:{s3_id}",
+            f"task.fence:{s3_id}",
+            f"task.outcome:{s3_id}",
+            f"task.result:{s3_id}",
+            f"task.lineage:{s3_id}",
+            f"task.required_capability:{s3_id}",
+            f"task.input:{s3_id}:1",
+            f"task.child_completion:{s3_id}",
+            f"task.status:{s4_id}",
+            f"task.claim:{s4_id}",
+            f"task.fence:{s4_id}",
+            f"task.outcome:{s4_id}",
+            f"task.result:{s4_id}",
+            f"task.lineage:{s4_id}",
+            f"task.required_capability:{s4_id}",
+            f"task.input:{s4_id}:1",
+            f"task.child_completion:{s4_id}",
+        ]
+
+        argv = [
+            clean_task,
+            command.assignment_id,
+            clean_principal,
+            clean_agent,
+            command.execution_kind,
+            "" if command.continuation_version is None else str(command.continuation_version),
+            str(fencing_epoch),
+            command.completion_command_id,
+            outcome.semantic_fingerprint,
+            clean_digest,
+            outcome.terminal_status,
+            "" if outcome.failure_code is None else outcome.failure_code,
+            outcome.to_json(),
+            "" if result is None else result.to_json(),
+            audit.to_json(),
+            clean_parent,
+            clean_root,
+            record.to_json(),
+            hint.to_json(),
+            marker_json,
+            status_json,
+            parent_status_json,
+            cont.wave_id,
+            now_iso,
+            str(child_count),
+            accepted_wave_fp,
+            cont_sat.to_json(),
+            cont_unsat.to_json(),
+            s1_id,
+            s2_id,
+            s3_id,
+            s4_id,
+        ]
+
+        try:
+            raw_res = await self._client.eval(
+                COMPLETE_WAVE_CHILD_TURN_LUA, len(keys), *keys, *argv
+            )
+        except (NoPermissionError, AuthenticationError):
+            raise
+        except ResponseError as exc:
+            raise CorruptAuthoritativeRecordError(
+                "Redis command failed during complete_turn"
+            ) from exc
+        return self._handle_complete_turn_response(clean_task, command, raw_res)
+
+    def _handle_complete_turn_response(
+        self,
+        clean_task: str,
+        command: CompletionCommand,
+        raw_res: Any,
+    ) -> tuple[TerminalOutcome, TaskResult | None, bool]:
         if not isinstance(raw_res, (list, tuple)) or len(raw_res) == 0:
             raise RuntimeError(f"Unexpected Redis complete_turn response: {raw_res}")
 
@@ -4859,12 +6237,14 @@ class RedisGateway:
             "PARENT_NOT_WAITING",
             "LINEAGE_NOT_FOUND",
             "PARENT_LINEAGE_NOT_FOUND",
+            "WAVE_ALREADY_RESOLVED",
+            "CONTINUATION_NOT_ACTIVE",
         ):
             raise TaskNotClaimableError(
                 f"Completion preconditions not satisfied for task '{clean_task}': {code}"
             )
 
-        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_")):
+        if code.startswith(("WRONG_KEY_TYPE_", "CORRUPT_", "MISSING_", "WAVE_CONSISTENCY_")):
             raise CorruptAuthoritativeRecordError(
                 f"Authoritative record corruption detected on task '{clean_task}': {code}"
             )
