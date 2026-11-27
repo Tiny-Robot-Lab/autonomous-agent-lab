@@ -1,82 +1,182 @@
-"""Offline-only Run 002 shadow-routing evaluation foundations (Increment 1)."""
+"""Offline-only Run 002 shadow-routing evaluation package."""
 
 from __future__ import annotations
 
-from evaluation.routing.run_002.canonicalization import (
-    NORMATIVE_CANONICALIZATION_VECTORS,
-    CanonicalizationVector,
-    CanonicalPrompt,
-    canonicalize_prompt,
-)
-from evaluation.routing.run_002.contract import (
-    CONTRACT_ID,
-    CONTRACT_SCHEMA_VERSION,
-    CONTRACT_SELF_HASH_FIELD,
-    DEFAULT_CONTRACT_PATH,
-    EXPECTED_CONTRACT_CANONICAL_SHA256,
-    EXPECTED_CONTRACT_PHYSICAL_SHA256,
-    EXPECTED_LABEL_INDEX_MAP,
-    EXPECTED_MODEL_ARTIFACT_IDENTITY,
-    EXPECTED_PROTOCOL_IDENTITY,
-    MANIFEST_SELF_HASH_FIELD,
-    canonical_json_sha256,
-    load_verified_contract,
-)
-from evaluation.routing.run_002.coordinator import (
-    OfflineShadowRunResult,
-    run_offline_shadow_evaluation,
-)
-from evaluation.routing.run_002.corpus import (
-    MINIMUM_COMPLETED_PER_AUTHORITATIVE_CLASS,
-    MINIMUM_COMPLETED_UNIQUE_ELIGIBLE,
-    CorpusManifest,
-    CorpusRecord,
-    ForbiddenOverlapManifest,
-    ValidatedCorpus,
-    ValidatedCorpusRecord,
-    validate_corpus_manifest,
-)
-from evaluation.routing.run_002.eligibility import (
-    EligibilityDecision,
-    IneligibilityReason,
-    ReportStratum,
-    RouterMode,
-    evaluate_eligibility,
-    validate_run_preflight,
-)
-from evaluation.routing.run_002.errors import (
-    FatalRunError,
-    FatalRunErrorCode,
-    PerRecordErrorCode,
-)
-from evaluation.routing.run_002.promotion import (
-    PromotionEvaluation,
-    PromotionGate,
-    evaluate_promotion_gate,
-)
-from evaluation.routing.run_002.telemetry import (
-    ALLOWED_ENVIRONMENT_FINGERPRINT_FIELDS,
-    FORBIDDEN_TELEMETRY_KEYS,
-    PROTOCOL_SUPERSESSION_NOTES,
-    DisagreementCategory,
-    EnvironmentFingerprint,
-    ObservationState,
-    RunSummary,
-    ShadowObservation,
-    collect_safe_environment_fingerprint,
-    serialize_observation_jsonl,
-    write_observations_jsonl,
-    write_run_summary,
-)
-from evaluation.routing.run_002.worker import (
-    ShadowWorker,
-    StubShadowWorker,
-    ValidatedWorkerPrediction,
-    WorkerFailure,
-    WorkerPrediction,
-    WorkerResult,
-    validate_and_resolve_prediction,
-)
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from evaluation.routing.run_002.canonicalization import (
+        NORMATIVE_CANONICALIZATION_VECTORS,
+        CanonicalizationVector,
+        CanonicalPrompt,
+        canonicalize_prompt,
+    )
+    from evaluation.routing.run_002.contract import (
+        CONTRACT_ID,
+        CONTRACT_SCHEMA_VERSION,
+        CONTRACT_SELF_HASH_FIELD,
+        DEFAULT_CONTRACT_PATH,
+        EXPECTED_CONTRACT_CANONICAL_SHA256,
+        EXPECTED_CONTRACT_PHYSICAL_SHA256,
+        EXPECTED_LABEL_INDEX_MAP,
+        EXPECTED_MODEL_ARTIFACT_IDENTITY,
+        EXPECTED_PROTOCOL_IDENTITY,
+        MANIFEST_SELF_HASH_FIELD,
+        canonical_json_sha256,
+        load_verified_contract,
+    )
+    from evaluation.routing.run_002.coordinator import (
+        OfflineShadowRunResult,
+        run_offline_shadow_evaluation,
+    )
+    from evaluation.routing.run_002.corpus import (
+        MINIMUM_COMPLETED_PER_AUTHORITATIVE_CLASS,
+        MINIMUM_COMPLETED_UNIQUE_ELIGIBLE,
+        CorpusManifest,
+        CorpusRecord,
+        ForbiddenOverlapManifest,
+        ValidatedCorpus,
+        ValidatedCorpusRecord,
+        validate_corpus_manifest,
+    )
+    from evaluation.routing.run_002.eligibility import (
+        EligibilityDecision,
+        IneligibilityReason,
+        ReportStratum,
+        RouterMode,
+        evaluate_eligibility,
+        validate_run_preflight,
+    )
+    from evaluation.routing.run_002.errors import (
+        FatalRunError,
+        FatalRunErrorCode,
+        PerRecordErrorCode,
+    )
+    from evaluation.routing.run_002.promotion import (
+        PromotionEvaluation,
+        PromotionGate,
+        evaluate_promotion_gate,
+    )
+    from evaluation.routing.run_002.subprocess_worker import (
+        SubprocessShadowWorker,
+        SubprocessWorkerConfig,
+    )
+    from evaluation.routing.run_002.telemetry import (
+        ALLOWED_ENVIRONMENT_FINGERPRINT_FIELDS,
+        FORBIDDEN_TELEMETRY_KEYS,
+        PROTOCOL_SUPERSESSION_NOTES,
+        DisagreementCategory,
+        EnvironmentFingerprint,
+        ObservationState,
+        RunSummary,
+        ShadowObservation,
+        collect_safe_environment_fingerprint,
+        serialize_observation_jsonl,
+        write_observations_jsonl,
+        write_run_summary,
+    )
+    from evaluation.routing.run_002.trust import (
+        ArtifactFileEntry,
+        ArtifactTrustAnchors,
+        VerifiedArtifactBundle,
+        resolve_contract_trust_anchors,
+        validate_worker_executable,
+        verify_artifact_trust,
+        verify_persisted_label_map,
+    )
+    from evaluation.routing.run_002.worker import (
+        ShadowWorker,
+        StubShadowWorker,
+        ValidatedWorkerPrediction,
+        WorkerFailure,
+        WorkerPrediction,
+        WorkerResult,
+        WorkerStartupError,
+        validate_and_resolve_prediction,
+        validate_predict_proba_output,
+    )
+
+_EXPORTS: dict[str, tuple[str, str]] = {
+    "NORMATIVE_CANONICALIZATION_VECTORS": ("evaluation.routing.run_002.canonicalization", "NORMATIVE_CANONICALIZATION_VECTORS"),
+    "CanonicalizationVector": ("evaluation.routing.run_002.canonicalization", "CanonicalizationVector"),
+    "CanonicalPrompt": ("evaluation.routing.run_002.canonicalization", "CanonicalPrompt"),
+    "canonicalize_prompt": ("evaluation.routing.run_002.canonicalization", "canonicalize_prompt"),
+    "CONTRACT_ID": ("evaluation.routing.run_002.contract", "CONTRACT_ID"),
+    "CONTRACT_SCHEMA_VERSION": ("evaluation.routing.run_002.contract", "CONTRACT_SCHEMA_VERSION"),
+    "CONTRACT_SELF_HASH_FIELD": ("evaluation.routing.run_002.contract", "CONTRACT_SELF_HASH_FIELD"),
+    "DEFAULT_CONTRACT_PATH": ("evaluation.routing.run_002.contract", "DEFAULT_CONTRACT_PATH"),
+    "EXPECTED_CONTRACT_CANONICAL_SHA256": ("evaluation.routing.run_002.contract", "EXPECTED_CONTRACT_CANONICAL_SHA256"),
+    "EXPECTED_CONTRACT_PHYSICAL_SHA256": ("evaluation.routing.run_002.contract", "EXPECTED_CONTRACT_PHYSICAL_SHA256"),
+    "EXPECTED_LABEL_INDEX_MAP": ("evaluation.routing.run_002.contract", "EXPECTED_LABEL_INDEX_MAP"),
+    "EXPECTED_MODEL_ARTIFACT_IDENTITY": ("evaluation.routing.run_002.contract", "EXPECTED_MODEL_ARTIFACT_IDENTITY"),
+    "EXPECTED_PROTOCOL_IDENTITY": ("evaluation.routing.run_002.contract", "EXPECTED_PROTOCOL_IDENTITY"),
+    "MANIFEST_SELF_HASH_FIELD": ("evaluation.routing.run_002.contract", "MANIFEST_SELF_HASH_FIELD"),
+    "canonical_json_sha256": ("evaluation.routing.run_002.contract", "canonical_json_sha256"),
+    "load_verified_contract": ("evaluation.routing.run_002.contract", "load_verified_contract"),
+    "OfflineShadowRunResult": ("evaluation.routing.run_002.coordinator", "OfflineShadowRunResult"),
+    "run_offline_shadow_evaluation": ("evaluation.routing.run_002.coordinator", "run_offline_shadow_evaluation"),
+    "MINIMUM_COMPLETED_PER_AUTHORITATIVE_CLASS": ("evaluation.routing.run_002.corpus", "MINIMUM_COMPLETED_PER_AUTHORITATIVE_CLASS"),
+    "MINIMUM_COMPLETED_UNIQUE_ELIGIBLE": ("evaluation.routing.run_002.corpus", "MINIMUM_COMPLETED_UNIQUE_ELIGIBLE"),
+    "CorpusManifest": ("evaluation.routing.run_002.corpus", "CorpusManifest"),
+    "CorpusRecord": ("evaluation.routing.run_002.corpus", "CorpusRecord"),
+    "ForbiddenOverlapManifest": ("evaluation.routing.run_002.corpus", "ForbiddenOverlapManifest"),
+    "ValidatedCorpus": ("evaluation.routing.run_002.corpus", "ValidatedCorpus"),
+    "ValidatedCorpusRecord": ("evaluation.routing.run_002.corpus", "ValidatedCorpusRecord"),
+    "validate_corpus_manifest": ("evaluation.routing.run_002.corpus", "validate_corpus_manifest"),
+    "EligibilityDecision": ("evaluation.routing.run_002.eligibility", "EligibilityDecision"),
+    "IneligibilityReason": ("evaluation.routing.run_002.eligibility", "IneligibilityReason"),
+    "ReportStratum": ("evaluation.routing.run_002.eligibility", "ReportStratum"),
+    "RouterMode": ("evaluation.routing.run_002.eligibility", "RouterMode"),
+    "evaluate_eligibility": ("evaluation.routing.run_002.eligibility", "evaluate_eligibility"),
+    "validate_run_preflight": ("evaluation.routing.run_002.eligibility", "validate_run_preflight"),
+    "FatalRunError": ("evaluation.routing.run_002.errors", "FatalRunError"),
+    "FatalRunErrorCode": ("evaluation.routing.run_002.errors", "FatalRunErrorCode"),
+    "PerRecordErrorCode": ("evaluation.routing.run_002.errors", "PerRecordErrorCode"),
+    "PromotionEvaluation": ("evaluation.routing.run_002.promotion", "PromotionEvaluation"),
+    "PromotionGate": ("evaluation.routing.run_002.promotion", "PromotionGate"),
+    "evaluate_promotion_gate": ("evaluation.routing.run_002.promotion", "evaluate_promotion_gate"),
+    "SubprocessShadowWorker": ("evaluation.routing.run_002.subprocess_worker", "SubprocessShadowWorker"),
+    "SubprocessWorkerConfig": ("evaluation.routing.run_002.subprocess_worker", "SubprocessWorkerConfig"),
+    "ALLOWED_ENVIRONMENT_FINGERPRINT_FIELDS": ("evaluation.routing.run_002.telemetry", "ALLOWED_ENVIRONMENT_FINGERPRINT_FIELDS"),
+    "FORBIDDEN_TELEMETRY_KEYS": ("evaluation.routing.run_002.telemetry", "FORBIDDEN_TELEMETRY_KEYS"),
+    "PROTOCOL_SUPERSESSION_NOTES": ("evaluation.routing.run_002.telemetry", "PROTOCOL_SUPERSESSION_NOTES"),
+    "DisagreementCategory": ("evaluation.routing.run_002.telemetry", "DisagreementCategory"),
+    "EnvironmentFingerprint": ("evaluation.routing.run_002.telemetry", "EnvironmentFingerprint"),
+    "ObservationState": ("evaluation.routing.run_002.telemetry", "ObservationState"),
+    "RunSummary": ("evaluation.routing.run_002.telemetry", "RunSummary"),
+    "ShadowObservation": ("evaluation.routing.run_002.telemetry", "ShadowObservation"),
+    "collect_safe_environment_fingerprint": ("evaluation.routing.run_002.telemetry", "collect_safe_environment_fingerprint"),
+    "serialize_observation_jsonl": ("evaluation.routing.run_002.telemetry", "serialize_observation_jsonl"),
+    "write_observations_jsonl": ("evaluation.routing.run_002.telemetry", "write_observations_jsonl"),
+    "write_run_summary": ("evaluation.routing.run_002.telemetry", "write_run_summary"),
+    "ArtifactFileEntry": ("evaluation.routing.run_002.trust", "ArtifactFileEntry"),
+    "ArtifactTrustAnchors": ("evaluation.routing.run_002.trust", "ArtifactTrustAnchors"),
+    "VerifiedArtifactBundle": ("evaluation.routing.run_002.trust", "VerifiedArtifactBundle"),
+    "resolve_contract_trust_anchors": ("evaluation.routing.run_002.trust", "resolve_contract_trust_anchors"),
+    "validate_worker_executable": ("evaluation.routing.run_002.trust", "validate_worker_executable"),
+    "verify_artifact_trust": ("evaluation.routing.run_002.trust", "verify_artifact_trust"),
+    "verify_persisted_label_map": ("evaluation.routing.run_002.trust", "verify_persisted_label_map"),
+    "ShadowWorker": ("evaluation.routing.run_002.worker", "ShadowWorker"),
+    "StubShadowWorker": ("evaluation.routing.run_002.worker", "StubShadowWorker"),
+    "ValidatedWorkerPrediction": ("evaluation.routing.run_002.worker", "ValidatedWorkerPrediction"),
+    "WorkerFailure": ("evaluation.routing.run_002.worker", "WorkerFailure"),
+    "WorkerPrediction": ("evaluation.routing.run_002.worker", "WorkerPrediction"),
+    "WorkerResult": ("evaluation.routing.run_002.worker", "WorkerResult"),
+    "WorkerStartupError": ("evaluation.routing.run_002.worker", "WorkerStartupError"),
+    "validate_and_resolve_prediction": ("evaluation.routing.run_002.worker", "validate_and_resolve_prediction"),
+    "validate_predict_proba_output": ("evaluation.routing.run_002.worker", "validate_predict_proba_output"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)
+
 
 __all__ = [
     "ALLOWED_ENVIRONMENT_FINGERPRINT_FIELDS",
@@ -95,6 +195,8 @@ __all__ = [
     "MINIMUM_COMPLETED_UNIQUE_ELIGIBLE",
     "NORMATIVE_CANONICALIZATION_VECTORS",
     "PROTOCOL_SUPERSESSION_NOTES",
+    "ArtifactFileEntry",
+    "ArtifactTrustAnchors",
     "CanonicalPrompt",
     "CanonicalizationVector",
     "CorpusManifest",
@@ -117,23 +219,32 @@ __all__ = [
     "ShadowObservation",
     "ShadowWorker",
     "StubShadowWorker",
+    "SubprocessShadowWorker",
+    "SubprocessWorkerConfig",
     "ValidatedCorpus",
     "ValidatedCorpusRecord",
     "ValidatedWorkerPrediction",
+    "VerifiedArtifactBundle",
     "WorkerFailure",
     "WorkerPrediction",
     "WorkerResult",
+    "WorkerStartupError",
     "canonical_json_sha256",
     "canonicalize_prompt",
     "collect_safe_environment_fingerprint",
     "evaluate_eligibility",
     "evaluate_promotion_gate",
     "load_verified_contract",
+    "resolve_contract_trust_anchors",
     "run_offline_shadow_evaluation",
     "serialize_observation_jsonl",
     "validate_and_resolve_prediction",
     "validate_corpus_manifest",
+    "validate_predict_proba_output",
     "validate_run_preflight",
+    "validate_worker_executable",
+    "verify_artifact_trust",
+    "verify_persisted_label_map",
     "write_observations_jsonl",
     "write_run_summary",
 ]
