@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -11,6 +11,16 @@ from evaluation.routing.run_002.errors import PerRecordErrorCode
 
 PROBABILITY_ROW_SUM_TOLERANCE = 0.0001
 ALLOWED_SHADOW_DECISIONS: frozenset[str] = frozenset({"general", "research"})
+
+
+class WorkerStartupError(RuntimeError):
+    """Privacy-safe failure initializing or validating the external worker environment."""
+
+    def __init__(self, detail: str) -> None:
+        if not isinstance(detail, str) or not detail.strip():
+            raise ValueError("detail must be a non-empty string")
+        self.detail = detail.strip()
+        super().__init__(self.detail)
 
 
 @dataclass(frozen=True)
@@ -111,7 +121,11 @@ def validate_and_resolve_prediction(
         )
 
     row_sum = p_gen + p_res
-    if not math.isfinite(row_sum) or abs(row_sum - 1.0) > PROBABILITY_ROW_SUM_TOLERANCE:
+    if (
+        not math.isfinite(row_sum)
+        or row_sum <= 0.0
+        or abs(row_sum - 1.0) > PROBABILITY_ROW_SUM_TOLERANCE
+    ):
         return WorkerFailure(
             error_code=PerRecordErrorCode.INVALID_PROBABILITIES,
             latency_ns=latency,
@@ -155,6 +169,59 @@ def validate_and_resolve_prediction(
         general_probability=norm_gen,
         research_probability=norm_res,
         latency_ns=latency,
+    )
+
+
+def validate_predict_proba_output(
+    raw_proba: Any,
+    *,
+    latency_ns: int,
+) -> ValidatedWorkerPrediction | WorkerFailure:
+    """Validate raw model predict_proba output using the single canonical validator.
+
+    Enforces shape (1, 2) and array-like structure (MALFORMED_OUTPUT on wrong
+    type/shape), then delegates scalar probability validation, row-sum tolerance,
+    normalization, post-normalization revalidation, tie rejection, and argmax
+    resolution to `validate_and_resolve_prediction`.
+    """
+    if isinstance(latency_ns, bool) or not isinstance(latency_ns, int) or latency_ns < 0:
+        return WorkerFailure(error_code=PerRecordErrorCode.MALFORMED_OUTPUT, latency_ns=None)
+
+    if raw_proba is None or isinstance(raw_proba, (str, bytes, bytearray, dict)):
+        return WorkerFailure(error_code=PerRecordErrorCode.MALFORMED_OUTPUT, latency_ns=latency_ns)
+
+    matrix: Any = raw_proba
+    tolist_fn = getattr(raw_proba, "tolist", None)
+    if callable(tolist_fn):
+        try:
+            matrix = tolist_fn()
+        except Exception:  # noqa: BLE001
+            return WorkerFailure(
+                error_code=PerRecordErrorCode.MALFORMED_OUTPUT,
+                latency_ns=latency_ns,
+            )
+
+    if (
+        not isinstance(matrix, Sequence)
+        or isinstance(matrix, (str, bytes, bytearray))
+        or len(matrix) != 1
+    ):
+        return WorkerFailure(error_code=PerRecordErrorCode.MALFORMED_OUTPUT, latency_ns=latency_ns)
+
+    row = matrix[0]
+    if (
+        not isinstance(row, Sequence)
+        or isinstance(row, (str, bytes, bytearray))
+        or len(row) != 2
+    ):
+        return WorkerFailure(error_code=PerRecordErrorCode.MALFORMED_OUTPUT, latency_ns=latency_ns)
+
+    return validate_and_resolve_prediction(
+        WorkerPrediction(
+            general_probability=row[0],
+            research_probability=row[1],
+            latency_ns=latency_ns,
+        )
     )
 
 

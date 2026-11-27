@@ -76,118 +76,133 @@ def _execute_coordinator_loop(
         router_mode=router_mode,
     )
 
+    preflight_fn = getattr(worker, "preflight", None)
+    if callable(preflight_fn):
+        preflight_fn()
+
     router = DeterministicCapabilityRouter()
     observations: list[ShadowObservation] = []
 
-    for validated_rec in validated_corpus.records:
-        rec = validated_rec.record
-        canon = validated_rec.canonical
-        assessment = router.assess(canon.canonical_prompt)
+    try:
+        for validated_rec in validated_corpus.records:
+            rec = validated_rec.record
+            canon = validated_rec.canonical
+            assessment = router.assess(canon.canonical_prompt)
 
-        decision = evaluate_eligibility(
-            canonical_prompt=canon,
-            corpus_approved=validated_corpus.manifest.approved,
-            corpus_eligible=rec.corpus_eligible,
-            router_mode=router_mode,
-            assessment=assessment,
-        )
+            decision = evaluate_eligibility(
+                canonical_prompt=canon,
+                corpus_approved=validated_corpus.manifest.approved,
+                corpus_eligible=rec.corpus_eligible,
+                router_mode=router_mode,
+                assessment=assessment,
+            )
 
-        if not decision.eligible:
-            assert decision.ineligibility_reason is not None
-            observations.append(
-                ShadowObservation.ineligible(
-                    observation_id=rec.record_id,
-                    canonical_input_sha256=canon.canonical_input_sha256,
-                    reason=decision.ineligibility_reason,
+            if not decision.eligible:
+                assert decision.ineligibility_reason is not None
+                observations.append(
+                    ShadowObservation.ineligible(
+                        observation_id=rec.record_id,
+                        canonical_input_sha256=canon.canonical_input_sha256,
+                        reason=decision.ineligibility_reason,
+                    )
                 )
-            )
-            continue
+                continue
 
-        assert decision.stratum is not None
-        assert decision.authoritative_capability is not None
-        auth_cap = decision.authoritative_capability.value
+            assert decision.stratum is not None
+            assert decision.authoritative_capability is not None
+            auth_cap = decision.authoritative_capability.value
 
-        try:
-            raw_result = worker.predict(canon.canonical_prompt)
-            resolved = validate_and_resolve_prediction(raw_result)
-        except FatalRunError:
-            raise
-        except TimeoutError:
-            resolved = WorkerFailure(
-                error_code=PerRecordErrorCode.INFERENCE_TIMEOUT,
-                latency_ns=None,
-            )
-        # Contract requires non-fatal worker crashes to continue the bounded run
-        # as per-record unexpected_observer_error without leaking exception text.
-        except Exception:  # noqa: BLE001
-            resolved = WorkerFailure(
-                error_code=PerRecordErrorCode.UNEXPECTED_OBSERVER_ERROR,
-                latency_ns=None,
-            )
+            try:
+                raw_result = worker.predict(canon.canonical_prompt)
+                resolved = validate_and_resolve_prediction(raw_result)
+            except FatalRunError:
+                raise
+            except TimeoutError:
+                resolved = WorkerFailure(
+                    error_code=PerRecordErrorCode.INFERENCE_TIMEOUT,
+                    latency_ns=None,
+                )
+            # Contract requires non-fatal worker crashes to continue the bounded run
+            # as per-record unexpected_observer_error without leaking exception text.
+            except Exception:  # noqa: BLE001
+                resolved = WorkerFailure(
+                    error_code=PerRecordErrorCode.UNEXPECTED_OBSERVER_ERROR,
+                    latency_ns=None,
+                )
 
-        if isinstance(resolved, WorkerFailure):
+            if isinstance(resolved, WorkerFailure):
+                observations.append(
+                    ShadowObservation.execution_error(
+                        observation_id=rec.record_id,
+                        canonical_input_sha256=canon.canonical_input_sha256,
+                        stratum=decision.stratum,
+                        authoritative_capability=auth_cap,
+                        error_code=resolved.error_code,
+                        latency_ns=resolved.latency_ns,
+                    )
+                )
+                continue
+
+            assert isinstance(resolved, ValidatedWorkerPrediction)
             observations.append(
-                ShadowObservation.execution_error(
+                ShadowObservation.completed(
                     observation_id=rec.record_id,
                     canonical_input_sha256=canon.canonical_input_sha256,
                     stratum=decision.stratum,
                     authoritative_capability=auth_cap,
-                    error_code=resolved.error_code,
+                    shadow_decision=resolved.shadow_decision,
+                    general_probability=resolved.general_probability,
+                    research_probability=resolved.research_probability,
                     latency_ns=resolved.latency_ns,
                 )
             )
-            continue
 
-        assert isinstance(resolved, ValidatedWorkerPrediction)
-        observations.append(
-            ShadowObservation.completed(
-                observation_id=rec.record_id,
-                canonical_input_sha256=canon.canonical_input_sha256,
-                stratum=decision.stratum,
-                authoritative_capability=auth_cap,
-                shadow_decision=resolved.shadow_decision,
-                general_probability=resolved.general_probability,
-                research_probability=resolved.research_probability,
-                latency_ns=resolved.latency_ns,
-            )
+        promotion = evaluate_promotion_gate(observations)
+        worker_env = getattr(worker, "worker_environment", None)
+        if environment is not None:
+            env = environment
+        elif isinstance(worker_env, EnvironmentFingerprint):
+            env = worker_env
+        else:
+            env = collect_safe_environment_fingerprint()
+        summary = RunSummary(
+            contract_id=CONTRACT_ID,
+            schema_version=CONTRACT_SCHEMA_VERSION,
+            corpus_id=validated_corpus.manifest.corpus_id,
+            corpus_sha256=validated_corpus.manifest.corpus_sha256,
+            corpus_manifest_sha256=validated_corpus.manifest.canonical_manifest_sha256,
+            overlap_manifest_hashes=validated_corpus.overlap_manifest_hashes,
+            expected_model_artifact_identity=EXPECTED_MODEL_ARTIFACT_IDENTITY,
+            expected_protocol_identity=EXPECTED_PROTOCOL_IDENTITY,
+            environment=env,
+            total_records=promotion.total_records,
+            ineligible_count=promotion.ineligible_count,
+            eligible_count=promotion.eligible_count,
+            agreed_count=promotion.agreed_count,
+            disagreed_count=promotion.disagreed_count,
+            dangerous_disagreement_count=promotion.dangerous_disagreement_count,
+            execution_error_count=promotion.execution_error_count,
+            completed_general_count=promotion.completed_general_count,
+            completed_research_count=promotion.completed_research_count,
+            stratum_counts=promotion.stratum_counts,
+            promotion_gate=promotion.gate.value,
+            completed=True,
         )
 
-    promotion = evaluate_promotion_gate(observations)
-    env = environment or collect_safe_environment_fingerprint()
-    summary = RunSummary(
-        contract_id=CONTRACT_ID,
-        schema_version=CONTRACT_SCHEMA_VERSION,
-        corpus_id=validated_corpus.manifest.corpus_id,
-        corpus_sha256=validated_corpus.manifest.corpus_sha256,
-        corpus_manifest_sha256=validated_corpus.manifest.canonical_manifest_sha256,
-        overlap_manifest_hashes=validated_corpus.overlap_manifest_hashes,
-        expected_model_artifact_identity=EXPECTED_MODEL_ARTIFACT_IDENTITY,
-        expected_protocol_identity=EXPECTED_PROTOCOL_IDENTITY,
-        environment=env,
-        total_records=promotion.total_records,
-        ineligible_count=promotion.ineligible_count,
-        eligible_count=promotion.eligible_count,
-        agreed_count=promotion.agreed_count,
-        disagreed_count=promotion.disagreed_count,
-        dangerous_disagreement_count=promotion.dangerous_disagreement_count,
-        execution_error_count=promotion.execution_error_count,
-        completed_general_count=promotion.completed_general_count,
-        completed_research_count=promotion.completed_research_count,
-        stratum_counts=promotion.stratum_counts,
-        promotion_gate=promotion.gate.value,
-        completed=True,
-    )
+        if telemetry_jsonl_path is not None:
+            write_observations_jsonl(observations, telemetry_jsonl_path)
+        if summary_path is not None:
+            write_run_summary(summary, summary_path)
 
-    if telemetry_jsonl_path is not None:
-        write_observations_jsonl(observations, telemetry_jsonl_path)
-    if summary_path is not None:
-        write_run_summary(summary, summary_path)
-
-    return OfflineShadowRunResult(
-        observations=tuple(observations),
-        promotion=promotion,
-        summary=summary,
-    )
+        return OfflineShadowRunResult(
+            observations=tuple(observations),
+            promotion=promotion,
+            summary=summary,
+        )
+    finally:
+        close_fn = getattr(worker, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 def run_offline_shadow_evaluation(

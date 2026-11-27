@@ -22,6 +22,7 @@ markers = [
     "live_redis_acl: live Docker-backed Redis 7.4.12 ACL allow/deny enforcement matrix",
     "live_redis_rotation: bounded Docker Compose Redis credential-rotation and AOF integration test",
     "external_provider: opt-in live tests targeting external network or live providers",
+    "run_002_real_model: opt-in offline integration test requiring external Run 002 model artifact and SetFit worker environment",
 ]
 
 [tool.ruff]
