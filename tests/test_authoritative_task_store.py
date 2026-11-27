@@ -1,4 +1,5 @@
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -6,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from agent_contracts import (
+    AcceptedDelegationWave,
     ActiveClaim,
     AgentAvailability,
     AgentAvailabilityState,
@@ -18,18 +20,22 @@ from agent_contracts import (
     CompletionCommand,
     CompletionRecord,
     DelegationGrant,
+    DelegationGrantV2,
     DelegationProposalRecord,
+    DelegationWaveProposalRecord,
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
     RequiredCapabilityRecord,
     RootAuthorityRecord,
     StageArtifact,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskRequested,
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveYieldRecord,
     build_claim_timed_out_terminal_outcome,
     build_completion_audit,
     build_terminal_outcome,
@@ -90,15 +96,17 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self.children: dict[str, set[str]] = {}
         self.inputs: dict[tuple[str, int], TaskInput] = {}
         self.artifacts: dict[tuple[str, str, int], StageArtifact] = {}
-        self.continuations: dict[tuple[str, int], TaskContinuation] = {}
+        self.continuations: dict[tuple[str, int], TaskContinuation | TaskContinuationV2] = {}
         self.latest_continuation: dict[str, int] = {}
         self.authorities: dict[str, RootAuthorityRecord] = {}
-        self.authority_grants: dict[tuple[str, str], DelegationGrant] = {}
+        self.authority_grants: dict[tuple[str, str], DelegationGrant | DelegationGrantV2] = {}
         self.required_capabilities: dict[str, RequiredCapabilityRecord] = {}
         self.claims: dict[str, ActiveClaim] = {}
         self.fences: dict[str, int] = {}
         self.proposals: dict[tuple[str, str], DelegationProposalRecord] = {}
-        self.yield_records: dict[tuple[str, str], AssignmentYieldRecord] = {}
+        self.wave_proposals: dict[tuple[str, str], DelegationWaveProposalRecord] = {}
+        self.accepted_waves: dict[tuple[str, str], AcceptedDelegationWave] = {}
+        self.yield_records: dict[tuple[str, str], AssignmentYieldRecord | WaveYieldRecord] = {}
         self.consumed_waves: dict[str, set[str]] = {}
         self.consumed_grants: dict[str, set[str]] = {}
         self.claim_deadlines: dict[str, str] = {}
@@ -396,6 +404,8 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         return self.artifacts.get((producing_task_id.strip(), artifact_id.strip(), artifact_version))
 
     async def save_continuation(self, continuation: TaskContinuation) -> None:
+        if not isinstance(continuation, TaskContinuation) or getattr(continuation, "version", None) != 1:
+            raise ValueError("Standalone save_continuation supports TaskContinuation v1 only")
         key = (continuation.parent_task_id, continuation.continuation_version)
         if key not in self.continuations:
             if continuation.continuation_version == 1:
@@ -448,8 +458,11 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
 
     async def get_continuation(
         self, parent_task_id: str, continuation_version: int = 1
-    ) -> TaskContinuation | None:
+    ) -> TaskContinuation | TaskContinuationV2 | None:
         return self.continuations.get((parent_task_id.strip(), continuation_version))
+
+    async def get_latest_continuation_version(self, parent_task_id: str) -> int | None:
+        return self.latest_continuation.get(parent_task_id.strip())
 
     async def save_root_authority(self, authority: RootAuthorityRecord) -> None:
         key = authority.root_task_id
@@ -465,7 +478,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None:
         return self.authorities.get(root_task_id.strip())
 
-    async def save_authority_grant(self, grant: DelegationGrant) -> None:
+    async def save_authority_grant(self, grant: DelegationGrant | DelegationGrantV2) -> None:
         key = (grant.root_task_id, grant.grant_id)
         if key in self.authority_grants:
             if self.authority_grants[key] == grant:
@@ -478,7 +491,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
 
     async def get_authority_grant(
         self, root_task_id: str, grant_id: str
-    ) -> DelegationGrant | None:
+    ) -> DelegationGrant | DelegationGrantV2 | None:
         return self.authority_grants.get((root_task_id.strip(), grant_id.strip()))
 
     async def save_active_claim(self, claim: ActiveClaim) -> None:
@@ -494,7 +507,7 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         self,
         task_id: str,
         claim: ActiveClaim,
-        grant: DelegationGrant | None = None,
+        grant: DelegationGrant | DelegationGrantV2 | None = None,
         now: str = "",
         expected_continuation_version: int = -1,
         is_root: bool = True,
@@ -606,6 +619,47 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
             )
 
         if grant:
+            root_auth = self.authorities.get(claim.root_task_id)
+            if root_auth is None:
+                raise DelegationConflictError(f"Missing root authority record for '{claim.root_task_id}'")
+            if (
+                type(root_auth.version) is bool
+                or root_auth.version not in (1, 2)
+                or type(root_auth.max_delegation_depth) is bool
+                or root_auth.max_delegation_depth != 1
+                or type(root_auth.max_delegation_waves) is bool
+                or root_auth.max_delegation_waves != 1
+                or type(root_auth.max_children_per_wave) is bool
+            ):
+                raise DelegationConflictError("Invalid root authority bounds")
+            if root_auth.version == 1 and root_auth.max_children_per_wave != 1:
+                raise DelegationConflictError("Invalid root authority v1 bounds")
+            if root_auth.version == 2 and not (2 <= root_auth.max_children_per_wave <= 4):
+                raise DelegationConflictError("Invalid root authority v2 bounds")
+            if ("research", "analysis") not in root_auth.allowed_delegation_edges:
+                raise DelegationConflictError("Invalid root authority edges")
+
+            if (
+                type(grant.max_depth) is bool
+                or grant.max_depth != 1
+                or type(grant.max_waves) is bool
+                or grant.max_waves != 1
+                or type(grant.max_children) is bool
+                or grant.fencing_epoch != expected_epoch
+                or grant.root_task_id != clean_task_id
+                or grant.source_capability != "research"
+                or grant.target_capability != "analysis"
+            ):
+                raise DelegationConflictError("Invalid delegation grant bounds")
+            if grant.version == 1:
+                if root_auth.version != 1 or grant.max_children != 1:
+                    raise DelegationConflictError("v1 grant requires v1 root authority and max_children=1")
+            elif grant.version == 2:
+                if root_auth.version != 2 or not (2 <= grant.max_children <= root_auth.max_children_per_wave <= 4):
+                    raise DelegationConflictError("v2 grant requires v2 root authority within bounds")
+            else:
+                raise DelegationConflictError(f"Unsupported grant version: {grant.version}")
+
             key = (grant.root_task_id, grant.grant_id)
             if key in self.authority_grants and self.authority_grants[key] != grant:
                 raise ConflictingAuthorityGrantError(
@@ -884,6 +938,313 @@ class InMemoryAuthoritativeTaskStore(AuthoritativeTaskStore):
         grants.add(proposal.delegation_grant_id)
         self.delegation_decisions.setdefault(clean_parent, set()).add(proposal.delegation_decision_id)
         self.hints.append(wake_up_hint)
+
+        return (proposal, False)
+
+    async def get_delegation_wave_proposal(
+        self,
+        parent_task_id: str,
+        proposal_id: str,
+    ) -> DelegationWaveProposalRecord | None:
+        return self.wave_proposals.get((parent_task_id.strip(), proposal_id.strip()))
+
+    async def get_accepted_delegation_wave(
+        self,
+        parent_task_id: str,
+        wave_id: str,
+    ) -> AcceptedDelegationWave | None:
+        return self.accepted_waves.get((parent_task_id.strip(), wave_id.strip()))
+
+    async def get_wave_yield(
+        self,
+        parent_task_id: str,
+        assignment_id: str,
+    ) -> WaveYieldRecord | None:
+        rec = self.yield_records.get((parent_task_id.strip(), assignment_id.strip()))
+        return rec if isinstance(rec, WaveYieldRecord) else None
+
+    async def get_child_claim_deadline(
+        self,
+        child_task_id: str,
+    ) -> str | None:
+        return self.claim_deadlines.get(child_task_id.strip())
+
+    async def accept_delegation_wave(
+        self,
+        parent_task_id: str,
+        proposal: DelegationWaveProposalRecord,
+        accepted_wave: AcceptedDelegationWave,
+        child_task_inputs: Sequence[TaskInput],
+        parent_continuation: TaskContinuationV2,
+        yield_record: WaveYieldRecord,
+        wake_up_hints: Sequence[WakeUpHint],
+        expected_fencing_epoch: int,
+        now: str,
+    ) -> tuple[DelegationWaveProposalRecord, bool]:
+        clean_parent = parent_task_id.strip()
+        proposal_key = (clean_parent, proposal.proposal_id.strip())
+
+        # Phase 1: Replay check (validate full stored projection)
+        existing = self.wave_proposals.get(proposal_key)
+        if existing is not None:
+            if not (
+                existing.assignment_id == proposal.assignment_id
+                and existing.runtime_principal_id == proposal.runtime_principal_id
+                and existing.bound_agent_id == proposal.bound_agent_id
+                and existing.parent_task_id == clean_parent
+                and existing.proposal_id == proposal.proposal_id
+                and existing.proposal_fingerprint == proposal.proposal_fingerprint
+                and existing.fencing_epoch == expected_fencing_epoch
+            ):
+                raise DelegationConflictError(
+                    f"Conflicting wave proposal replay for proposal '{proposal.proposal_id}'"
+                )
+
+            sw = self.accepted_waves.get((clean_parent, existing.wave_id))
+            sc = self.continuations.get((clean_parent, 2))
+            sl = self.latest_continuation.get(clean_parent)
+            sps = self.statuses.get(clean_parent)
+            sy = self.yield_records.get((clean_parent, existing.assignment_id))
+            s_children = self.children.get(clean_parent)
+            if (
+                sw is None
+                or sw.wave_id != existing.wave_id
+                or sw.parent_task_id != clean_parent
+                or sw.required_child_task_ids != existing.required_child_task_ids
+                or sw.barrier_policy != existing.barrier_policy
+                or sw.required_success_fraction != existing.required_success_fraction
+                or sw.required_success_count != existing.required_success_count
+                or sw.accepted_at != existing.accepted_at
+                or sw.wave_deadline != existing.wave_deadline
+                or sw.state != "unresolved"
+                or not isinstance(sc, TaskContinuationV2)
+                or sc.parent_task_id != clean_parent
+                or sc.wave_id != existing.wave_id
+                or sc.required_child_task_ids != existing.required_child_task_ids
+                or sc.continuation_version != 2
+                or sc.version != 2
+                or sc.state != "active"
+                or sc.wave_resolution is not None
+                or sl != 2
+                or sps != "waiting_for_children"
+                or not isinstance(sy, WaveYieldRecord)
+                or sy.wave_id != existing.wave_id
+                or sy.assignment_id != existing.assignment_id
+                or sy.proposal_id != existing.proposal_id
+                or sy.parent_task_id != clean_parent
+                or sy.delegation_decision_id != existing.delegation_decision_id
+                or sy.required_child_task_ids != existing.required_child_task_ids
+                or sy.continuation_version != 2
+                or s_children is None
+                or len(s_children) != len(existing.required_child_task_ids)
+                or tuple(sorted(s_children)) != existing.required_child_task_ids
+            ):
+                raise CorruptAuthoritativeRecordError(
+                    f"Corrupt stored wave projection for proposal '{proposal.proposal_id}'"
+                )
+            for cid in existing.required_child_task_ids:
+                cl = self.lineages.get(cid)
+                cc = self.required_capabilities.get(cid)
+                ci = self.inputs.get((cid, 1))
+                if (
+                    self.statuses.get(cid) != "pending"
+                    or cl is None
+                    or cl.task_id != cid
+                    or cl.parent_task_id != clean_parent
+                    or cl.root_task_id != clean_parent
+                    or cc is None
+                    or cc.required_capability != "analysis"
+                    or ci is None
+                    or ci.task_id != cid
+                    or ci.input_version != 1
+                    or self.claim_deadlines.get(cid) != existing.child_claim_deadline
+                    or self.fences.get(cid) != 0
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"Corrupt child projection '{cid}' for proposal '{proposal.proposal_id}'"
+                    )
+            return (existing, True)
+
+        # Phase 1: Validations (zero mutations)
+        cur_status = self.statuses.get(clean_parent)
+        if not cur_status:
+            raise ParentTaskNotFoundError(f"Parent task '{clean_parent}' not found")
+        if cur_status != "working":
+            raise TaskNotClaimableError(
+                f"Parent task '{clean_parent}' must be in 'working' status, got '{cur_status}'"
+            )
+
+        waves = self.consumed_waves.get(clean_parent, set())
+        if "1" in waves:
+            raise WaveBudgetExceededError(f"Wave budget exceeded for parent task '{clean_parent}'")
+
+        grants = self.consumed_grants.get(clean_parent, set())
+        if proposal.delegation_grant_id in grants:
+            raise GrantAlreadyConsumedError(
+                f"Authority grant '{proposal.delegation_grant_id}' has already been consumed"
+            )
+
+        if len(self.children.get(clean_parent, set())) >= 1:
+            raise WaveBudgetExceededError(f"Child limit exceeded for parent task '{clean_parent}'")
+
+        claim = self.claims.get(clean_parent)
+        if not claim:
+            raise ClaimNotFoundError(f"Active claim for parent task '{clean_parent}' not found")
+        if claim.assignment_id != proposal.assignment_id or claim.runtime_principal_id != proposal.runtime_principal_id:
+            raise ClaimNotFoundError("Assignment ID or principal mismatch on parent claim")
+        if claim.bound_agent_id != proposal.bound_agent_id:
+            raise ClaimNotFoundError("Bound agent mismatch on parent claim")
+        if claim.state != "acknowledged":
+            raise TaskNotClaimableError("Parent assignment must be acknowledged before proposing delegation wave")
+        if claim.assigned_capability != "research":
+            raise CapabilityMismatchError("Only research assignments may propose delegation wave")
+        if claim.execution_kind != "initial":
+            raise TaskNotClaimableError("Only initial research root claims may propose delegation wave")
+
+        cur_fence = self.fences.get(clean_parent, 0)
+        if cur_fence != expected_fencing_epoch or claim.fencing_epoch != expected_fencing_epoch:
+            raise FencingEpochRaceError(
+                f"Fencing epoch mismatch for parent task '{clean_parent}': expected {expected_fencing_epoch}, current {cur_fence}"
+            )
+
+        parent_lineage = self.lineages.get(clean_parent)
+        if (
+            not parent_lineage
+            or not parent_lineage.is_root
+            or parent_lineage.task_id != clean_parent
+            or parent_lineage.root_task_id != clean_parent
+            or bool(parent_lineage.parent_task_id)
+        ):
+            raise TaskNotClaimableError(f"Parent task '{clean_parent}' is not an eligible root task")
+
+        root_auth = self.authorities.get(clean_parent)
+        if not root_auth:
+            raise ParentTaskNotFoundError(f"Root authority record for '{clean_parent}' not found")
+        if root_auth.root_task_id != clean_parent:
+            raise DelegationConflictError("Root authority binding mismatch")
+        child_count = len(accepted_wave.required_child_task_ids)
+        if (
+            root_auth.version != 2
+            or root_auth.max_delegation_depth != 1
+            or root_auth.max_delegation_waves != 1
+            or not (2 <= root_auth.max_children_per_wave <= 4)
+            or child_count > root_auth.max_children_per_wave
+        ):
+            raise WaveBudgetExceededError("Root authority v2 wave policy bounds violation")
+        if ("research", "analysis") not in root_auth.allowed_delegation_edges:
+            raise DelegationConflictError("Delegation edge research->analysis not permitted by root authority")
+
+        grant_rec = self.authority_grants.get((clean_parent, proposal.delegation_grant_id))
+        if not grant_rec:
+            raise ParentTaskNotFoundError(f"Delegation grant '{proposal.delegation_grant_id}' not found")
+        if grant_rec.grant_id != proposal.delegation_grant_id:
+            raise DelegationConflictError("Delegation grant ID mismatch")
+        if grant_rec.root_task_id != clean_parent:
+            raise DelegationConflictError("Delegation grant root task binding mismatch")
+        if grant_rec.issued_to_assignment_id != proposal.assignment_id:
+            raise ClaimNotFoundError("Delegation grant issued assignment mismatch")
+        if grant_rec.issued_to_principal_id != proposal.runtime_principal_id:
+            raise ClaimNotFoundError("Delegation grant issued principal mismatch")
+        if not claim.turn_id or not grant_rec.turn_id or grant_rec.turn_id != claim.turn_id:
+            raise ClaimNotFoundError("Delegation grant turn mismatch")
+        if grant_rec.source_capability != "research" or grant_rec.target_capability != "analysis":
+            raise CapabilityMismatchError("Delegation grant capability mismatch")
+        if grant_rec.fencing_epoch != expected_fencing_epoch:
+            raise FencingEpochRaceError("Delegation grant fencing epoch mismatch")
+        if (
+            grant_rec.version != 2
+            or grant_rec.max_depth != 1
+            or grant_rec.max_waves != 1
+            or not (2 <= grant_rec.max_children <= root_auth.max_children_per_wave)
+            or child_count > grant_rec.max_children
+        ):
+            raise WaveBudgetExceededError("Delegation grant v2 bounds violation")
+
+        inputs_by_id = {ti.task_id: ti for ti in child_task_inputs}
+        hints_by_id = {h.task_id: h for h in wake_up_hints}
+        if tuple(sorted(inputs_by_id.keys())) != accepted_wave.required_child_task_ids:
+            raise DelegationConflictError("child_task_inputs IDs must match accepted_wave")
+        if tuple(sorted(hints_by_id.keys())) != accepted_wave.required_child_task_ids:
+            raise DelegationConflictError("wake_up_hints IDs must match accepted_wave")
+        if (
+            parent_continuation.wave_id != accepted_wave.wave_id
+            or parent_continuation.parent_task_id != clean_parent
+            or parent_continuation.required_child_task_ids != accepted_wave.required_child_task_ids
+            or parent_continuation.continuation_version != 2
+            or parent_continuation.version != 2
+            or parent_continuation.state != "active"
+        ):
+            raise DelegationConflictError("TaskContinuationV2 inconsistent with accepted wave")
+
+        for ti in child_task_inputs:
+            if not ti.artifact_references:
+                raise ValueError("Child task input must reference at least one sealed artifact")
+            art_ref = ti.artifact_references[0]
+            art = self.artifacts.get((art_ref.producing_task_id, art_ref.artifact_id, art_ref.artifact_version))
+            if not art or not art.sealed:
+                raise ValueError("Referenced artifact not found or not sealed")
+            if art.producing_task_id != clean_parent:
+                raise ValueError("Artifact producing task mismatch")
+            if art.artifact_type != "research_material":
+                raise ValueError(f"Artifact type must be research_material, got {art.artifact_type}")
+            if art.producing_turn_id != claim.turn_id:
+                raise ValueError("Artifact producing_turn_id does not match active claim turn_id")
+
+        parent_input = self.inputs.get((clean_parent, parent_continuation.input_version))
+        if parent_input is None:
+            raise ValueError(f"Parent TaskInput version {parent_continuation.input_version} not found")
+
+        if (clean_parent, accepted_wave.wave_id) in self.accepted_waves:
+            raise ConflictingChildTaskRegistrationError("Accepted wave already exists")
+        if (clean_parent, 2) in self.continuations or clean_parent in self.latest_continuation:
+            raise ConflictingContinuationError(f"Continuation already exists for task '{clean_parent}'")
+        if (clean_parent, yield_record.assignment_id) in self.yield_records:
+            raise ConflictingChildTaskRegistrationError(f"Yield record for '{clean_parent}' already exists")
+        for clean_child in accepted_wave.required_child_task_ids:
+            if (
+                clean_child in self.statuses
+                or clean_child in self.lineages
+                or clean_child in self.required_capabilities
+                or (clean_child, 1) in self.inputs
+                or clean_child in self.claim_deadlines
+                or clean_child in self.fences
+            ):
+                raise ConflictingChildTaskRegistrationError(f"Child task '{clean_child}' already exists")
+
+        # Phase 2: Commits
+        now_iso = (
+            normalize_canonical_utc_timestamp(now)
+            if (now and str(now).strip())
+            else normalize_canonical_utc_timestamp(datetime.now(UTC))
+        )
+        self.wave_proposals[proposal_key] = proposal
+        self.accepted_waves[(clean_parent, accepted_wave.wave_id)] = accepted_wave
+        for clean_child in accepted_wave.required_child_task_ids:
+            self.statuses[clean_child] = "pending"
+            self.claim_deadlines[clean_child] = proposal.child_claim_deadline
+            self.fences[clean_child] = 0
+            self.required_capabilities[clean_child] = RequiredCapabilityRecord(
+                task_id=clean_child,
+                required_capability="analysis",
+                created_at=now_iso,
+                version=1,
+            )
+            self.lineages[clean_child] = TaskLineage(
+                task_id=clean_child,
+                root_task_id=parent_lineage.root_task_id,
+                parent_task_id=clean_parent,
+            )
+            self.inputs[(clean_child, 1)] = inputs_by_id[clean_child]
+            self.children.setdefault(clean_parent, set()).add(clean_child)
+            self.hints.append(hints_by_id[clean_child])
+        self.continuations[(clean_parent, 2)] = parent_continuation
+        self.latest_continuation[clean_parent] = 2
+        self.statuses[clean_parent] = "waiting_for_children"
+        del self.claims[clean_parent]
+        self.yield_records[(clean_parent, yield_record.assignment_id)] = yield_record
+        self.consumed_waves.setdefault(clean_parent, set()).add("1")
+        self.consumed_grants.setdefault(clean_parent, set()).add(proposal.delegation_grant_id)
+        self.delegation_decisions.setdefault(clean_parent, set()).add(proposal.delegation_decision_id)
 
         return (proposal, False)
 

@@ -1,6 +1,8 @@
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from agent_contracts import (
+    AcceptedDelegationWave,
     ActiveClaim,
     AgentCandidate,
     AgentEvent,
@@ -10,7 +12,9 @@ from agent_contracts import (
     CompletionCommand,
     CompletionRecord,
     DelegationGrant,
+    DelegationGrantV2,
     DelegationProposalRecord,
+    DelegationWaveProposalRecord,
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
     RequiredCapabilityRecord,
@@ -18,11 +22,13 @@ from agent_contracts import (
     RoutingDecision,
     StageArtifact,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskRequested,
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveYieldRecord,
 )
 
 from orchestrator.domain.advisor import AdvisorRecommendation
@@ -206,17 +212,19 @@ class AuthoritativeTaskStore(Protocol):
 
     async def get_continuation(
         self, parent_task_id: str, continuation_version: int = 1
-    ) -> TaskContinuation | None: ...
+    ) -> TaskContinuation | TaskContinuationV2 | None: ...
+
+    async def get_latest_continuation_version(self, parent_task_id: str) -> int | None: ...
 
     async def save_root_authority(self, authority: RootAuthorityRecord) -> None: ...
 
     async def get_root_authority(self, root_task_id: str) -> RootAuthorityRecord | None: ...
 
-    async def save_authority_grant(self, grant: DelegationGrant) -> None: ...
+    async def save_authority_grant(self, grant: DelegationGrant | DelegationGrantV2) -> None: ...
 
     async def get_authority_grant(
         self, root_task_id: str, grant_id: str
-    ) -> DelegationGrant | None: ...
+    ) -> DelegationGrant | DelegationGrantV2 | None: ...
 
     async def save_active_claim(self, claim: ActiveClaim) -> None: ...
 
@@ -228,7 +236,7 @@ class AuthoritativeTaskStore(Protocol):
         self,
         task_id: str,
         claim: ActiveClaim,
-        grant: DelegationGrant | None = None,
+        grant: DelegationGrant | DelegationGrantV2 | None = None,
         now: str = "",
         expected_continuation_version: int = -1,
         is_root: bool = True,
@@ -319,6 +327,55 @@ class AuthoritativeTaskStore(Protocol):
         proposal_id: str,
     ) -> DelegationProposalRecord | None:
         """Retrieve an accepted delegation proposal record by parent_task_id and proposal_id."""
+        ...
+
+    async def accept_delegation_wave(
+        self,
+        parent_task_id: str,
+        proposal: DelegationWaveProposalRecord,
+        accepted_wave: AcceptedDelegationWave,
+        child_task_inputs: Sequence[TaskInput],
+        parent_continuation: TaskContinuationV2,
+        yield_record: WaveYieldRecord,
+        wake_up_hints: Sequence[WakeUpHint],
+        expected_fencing_epoch: int,
+        now: str,
+    ) -> tuple[DelegationWaveProposalRecord, bool]:
+        """Atomically accept a bounded multi-child research -> analysis delegation wave.
+
+        Returns (accepted_wave_proposal_record, is_replay).
+        """
+        ...
+
+    async def get_delegation_wave_proposal(
+        self,
+        parent_task_id: str,
+        proposal_id: str,
+    ) -> DelegationWaveProposalRecord | None:
+        """Retrieve an accepted wave proposal record by parent_task_id and proposal_id."""
+        ...
+
+    async def get_accepted_delegation_wave(
+        self,
+        parent_task_id: str,
+        wave_id: str,
+    ) -> AcceptedDelegationWave | None:
+        """Retrieve an accepted delegation wave record by parent_task_id and wave_id."""
+        ...
+
+    async def get_wave_yield(
+        self,
+        parent_task_id: str,
+        assignment_id: str,
+    ) -> WaveYieldRecord | None:
+        """Retrieve a persisted wave yield record by parent_task_id and assignment_id."""
+        ...
+
+    async def get_child_claim_deadline(
+        self,
+        child_task_id: str,
+    ) -> str | None:
+        """Retrieve a child task's authoritative claim deadline."""
         ...
 
 

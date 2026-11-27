@@ -390,20 +390,32 @@ def test_narrowed_replay_rule_denial_fails_health() -> None:
 def _write_full_envelope_state(cluster: LiveRedisAclCluster) -> None:
     """Exercise qualifying RedisGateway paths covering every projection selector and +select."""
     from agent_contracts import (
+        MAX_WAVE_DURATION_SECONDS,
+        MIN_WAVE_DURATION_SECONDS,
+        AcceptedDelegationWave,
         ActiveClaim,
         ArtifactReference,
         AssignmentYieldRecord,
         CompletionCommand,
         DelegationGrant,
+        DelegationGrantV2,
         DelegationProposalRecord,
+        DelegationWaveProposalItem,
+        DelegationWaveProposalRecord,
+        DelegationWaveProposalRequest,
         RecoveryDecisionCommand,
+        RootAuthorityRecord,
         StageArtifact,
         TaskContinuation,
+        TaskContinuationV2,
         TaskInput,
         TaskRequested,
         TaskResult,
         WakeUpHint,
+        WaveYieldRecord,
         compute_proposal_fingerprint,
+        compute_wave_proposal_fingerprint,
+        derive_wave_deadline,
     )
     from orchestrator.infrastructure.redis_adapter import RedisGateway
 
@@ -675,6 +687,196 @@ def _write_full_envelope_state(cluster: LiveRedisAclCluster) -> None:
             )
             await gw.resolve_expired_claim(
                 rec_cmd, operator_principal_id="operator-1", now=future_resolve
+            )
+
+            # Accept bounded multi-child delegation wave -> task.delegation_wave_proposal:*, task.delegation_wave:*
+            wave_parent_id = "task-env-wave-parent"
+            await gw.register_root_task(
+                TaskRequested(
+                    task_id=wave_parent_id,
+                    root_task_id=wave_parent_id,
+                    parent_task_id=None,
+                    prompt="Envelope wave parent",
+                    created_at=t0,
+                    version=2,
+                ),
+                initial_status="pending",
+                required_capability="research",
+            )
+            auth_set = cluster.admin_cli(
+                "SET",
+                f"task.authority:{wave_parent_id}",
+                RootAuthorityRecord.create_wave_baseline(
+                    wave_parent_id, max_children_per_wave=2, created_at=t0
+                ).to_json(),
+            )
+            assert auth_set.returncode == 0, auth_set.combined
+            wave_grant = DelegationGrantV2(
+                grant_id="grant-env-wave-1",
+                root_task_id=wave_parent_id,
+                issued_to_assignment_id="assign-env-wave-1",
+                issued_to_principal_id="principal-research-1",
+                fencing_epoch=1,
+                turn_id="turn-env-wave-1",
+                issued_at=t0,
+                max_children=2,
+            )
+            wave_claim = ActiveClaim(
+                task_id=wave_parent_id,
+                assignment_id="assign-env-wave-1",
+                claim_id="claim-env-wave-1",
+                root_task_id=wave_parent_id,
+                turn_id="turn-env-wave-1",
+                runtime_principal_id="principal-research-1",
+                bound_agent_id="research-agent-1",
+                assigned_capability="research",
+                execution_kind="initial",
+                fencing_epoch=1,
+                proof_digest="d" * 64,
+                request_id="req-env-wave-1",
+                claimed_at=t0,
+                delivery_expires_at=future_lease,
+                delegation_grant_id="grant-env-wave-1",
+                prior_claimable_status="pending",
+            )
+            await gw.atomic_claim_task(wave_parent_id, wave_claim, grant=wave_grant, now=t0)
+            await gw.acknowledge_claim(
+                wave_parent_id, "assign-env-wave-1", "principal-research-1", t0
+            )
+            wave_art = StageArtifact(
+                artifact_id="art-env-wave-1",
+                producing_task_id=wave_parent_id,
+                artifact_type="research_material",
+                content={"material": "envelope wave artifact"},
+                created_at=t0,
+                producing_turn_id="turn-env-wave-1",
+                artifact_version=1,
+                payload_schema_version=1,
+                sealed=True,
+                metadata={"turn_id": "turn-env-wave-1"},
+            )
+            await gw.save_stage_artifact(
+                wave_art, "assign-env-wave-1", "principal-research-1", 1
+            )
+            wave_art_ref = ArtifactReference(
+                artifact_id="art-env-wave-1",
+                producing_task_id=wave_parent_id,
+                artifact_version=1,
+            )
+            wave_req = DelegationWaveProposalRequest(
+                proposal_id="prop-env-wave-1",
+                items=(
+                    DelegationWaveProposalItem(
+                        item_id="item-1",
+                        child_intent="Analyze wave branch 1",
+                        artifact_reference=wave_art_ref,
+                    ),
+                    DelegationWaveProposalItem(
+                        item_id="item-2",
+                        child_intent="Analyze wave branch 2",
+                        artifact_reference=wave_art_ref,
+                    ),
+                ),
+                barrier_policy="WAIT_ALL",
+            )
+            wave_child_ids = ("task-env-wave-child-1", "task-env-wave-child-2")
+            wave_deadline_derivation = derive_wave_deadline(
+                work_complexity=wave_req.work_complexity,
+                uncertainty_level=wave_req.uncertainty_level,
+                required_child_count=len(wave_req.items),
+                planned_parallelism=wave_req.planned_parallelism or len(wave_req.items),
+                min_duration_seconds=MIN_WAVE_DURATION_SECONDS,
+                max_duration_seconds=MAX_WAVE_DURATION_SECONDS,
+                accepted_at=t0,
+            )
+            accepted_wave = AcceptedDelegationWave(
+                wave_id="wave-env-1",
+                parent_task_id=wave_parent_id,
+                required_child_task_ids=wave_child_ids,
+                barrier_policy=wave_req.barrier_policy,
+                deadline_derivation=wave_deadline_derivation,
+                accepted_at=t0,
+            )
+            wave_fp = compute_wave_proposal_fingerprint(
+                parent_task_id=wave_parent_id,
+                assignment_id="assign-env-wave-1",
+                request=wave_req,
+            )
+            wave_proposal_record = DelegationWaveProposalRecord(
+                parent_task_id=wave_parent_id,
+                proposal_id=wave_req.proposal_id,
+                wave_id=accepted_wave.wave_id,
+                delegation_decision_id="dec-env-wave-1",
+                assignment_id="assign-env-wave-1",
+                runtime_principal_id="principal-research-1",
+                bound_agent_id="research-agent-1",
+                fencing_epoch=1,
+                proof_digest="d" * 64,
+                proposal_fingerprint=wave_fp,
+                delegation_grant_id="grant-env-wave-1",
+                required_child_task_ids=wave_child_ids,
+                barrier_policy=accepted_wave.barrier_policy,
+                required_success_fraction=accepted_wave.required_success_fraction,
+                required_success_count=accepted_wave.required_success_count,
+                accepted_at=t0,
+                wave_deadline=accepted_wave.wave_deadline or wave_deadline_derivation.wave_deadline,
+                child_claim_deadline=future_now,
+            )
+            wave_cont = TaskContinuationV2(
+                parent_task_id=wave_parent_id,
+                wave_id=accepted_wave.wave_id,
+                required_child_task_ids=wave_child_ids,
+                created_at=t0,
+                updated_at=t0,
+                input_version=1,
+                continuation_capability="research",
+                stage="incorporate_analysis_child",
+                control_fields={},
+                artifact_references=(wave_art_ref,),
+                continuation_version=2,
+                state="active",
+                wave_resolution=None,
+            )
+            wave_child_inputs = [
+                TaskInput(
+                    task_id=cid,
+                    prompt=item.child_intent,
+                    created_at=t0,
+                    input_version=1,
+                    artifact_references=(item.artifact_reference,),
+                )
+                for cid, item in zip(wave_child_ids, wave_req.items, strict=True)
+            ]
+            wave_hints = [
+                WakeUpHint(
+                    hint_id=f"hint-{cid}",
+                    capability="analysis",
+                    created_at=t0,
+                    execution_kind="delegated_child",
+                    task_id=cid,
+                )
+                for cid in wave_child_ids
+            ]
+            wave_yield_rec = WaveYieldRecord(
+                assignment_id="assign-env-wave-1",
+                parent_task_id=wave_parent_id,
+                principal_id="principal-research-1",
+                proposal_id=wave_req.proposal_id,
+                wave_id=accepted_wave.wave_id,
+                required_child_task_ids=wave_child_ids,
+                delegation_decision_id="dec-env-wave-1",
+                yielded_at=t0,
+            )
+            await gw.accept_delegation_wave(
+                parent_task_id=wave_parent_id,
+                proposal=wave_proposal_record,
+                accepted_wave=accepted_wave,
+                child_task_inputs=wave_child_inputs,
+                parent_continuation=wave_cont,
+                yield_record=wave_yield_rec,
+                wake_up_hints=wave_hints,
+                expected_fencing_epoch=1,
+                now=t0,
             )
         finally:
             await gw_legacy.aclose()

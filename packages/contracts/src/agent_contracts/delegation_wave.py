@@ -1,21 +1,64 @@
 import hashlib
 import json
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
+from .artifact_reference import ArtifactReference
+from .delegation_proposal import (
+    ALLOWED_CONTROL_FIELDS,
+    ALLOWED_TARGET_CAPABILITIES,
+    FORBIDDEN_AUTHORITY_FIELDS,
+)
 from .serialization import (
     canonical_json_dumps,
     check_no_credential_bearing_keys,
+    freeze_value,
     normalize_canonical_utc_timestamp,
+    to_plain_json_structure,
 )
 
 DELEGATION_WAVE_CONTRACT_VERSION: int = 1
+DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION: int = 2
+DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION: int = 2
+WAVE_YIELD_CONTRACT_VERSION: int = 2
 WAVE_DEADLINE_POLICY_CONTRACT_VERSION: int = 1
+
+MIN_WAVE_CHILDREN: int = 2
+MAX_WAVE_CHILDREN: int = 4
+MAX_WAVE_COUNT: int = 1
+MAX_WAVE_DEPTH: int = 1
+MAX_ACCEPTED_WAVE_BYTES: int = 16 * 1024
+MAX_CONTROL_RECORD_BYTES: int = 16 * 1024
+MAX_WAVE_IDENTIFIER_BYTES: int = 256
+MAX_ITEM_ID_BYTES: int = 128
+MAX_CHILD_INTENT_BYTES: int = 2000
+MAX_ITEM_CONTROL_FIELDS_BYTES: int = 4096
+MAX_FRACTION_VALUE: int = 10_000
+MIN_WAVE_DURATION_SECONDS: int = 30
+MAX_WAVE_DURATION_SECONDS: int = 3_600
+
+FORBIDDEN_WAVE_AUTHORITY_FIELDS: frozenset[str] = FORBIDDEN_AUTHORITY_FIELDS | frozenset({
+    "wave_id",
+    "wave_deadline",
+    "accepted_at",
+    "resolved_at",
+    "required_child_task_ids",
+    "required_success_count",
+    "state",
+    "resolution",
+    "lineage",
+    "claim",
+    "continuation",
+    "continuation_version",
+    "fence",
+    "execution_kind",
+    "decision",
+})
 
 WAVE_DEADLINE_POLICY_ID: str = "deterministic_bounded_baseline_v1"
 WAVE_DEADLINE_POLICY_VERSION: int = 1
@@ -79,6 +122,21 @@ def _require_nonempty_str(value: Any, field_name: str) -> str:
     return value.strip()
 
 
+def _require_utf8_bound(value: str, field_name: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{field_name} exceeds maximum UTF-8 byte bound of {max_bytes} bytes")
+    return value
+
+
+def _require_json_byte_bound(json_text: str, record_name: str, max_bytes: int = MAX_CONTROL_RECORD_BYTES) -> None:
+    byte_len = len(json_text.encode("utf-8"))
+    if byte_len > max_bytes:
+        raise ValueError(
+            f"{record_name} byte size ({byte_len} bytes) exceeds maximum bound of {max_bytes} bytes"
+        )
+
+
 def _normalize_wave_child_ids(raw_ids: Any, parent_task_id: str) -> tuple[str, ...]:
     if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence):
         raise TypeError(
@@ -119,6 +177,11 @@ class RequiredSuccessFraction:
     def __post_init__(self) -> None:
         num = _require_int(self.numerator, "numerator", minimum=1)
         den = _require_int(self.denominator, "denominator", minimum=1)
+        if num > MAX_FRACTION_VALUE or den > MAX_FRACTION_VALUE:
+            raise ValueError(
+                f"required_success_fraction numerator and denominator must be <= {MAX_FRACTION_VALUE}, "
+                f"got {num}/{den}"
+            )
         if num > den:
             raise ValueError(
                 f"required_success_fraction must be <= 1, got {num}/{den}"
@@ -279,9 +342,12 @@ class WaveDeadlineDerivation:
         clean_accepted = normalize_canonical_utc_timestamp(self.accepted_at)
         object.__setattr__(self, "accepted_at", clean_accepted)
 
-        expected_deadline = normalize_canonical_utc_timestamp(
-            datetime.fromisoformat(clean_accepted) + timedelta(seconds=expected_duration)
-        )
+        try:
+            expected_deadline = normalize_canonical_utc_timestamp(
+                datetime.fromisoformat(clean_accepted) + timedelta(seconds=expected_duration)
+            )
+        except OverflowError as exc:
+            raise ValueError("Wave deadline timestamp overflows supported datetime range") from exc
         clean_deadline = normalize_canonical_utc_timestamp(self.wave_deadline)
         if clean_deadline != expected_deadline:
             raise ValueError(
@@ -289,6 +355,7 @@ class WaveDeadlineDerivation:
                 f"accepted_at + derived_duration_seconds ({expected_deadline})"
             )
         object.__setattr__(self, "wave_deadline", clean_deadline)
+        _require_json_byte_bound(self.to_json(), "WaveDeadlineDerivation")
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -487,6 +554,13 @@ class AcceptedDelegationWave:
                 )
         object.__setattr__(self, "wave_deadline", self.deadline_derivation.wave_deadline)
 
+        byte_len = len(self.to_json().encode("utf-8"))
+        if byte_len > MAX_ACCEPTED_WAVE_BYTES:
+            raise ValueError(
+                f"AcceptedDelegationWave byte size ({byte_len} bytes) exceeds maximum bound "
+                f"of {MAX_ACCEPTED_WAVE_BYTES} bytes"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "accepted_at": self.accepted_at,
@@ -641,6 +715,7 @@ class ResolvedDelegationWave:
         object.__setattr__(
             self, "wave_deadline", normalize_canonical_utc_timestamp(self.wave_deadline)
         )
+        _require_json_byte_bound(self.to_json(), "ResolvedDelegationWave")
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -720,6 +795,732 @@ class ResolvedDelegationWave:
 
     @classmethod
     def from_json(cls, value: str) -> "ResolvedDelegationWave":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class DelegationWaveProposalItem:
+    """Single caller-supplied child intent within a bounded multi-child wave proposal."""
+
+    item_id: str
+    child_intent: str
+    artifact_reference: ArtifactReference
+    target_capability: str = "analysis"
+    control_fields: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        clean_item_id = _require_nonempty_str(self.item_id, "item_id")
+        _require_utf8_bound(clean_item_id, "item_id", MAX_ITEM_ID_BYTES)
+        object.__setattr__(self, "item_id", clean_item_id)
+
+        clean_cap = _require_nonempty_str(self.target_capability, "target_capability")
+        if clean_cap not in ALLOWED_TARGET_CAPABILITIES:
+            raise ValueError(
+                f"Unsupported target_capability '{clean_cap}'. Allowed: {sorted(ALLOWED_TARGET_CAPABILITIES)}"
+            )
+        object.__setattr__(self, "target_capability", clean_cap)
+
+        if not isinstance(self.child_intent, str):
+            raise TypeError(f"child_intent must be a str, got {type(self.child_intent).__name__}")
+        clean_intent = self.child_intent.strip()
+        if not clean_intent:
+            raise ValueError("child_intent must not be empty")
+        _require_utf8_bound(self.child_intent, "child_intent", MAX_CHILD_INTENT_BYTES)
+        _require_utf8_bound(clean_intent, "child_intent", MAX_CHILD_INTENT_BYTES)
+        object.__setattr__(self, "child_intent", clean_intent)
+
+        if not isinstance(self.artifact_reference, ArtifactReference):
+            raise TypeError(
+                f"artifact_reference must be an ArtifactReference, got {type(self.artifact_reference).__name__}"
+            )
+
+        if not isinstance(self.control_fields, Mapping):
+            raise TypeError(
+                f"control_fields must be a Mapping, got {type(self.control_fields).__name__}"
+            )
+        unexpected_controls = set(self.control_fields.keys()) - ALLOWED_CONTROL_FIELDS
+        if unexpected_controls:
+            raise ValueError(
+                f"Unexpected control_fields for delegation wave item: {sorted(unexpected_controls)}"
+            )
+        check_no_credential_bearing_keys(
+            dict(self.control_fields), "DelegationWaveProposalItem.control_fields"
+        )
+        frozen_controls = freeze_value(dict(self.control_fields))
+        _require_json_byte_bound(
+            canonical_json_dumps(to_plain_json_structure(frozen_controls)),
+            "DelegationWaveProposalItem.control_fields",
+            MAX_ITEM_CONTROL_FIELDS_BYTES,
+        )
+        object.__setattr__(self, "control_fields", frozen_controls)
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "artifact_reference": self.artifact_reference.to_dict(),
+            "child_intent": self.child_intent,
+            "control_fields": to_plain_json_structure(self.control_fields),
+            "item_id": self.item_id,
+            "target_capability": self.target_capability,
+        }
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalItem.to_dict")
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DelegationWaveProposalItem":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalItem payload")
+
+        forbidden = set(data.keys()) & FORBIDDEN_WAVE_AUTHORITY_FIELDS
+        if forbidden:
+            raise ValueError(f"Forbidden authority fields supplied by caller: {sorted(forbidden)}")
+
+        allowed = {
+            "artifact_reference",
+            "child_intent",
+            "control_fields",
+            "item_id",
+            "target_capability",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise ValueError(f"Unexpected fields in DelegationWaveProposalItem: {sorted(unexpected)}")
+
+        for req in ("item_id", "child_intent", "artifact_reference"):
+            if req not in data:
+                raise ValueError(f"{req} is required")
+
+        raw_ref = data["artifact_reference"]
+        if isinstance(raw_ref, ArtifactReference):
+            ref = raw_ref
+        elif isinstance(raw_ref, dict):
+            ref = ArtifactReference.from_dict(raw_ref)
+        else:
+            raise TypeError("artifact_reference must be a dict or ArtifactReference")
+
+        return cls(
+            item_id=data["item_id"],
+            child_intent=data["child_intent"],
+            artifact_reference=ref,
+            target_capability=data.get("target_capability", "analysis"),
+            control_fields=data.get("control_fields", {}),
+        )
+
+
+@dataclass(frozen=True)
+class DelegationWaveProposalRequest:
+    """Caller-supplied bounded multi-child delegation wave proposal (version 2)."""
+
+    proposal_id: str
+    items: tuple[DelegationWaveProposalItem, ...]
+    barrier_policy: str
+    required_success_fraction: RequiredSuccessFraction | None = None
+    work_complexity: str = "medium"
+    uncertainty_level: str = "low"
+    planned_parallelism: int | None = None
+    parent_input_version: int = 1
+    version: int = DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        clean_proposal_id = _require_nonempty_str(self.proposal_id, "proposal_id")
+        _require_utf8_bound(clean_proposal_id, "proposal_id", MAX_WAVE_IDENTIFIER_BYTES)
+        object.__setattr__(self, "proposal_id", clean_proposal_id)
+
+        if isinstance(self.items, (str, bytes)) or not isinstance(self.items, Sequence):
+            raise TypeError(f"items must be a sequence, got {type(self.items).__name__}")
+        if not (MIN_WAVE_CHILDREN <= len(self.items) <= MAX_WAVE_CHILDREN):
+            raise ValueError(
+                f"DelegationWaveProposalRequest items must contain {MIN_WAVE_CHILDREN} to "
+                f"{MAX_WAVE_CHILDREN} children, got {len(self.items)}"
+            )
+        parsed_items: list[DelegationWaveProposalItem] = []
+        seen_item_ids: set[str] = set()
+        for item in self.items:
+            parsed_item = (
+                item
+                if isinstance(item, DelegationWaveProposalItem)
+                else DelegationWaveProposalItem.from_dict(item)
+            )
+            if parsed_item.item_id in seen_item_ids:
+                raise ValueError(f"Duplicate item_id in wave proposal: '{parsed_item.item_id}'")
+            seen_item_ids.add(parsed_item.item_id)
+            parsed_items.append(parsed_item)
+        object.__setattr__(self, "items", tuple(parsed_items))
+
+        clean_policy, parsed_fraction, _ = _validate_barrier_and_threshold(
+            self.barrier_policy,
+            len(parsed_items),
+            self.required_success_fraction,
+            None,
+        )
+        object.__setattr__(self, "barrier_policy", clean_policy)
+        object.__setattr__(self, "required_success_fraction", parsed_fraction)
+
+        clean_complexity = _require_nonempty_str(self.work_complexity, "work_complexity")
+        if clean_complexity not in ALLOWED_WORK_COMPLEXITY_LEVELS:
+            raise ValueError(f"Unsupported work_complexity '{clean_complexity}'")
+        object.__setattr__(self, "work_complexity", clean_complexity)
+
+        clean_uncertainty = _require_nonempty_str(self.uncertainty_level, "uncertainty_level")
+        if clean_uncertainty not in ALLOWED_UNCERTAINTY_LEVELS:
+            raise ValueError(f"Unsupported uncertainty_level '{clean_uncertainty}'")
+        object.__setattr__(self, "uncertainty_level", clean_uncertainty)
+
+        parallelism = (
+            len(parsed_items)
+            if self.planned_parallelism is None
+            else _require_int(self.planned_parallelism, "planned_parallelism", minimum=1)
+        )
+        if parallelism > len(parsed_items):
+            raise ValueError(
+                f"planned_parallelism ({parallelism}) must be <= len(items) ({len(parsed_items)})"
+            )
+        object.__setattr__(self, "planned_parallelism", parallelism)
+
+        _require_int(self.parent_input_version, "parent_input_version", minimum=1)
+        _require_json_byte_bound(self.to_json(), "DelegationWaveProposalRequest")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "barrier_policy": self.barrier_policy,
+            "items": [item.to_dict() for item in self.items],
+            "parent_input_version": self.parent_input_version,
+            "planned_parallelism": self.planned_parallelism,
+            "proposal_id": self.proposal_id,
+            "required_success_fraction": (
+                self.required_success_fraction.to_dict()
+                if self.required_success_fraction is not None
+                else None
+            ),
+            "uncertainty_level": self.uncertainty_level,
+            "version": self.version,
+            "work_complexity": self.work_complexity,
+        }
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalRequest.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DelegationWaveProposalRequest":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalRequest payload")
+
+        forbidden = set(data.keys()) & FORBIDDEN_WAVE_AUTHORITY_FIELDS
+        if forbidden:
+            raise ValueError(f"Forbidden authority fields supplied by caller: {sorted(forbidden)}")
+
+        allowed = {
+            "barrier_policy",
+            "items",
+            "parent_input_version",
+            "planned_parallelism",
+            "proposal_id",
+            "required_success_fraction",
+            "uncertainty_level",
+            "version",
+            "work_complexity",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise ValueError(f"Unexpected fields in DelegationWaveProposalRequest: {sorted(unexpected)}")
+
+        for req in ("proposal_id", "items", "barrier_policy"):
+            if req not in data:
+                raise ValueError(f"{req} is required")
+
+        return cls(
+            proposal_id=data["proposal_id"],
+            items=data["items"],
+            barrier_policy=data["barrier_policy"],
+            required_success_fraction=data.get("required_success_fraction"),
+            work_complexity=data.get("work_complexity", "medium"),
+            uncertainty_level=data.get("uncertainty_level", "low"),
+            planned_parallelism=data.get("planned_parallelism"),
+            parent_input_version=data.get("parent_input_version", 1),
+            version=data.get("version", DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "DelegationWaveProposalRequest":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+def compute_wave_proposal_fingerprint(
+    *,
+    parent_task_id: str,
+    assignment_id: str,
+    request: DelegationWaveProposalRequest,
+) -> str:
+    """Compute deterministic canonical SHA-256 fingerprint over semantic wave proposal fields.
+
+    Preserves caller item order so reordering items changes the semantic fingerprint.
+    """
+    payload = {
+        "assignment_id": str(assignment_id).strip(),
+        "barrier_policy": request.barrier_policy,
+        "items": [item.to_dict() for item in request.items],
+        "parent_input_version": int(request.parent_input_version),
+        "parent_task_id": str(parent_task_id).strip(),
+        "planned_parallelism": int(request.planned_parallelism or len(request.items)),
+        "proposal_id": request.proposal_id,
+        "required_success_fraction": (
+            request.required_success_fraction.to_dict()
+            if request.required_success_fraction is not None
+            else None
+        ),
+        "uncertainty_level": request.uncertainty_level,
+        "version": request.version,
+        "work_complexity": request.work_complexity,
+    }
+    return hashlib.sha256(canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class DelegationWaveProposalRecord:
+    """Authoritative Redis-persisted replay record for an accepted multi-child wave proposal."""
+
+    parent_task_id: str
+    proposal_id: str
+    wave_id: str
+    delegation_decision_id: str
+    assignment_id: str
+    runtime_principal_id: str
+    bound_agent_id: str
+    fencing_epoch: int
+    proof_digest: str
+    proposal_fingerprint: str
+    delegation_grant_id: str
+    required_child_task_ids: tuple[str, ...]
+    barrier_policy: str
+    accepted_at: str
+    wave_deadline: str
+    child_claim_deadline: str
+    required_success_fraction: RequiredSuccessFraction | None = None
+    required_success_count: int | None = None
+    continuation_version: int = 2
+    version: int = DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        _require_int(self.fencing_epoch, "fencing_epoch", minimum=1)
+
+        for str_field in (
+            "parent_task_id",
+            "proposal_id",
+            "wave_id",
+            "delegation_decision_id",
+            "assignment_id",
+            "runtime_principal_id",
+            "bound_agent_id",
+            "proof_digest",
+            "proposal_fingerprint",
+            "delegation_grant_id",
+            "accepted_at",
+            "wave_deadline",
+            "child_claim_deadline",
+        ):
+            clean_val = _require_nonempty_str(getattr(self, str_field), str_field)
+            _require_utf8_bound(clean_val, str_field, MAX_WAVE_IDENTIFIER_BYTES)
+            object.__setattr__(self, str_field, clean_val)
+
+        clean_children = _normalize_wave_child_ids(
+            self.required_child_task_ids, self.parent_task_id
+        )
+        if not (MIN_WAVE_CHILDREN <= len(clean_children) <= MAX_WAVE_CHILDREN):
+            raise ValueError(
+                f"required_child_task_ids must contain {MIN_WAVE_CHILDREN} to {MAX_WAVE_CHILDREN} children"
+            )
+        object.__setattr__(self, "required_child_task_ids", clean_children)
+
+        clean_policy, parsed_fraction, derived_count = _validate_barrier_and_threshold(
+            self.barrier_policy,
+            len(clean_children),
+            self.required_success_fraction,
+            self.required_success_count,
+        )
+        object.__setattr__(self, "barrier_policy", clean_policy)
+        object.__setattr__(self, "required_success_fraction", parsed_fraction)
+        object.__setattr__(self, "required_success_count", derived_count)
+
+        cver = _require_int(self.continuation_version, "continuation_version", minimum=2)
+        if cver != 2:
+            raise ValueError(f"DelegationWaveProposalRecord continuation_version must be 2, got {cver}")
+
+        object.__setattr__(self, "accepted_at", normalize_canonical_utc_timestamp(self.accepted_at))
+        object.__setattr__(self, "wave_deadline", normalize_canonical_utc_timestamp(self.wave_deadline))
+        object.__setattr__(
+            self, "child_claim_deadline", normalize_canonical_utc_timestamp(self.child_claim_deadline)
+        )
+        _require_json_byte_bound(self.to_json(), "DelegationWaveProposalRecord")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "accepted_at": self.accepted_at,
+            "assignment_id": self.assignment_id,
+            "barrier_policy": self.barrier_policy,
+            "bound_agent_id": self.bound_agent_id,
+            "child_claim_deadline": self.child_claim_deadline,
+            "continuation_version": self.continuation_version,
+            "delegation_decision_id": self.delegation_decision_id,
+            "delegation_grant_id": self.delegation_grant_id,
+            "fencing_epoch": self.fencing_epoch,
+            "parent_task_id": self.parent_task_id,
+            "proof_digest": self.proof_digest,
+            "proposal_fingerprint": self.proposal_fingerprint,
+            "proposal_id": self.proposal_id,
+            "required_child_task_ids": list(self.required_child_task_ids),
+            "required_success_count": self.required_success_count,
+            "required_success_fraction": (
+                self.required_success_fraction.to_dict()
+                if self.required_success_fraction is not None
+                else None
+            ),
+            "runtime_principal_id": self.runtime_principal_id,
+            "version": self.version,
+            "wave_deadline": self.wave_deadline,
+            "wave_id": self.wave_id,
+        }
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalRecord.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DelegationWaveProposalRecord":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "DelegationWaveProposalRecord payload")
+        allowed = {
+            "accepted_at",
+            "assignment_id",
+            "barrier_policy",
+            "bound_agent_id",
+            "child_claim_deadline",
+            "continuation_version",
+            "delegation_decision_id",
+            "delegation_grant_id",
+            "fencing_epoch",
+            "parent_task_id",
+            "proof_digest",
+            "proposal_fingerprint",
+            "proposal_id",
+            "required_child_task_ids",
+            "required_success_count",
+            "required_success_fraction",
+            "runtime_principal_id",
+            "version",
+            "wave_deadline",
+            "wave_id",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(f"Unexpected fields in DelegationWaveProposalRecord: {sorted(unexpected)}")
+        for req in allowed - {
+            "continuation_version",
+            "required_success_count",
+            "required_success_fraction",
+            "version",
+        }:
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            parent_task_id=data["parent_task_id"],
+            proposal_id=data["proposal_id"],
+            wave_id=data["wave_id"],
+            delegation_decision_id=data["delegation_decision_id"],
+            assignment_id=data["assignment_id"],
+            runtime_principal_id=data["runtime_principal_id"],
+            bound_agent_id=data["bound_agent_id"],
+            fencing_epoch=data["fencing_epoch"],
+            proof_digest=data["proof_digest"],
+            proposal_fingerprint=data["proposal_fingerprint"],
+            delegation_grant_id=data["delegation_grant_id"],
+            required_child_task_ids=data["required_child_task_ids"],
+            barrier_policy=data["barrier_policy"],
+            accepted_at=data["accepted_at"],
+            wave_deadline=data["wave_deadline"],
+            child_claim_deadline=data["child_claim_deadline"],
+            required_success_fraction=data.get("required_success_fraction"),
+            required_success_count=data.get("required_success_count"),
+            continuation_version=data.get("continuation_version", 2),
+            version=data.get("version", DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "DelegationWaveProposalRecord":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class WaveYieldRecord:
+    """Authoritative audit record created when an active assignment yields turn for a delegation wave."""
+
+    assignment_id: str
+    parent_task_id: str
+    principal_id: str
+    proposal_id: str
+    wave_id: str
+    required_child_task_ids: tuple[str, ...]
+    delegation_decision_id: str
+    yielded_at: str
+    yield_reason: str = "delegation_wave"
+    continuation_version: int = 2
+    version: int = WAVE_YIELD_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != WAVE_YIELD_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        for str_field in (
+            "assignment_id",
+            "parent_task_id",
+            "principal_id",
+            "proposal_id",
+            "wave_id",
+            "delegation_decision_id",
+            "yield_reason",
+            "yielded_at",
+        ):
+            object.__setattr__(self, str_field, _require_nonempty_str(getattr(self, str_field), str_field))
+
+        if self.yield_reason != "delegation_wave":
+            raise ValueError(f"Unsupported yield_reason: '{self.yield_reason}'")
+
+        clean_children = _normalize_wave_child_ids(
+            self.required_child_task_ids, self.parent_task_id
+        )
+        object.__setattr__(self, "required_child_task_ids", clean_children)
+
+        cver = _require_int(self.continuation_version, "continuation_version", minimum=2)
+        if cver != 2:
+            raise ValueError(f"WaveYieldRecord continuation_version must be 2, got {cver}")
+
+        object.__setattr__(self, "yielded_at", normalize_canonical_utc_timestamp(self.yielded_at))
+        _require_json_byte_bound(self.to_json(), "WaveYieldRecord")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "assignment_id": self.assignment_id,
+            "continuation_version": self.continuation_version,
+            "delegation_decision_id": self.delegation_decision_id,
+            "parent_task_id": self.parent_task_id,
+            "principal_id": self.principal_id,
+            "proposal_id": self.proposal_id,
+            "required_child_task_ids": list(self.required_child_task_ids),
+            "version": self.version,
+            "wave_id": self.wave_id,
+            "yield_reason": self.yield_reason,
+            "yielded_at": self.yielded_at,
+        }
+        check_no_credential_bearing_keys(data, "WaveYieldRecord.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WaveYieldRecord":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "WaveYieldRecord payload")
+        allowed = {
+            "assignment_id",
+            "continuation_version",
+            "delegation_decision_id",
+            "parent_task_id",
+            "principal_id",
+            "proposal_id",
+            "required_child_task_ids",
+            "version",
+            "wave_id",
+            "yield_reason",
+            "yielded_at",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(f"Unexpected fields in WaveYieldRecord: {sorted(unexpected)}")
+        for req in allowed - {"yield_reason", "continuation_version", "version"}:
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            assignment_id=data["assignment_id"],
+            parent_task_id=data["parent_task_id"],
+            principal_id=data["principal_id"],
+            proposal_id=data["proposal_id"],
+            wave_id=data["wave_id"],
+            required_child_task_ids=data["required_child_task_ids"],
+            delegation_decision_id=data["delegation_decision_id"],
+            yielded_at=data["yielded_at"],
+            yield_reason=data.get("yield_reason", "delegation_wave"),
+            continuation_version=data.get("continuation_version", 2),
+            version=data.get("version", WAVE_YIELD_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "WaveYieldRecord":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class DelegationWaveResponse:
+    """Platform response returned on successful multi-child wave acceptance or replay."""
+
+    parent_task_id: str
+    proposal_id: str
+    wave_id: str
+    delegation_decision_id: str
+    required_child_task_ids: tuple[str, ...]
+    barrier_policy: str
+    accepted_at: str
+    wave_deadline: str
+    child_claim_deadline: str
+    required_success_fraction: RequiredSuccessFraction | None = None
+    required_success_count: int | None = None
+    continuation_version: int = 2
+    status: str = "accepted"
+    version: int = DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        for str_field in (
+            "parent_task_id",
+            "proposal_id",
+            "wave_id",
+            "delegation_decision_id",
+            "accepted_at",
+            "wave_deadline",
+            "child_claim_deadline",
+            "status",
+        ):
+            object.__setattr__(self, str_field, _require_nonempty_str(getattr(self, str_field), str_field))
+
+        clean_children = _normalize_wave_child_ids(
+            self.required_child_task_ids, self.parent_task_id
+        )
+        object.__setattr__(self, "required_child_task_ids", clean_children)
+
+        clean_policy, parsed_fraction, derived_count = _validate_barrier_and_threshold(
+            self.barrier_policy,
+            len(clean_children),
+            self.required_success_fraction,
+            self.required_success_count,
+        )
+        object.__setattr__(self, "barrier_policy", clean_policy)
+        object.__setattr__(self, "required_success_fraction", parsed_fraction)
+        object.__setattr__(self, "required_success_count", derived_count)
+
+        cver = _require_int(self.continuation_version, "continuation_version", minimum=2)
+        if cver != 2:
+            raise ValueError(f"DelegationWaveResponse continuation_version must be 2, got {cver}")
+        object.__setattr__(self, "accepted_at", normalize_canonical_utc_timestamp(self.accepted_at))
+        object.__setattr__(self, "wave_deadline", normalize_canonical_utc_timestamp(self.wave_deadline))
+        object.__setattr__(
+            self, "child_claim_deadline", normalize_canonical_utc_timestamp(self.child_claim_deadline)
+        )
+        _require_json_byte_bound(self.to_json(), "DelegationWaveResponse")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "accepted_at": self.accepted_at,
+            "barrier_policy": self.barrier_policy,
+            "child_claim_deadline": self.child_claim_deadline,
+            "continuation_version": self.continuation_version,
+            "delegation_decision_id": self.delegation_decision_id,
+            "parent_task_id": self.parent_task_id,
+            "proposal_id": self.proposal_id,
+            "required_child_task_ids": list(self.required_child_task_ids),
+            "required_success_count": self.required_success_count,
+            "required_success_fraction": (
+                self.required_success_fraction.to_dict()
+                if self.required_success_fraction is not None
+                else None
+            ),
+            "status": self.status,
+            "version": self.version,
+            "wave_deadline": self.wave_deadline,
+            "wave_id": self.wave_id,
+        }
+        check_no_credential_bearing_keys(data, "DelegationWaveResponse.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DelegationWaveResponse":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "DelegationWaveResponse payload")
+        allowed = {
+            "accepted_at",
+            "barrier_policy",
+            "child_claim_deadline",
+            "continuation_version",
+            "delegation_decision_id",
+            "parent_task_id",
+            "proposal_id",
+            "required_child_task_ids",
+            "required_success_count",
+            "required_success_fraction",
+            "status",
+            "version",
+            "wave_deadline",
+            "wave_id",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(f"Unexpected fields in DelegationWaveResponse: {sorted(unexpected)}")
+        for req in allowed - {
+            "continuation_version",
+            "required_success_count",
+            "required_success_fraction",
+            "status",
+            "version",
+        }:
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            parent_task_id=data["parent_task_id"],
+            proposal_id=data["proposal_id"],
+            wave_id=data["wave_id"],
+            delegation_decision_id=data["delegation_decision_id"],
+            required_child_task_ids=data["required_child_task_ids"],
+            barrier_policy=data["barrier_policy"],
+            accepted_at=data["accepted_at"],
+            wave_deadline=data["wave_deadline"],
+            child_claim_deadline=data["child_claim_deadline"],
+            required_success_fraction=data.get("required_success_fraction"),
+            required_success_count=data.get("required_success_count"),
+            continuation_version=data.get("continuation_version", 2),
+            status=data.get("status", "accepted"),
+            version=data.get("version", DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "DelegationWaveResponse":
         if not isinstance(value, str):
             raise TypeError(f"value must be a string, got {type(value).__name__}")
         return cls.from_dict(json.loads(value))
