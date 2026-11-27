@@ -577,14 +577,15 @@ Rejected. Their late completion could mutate a resolved wave or create unclear
 contribution semantics. Closure must invalidate residual commit authority while
 preserving durable history.
 
-## Acceptance gate
+## Acceptance record
 
-This ADR remains Proposed until all of the following occur:
+The architecture acceptance gate was completed on 2026-11-27:
 
-1. independent Gemini 4 Neon High architecture/concurrency review;
-2. validation of review findings against current live repository behavior;
-3. one consolidated revision if warranted;
-4. final whole-document consistency review; and
-5. explicit human architecture acceptance.
+1. independent Gemini 4 Neon High architecture/concurrency review completed;
+2. review findings validated against live repository behavior;
+3. one consolidated revision completed;
+4. final whole-document consistency review completed; and
+5. explicit human architecture acceptance recorded.
 
-Only after acceptance may Issue #34 implementation increments be planned.
+ADR 0011 is the governing architecture for Issue #34. Implementation
+increments may now be planned within its accepted boundaries.
