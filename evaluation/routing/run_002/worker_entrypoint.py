@@ -16,6 +16,7 @@ Security invariants:
 
 from __future__ import annotations
 
+import ctypes
 import http.client
 import importlib.metadata
 import inspect
@@ -28,6 +29,11 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+try:
+    import resource
+except ImportError:  # pragma: no cover
+    resource = None  # type: ignore[assignment]
 
 from evaluation.routing.run_002.contract import EXPECTED_LABEL_INDEX_MAP, load_verified_contract
 from evaluation.routing.run_002.errors import FatalRunError, FatalRunErrorCode, PerRecordErrorCode
@@ -72,6 +78,39 @@ class NetworkAccessBlockedError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("Outbound network access is prohibited during offline Run 002 evaluation")
+
+
+def disable_core_dumps() -> None:
+    """Disable POSIX core dump generation for the isolated worker process.
+
+    Prevents native crashes (such as SIGSEGV) from writing core files or
+    invoking OS core-dump handlers that can leak process memory or delay
+    subprocess termination past parent inference deadlines.
+    """
+    if resource is not None:
+        rlimit_core = getattr(resource, "RLIMIT_CORE", None)
+        if rlimit_core is not None:
+            try:
+                resource.setrlimit(rlimit_core, (0, 0))
+            except (OSError, ValueError):
+                pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None)
+            prctl = getattr(libc, "prctl", None)
+            if prctl is not None:
+                # PR_SET_DUMPABLE = 4; disabling dumpability also bypasses
+                # Linux pipe core_pattern handlers (e.g., apport/systemd-coredump).
+                prctl(
+                    ctypes.c_int(4),
+                    ctypes.c_ulong(0),
+                    ctypes.c_ulong(0),
+                    ctypes.c_ulong(0),
+                    ctypes.c_ulong(0),
+                )
+        except OSError:
+            pass
 
 
 def install_offline_network_guard() -> None:
@@ -392,6 +431,8 @@ def _send_fatal(request_id: int, code: FatalRunErrorCode) -> None:
 
 def main() -> int:
     """Run the isolated Run 002 worker IPC loop."""
+    disable_core_dumps()
+
     raw_startup = sys.stdin.buffer.readline(MAX_IPC_REQUEST_BYTES + 1)
     if not raw_startup:
         return 2

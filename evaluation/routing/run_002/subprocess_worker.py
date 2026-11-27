@@ -372,8 +372,19 @@ class SubprocessShadowWorker:
         elapsed_ns = max(0, time.perf_counter_ns() - t0)
 
         if timed_out:
+            rc_before_kill = proc.poll()
             _terminate_and_reap(proc)
             self._proc = None
+            if rc_before_kill is not None:
+                if rc_before_kill == 0:
+                    return WorkerFailure(
+                        error_code=PerRecordErrorCode.MALFORMED_OUTPUT,
+                        latency_ns=elapsed_ns,
+                    )
+                return WorkerFailure(
+                    error_code=PerRecordErrorCode.UNEXPECTED_OBSERVER_ERROR,
+                    latency_ns=elapsed_ns,
+                )
             return WorkerFailure(
                 error_code=PerRecordErrorCode.INFERENCE_TIMEOUT,
                 latency_ns=elapsed_ns,

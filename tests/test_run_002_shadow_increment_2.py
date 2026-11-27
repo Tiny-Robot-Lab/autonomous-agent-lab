@@ -1161,6 +1161,135 @@ def test_coordinator_end_to_end_with_subprocess_worker_preserves_authority_and_p
     assert "CRASH secret" not in serialize_observation_jsonl(small_res.observations[1])
 
 
+def test_worker_disables_core_dumps_before_ml_import_and_sigsegv_does_not_race_deadline(
+    tmp_path: Path,
+) -> None:
+    rlimit_log = tmp_path / "rlimit.json"
+    art, man, proto, anchors = _build_synthetic_artifact_bundle(tmp_path / "coredump")
+    fake_setfit = f"""
+    import json, os, resource, signal, sys
+    from pathlib import Path
+
+    class _Head:
+        classes_ = ["general", "research"]
+
+    class SetFitModel:
+        def __init__(self):
+            self.labels = ["general", "research"]
+            self.model_head = _Head()
+            self.device = "cpu"
+
+        @classmethod
+        def from_pretrained(cls, model_path, local_files_only=False, trust_remote_code=True, **kwargs):
+            soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+            dumpable = None
+            status_path = Path("/proc/self/status")
+            if status_path.exists():
+                for line in status_path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("Dumpable:"):
+                        dumpable = line.split(":", 1)[1].strip()
+                        break
+            Path({str(rlimit_log)!r}).write_text(
+                json.dumps({{"soft": soft, "hard": hard, "dumpable": dumpable}}),
+                encoding="utf-8",
+            )
+            return cls()
+
+        def predict_proba(self, prompts):
+            if "SIGSEGV_CRASH" in prompts[0]:
+                os.kill(os.getpid(), signal.SIGSEGV)
+            return [[0.9, 0.1]]
+    """
+    shim = _make_worker_python_shim(tmp_path / "coredump", fake_setfit_code=fake_setfit)
+    worker = SubprocessShadowWorker(
+        SubprocessWorkerConfig(
+            worker_python=shim,
+            artifact_dir=art,
+            artifact_manifest_path=man,
+            protocol_path=proto,
+            trust_anchors=anchors,
+            timeout_seconds=0.25,
+            startup_timeout_seconds=5.0,
+        )
+    )
+    with worker:
+        worker.preflight()
+        recorded = json.loads(rlimit_log.read_text(encoding="utf-8"))
+        assert recorded["soft"] == 0
+        assert recorded["hard"] == 0
+        if sys.platform.startswith("linux") and recorded["dumpable"] is not None:
+            assert recorded["dumpable"] == "0"
+
+        res_segv = worker.predict("SIGSEGV_CRASH prompt")
+        assert isinstance(res_segv, WorkerFailure)
+        assert res_segv.error_code is PerRecordErrorCode.UNEXPECTED_OBSERVER_ERROR
+
+        res_ok = worker.predict("What is 2 + 2?")
+        assert isinstance(res_ok, WorkerPrediction)
+        assert res_ok.shadow_decision == "general"
+
+
+def test_subprocess_worker_predict_classifies_already_exited_process_on_timeout_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import signal
+
+    import evaluation.routing.run_002.subprocess_worker as sw_mod
+
+    art, man, proto, anchors = _build_synthetic_artifact_bundle(tmp_path / "boundary")
+    fake_setfit = """
+    class _Head:
+        classes_ = ["general", "research"]
+
+    class SetFitModel:
+        def __init__(self):
+            self.labels = ["general", "research"]
+            self.model_head = _Head()
+            self.device = "cpu"
+
+        @classmethod
+        def from_pretrained(cls, model_path, local_files_only=False, trust_remote_code=True, **kwargs):
+            return cls()
+
+        def predict_proba(self, prompts):
+            return [[0.9, 0.1]]
+    """
+    shim = _make_worker_python_shim(tmp_path / "boundary", fake_setfit_code=fake_setfit)
+    worker = SubprocessShadowWorker(
+        SubprocessWorkerConfig(
+            worker_python=shim,
+            artifact_dir=art,
+            artifact_manifest_path=man,
+            protocol_path=proto,
+            trust_anchors=anchors,
+            timeout_seconds=0.25,
+            startup_timeout_seconds=5.0,
+        )
+    )
+    try:
+        worker.preflight()
+        proc = worker._ensure_worker_started()
+
+        def _fake_timed_out_after_exit(
+            p: subprocess.Popen[bytes],
+            *,
+            timeout_seconds: float,
+            max_bytes: int,
+        ) -> tuple[bytes | None, bool, bool]:
+            os.kill(p.pid, signal.SIGKILL)
+            p.wait(timeout=2.0)
+            return None, True, False
+
+        monkeypatch.setattr(sw_mod, "_read_bounded_line_with_timeout", _fake_timed_out_after_exit)
+        res = worker.predict("boundary prompt")
+        assert isinstance(res, WorkerFailure)
+        assert res.error_code is PerRecordErrorCode.UNEXPECTED_OBSERVER_ERROR
+        assert not _is_pid_alive(proc.pid)
+    finally:
+        worker.close()
+
+
 # ---------------------------------------------------------------------------
 # 7. Opt-in real-model integration test (skipped unless external env/artifacts exist)
 # ---------------------------------------------------------------------------
