@@ -619,3 +619,41 @@ class TaskContinuationV2:
         if not isinstance(value, str):
             raise TypeError(f"value must be a string, got {type(value).__name__}")
         return cls.from_dict(json.loads(value))
+
+
+def deserialize_continuation(
+    data: dict[str, Any] | str,
+    *,
+    expected_continuation_version: int | None = None,
+) -> TaskContinuation | TaskContinuationV2:
+    """Version-aware fail-closed deserialization for TaskContinuation v1 and v2."""
+    parsed = json.loads(data) if isinstance(data, str) else data
+    if not isinstance(parsed, dict):
+        raise TypeError("data must be a dict")
+
+    if "version" not in parsed:
+        raise ValueError("version is required")
+    version = parsed["version"]
+    if type(version) is bool or not isinstance(version, int):
+        raise TypeError(f"version must be an int, got {type(version).__name__}")
+
+    continuation: TaskContinuation | TaskContinuationV2
+    if version == 1:
+        continuation = TaskContinuation.from_dict(parsed)
+    elif version == TASK_CONTINUATION_V2_CONTRACT_VERSION:
+        continuation = TaskContinuationV2.from_dict(parsed)
+    else:
+        raise ValueError(f"Unsupported contract version: {version}")
+
+    if expected_continuation_version is not None:
+        if (
+            type(expected_continuation_version) is bool
+            or not isinstance(expected_continuation_version, int)
+        ):
+            raise TypeError("expected_continuation_version must be an int")
+        if continuation.continuation_version != expected_continuation_version:
+            raise ValueError(
+                f"Continuation version mismatch: expected {expected_continuation_version}, "
+                f"got {continuation.continuation_version}"
+            )
+    return continuation

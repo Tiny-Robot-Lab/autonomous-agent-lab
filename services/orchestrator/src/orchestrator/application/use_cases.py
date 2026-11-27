@@ -6,6 +6,11 @@ from typing import Any
 from uuid import uuid4
 
 from agent_contracts import (
+    MAX_WAVE_CHILDREN,
+    MAX_WAVE_DURATION_SECONDS,
+    MIN_WAVE_CHILDREN,
+    MIN_WAVE_DURATION_SECONDS,
+    AcceptedDelegationWave,
     ActiveClaim,
     AgentEvent,
     ArtifactReference,
@@ -16,9 +21,13 @@ from agent_contracts import (
     CompletionCommand,
     CompletionResponse,
     DelegationGrant,
+    DelegationGrantV2,
     DelegationProposalRecord,
     DelegationProposalRequest,
     DelegationProposalResponse,
+    DelegationWaveProposalRecord,
+    DelegationWaveProposalRequest,
+    DelegationWaveResponse,
     RecoveryDecisionCommand,
     RecoveryDecisionRecord,
     ResumedContinuationContext,
@@ -27,13 +36,17 @@ from agent_contracts import (
     StageArtifact,
     TaskAssignment,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskInputReference,
     TaskRequested,
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveYieldRecord,
     compute_proposal_fingerprint,
+    compute_wave_proposal_fingerprint,
+    derive_wave_deadline,
     normalize_canonical_utc_timestamp,
 )
 
@@ -531,6 +544,8 @@ class ClaimTask:
         assignment_proof_pepper: str,
         delivery_lease_seconds: float = 30.0,
         clock: Any = None,
+        *,
+        allow_wave_delegation_grant: bool = False,
     ) -> None:
         if task_store is None:
             raise TypeError("ClaimTask requires an AuthoritativeTaskStore")
@@ -539,6 +554,7 @@ class ClaimTask:
         self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
         self._delivery_lease_seconds = float(delivery_lease_seconds)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._allow_wave_delegation_grant = bool(allow_wave_delegation_grant)
 
     async def execute(
         self,
@@ -618,6 +634,10 @@ class ClaimTask:
                 raise TaskNotClaimableError(
                     f"Continuation version {continuation_version} not found for task '{clean_task_id}'"
                 )
+            if isinstance(continuation, TaskContinuationV2) and not continuation.is_claimable:
+                raise TaskNotClaimableError(
+                    f"Continuation version {continuation_version} for task '{clean_task_id}' is not claimable"
+                )
             if continuation.parent_task_id != clean_task_id:
                 raise TaskNotClaimableError("Continuation task mismatch")
             if continuation.continuation_capability != clean_cap:
@@ -639,22 +659,38 @@ class ClaimTask:
         candidate_epoch = cur_epoch + 1
 
         # 7. Check for eligible root grant
-        grant: DelegationGrant | None = None
+        grant: DelegationGrant | DelegationGrantV2 | None = None
         assignment_id = f"assign-{uuid4()}"
         turn_id = f"turn-{uuid4()}"
         if clean_kind == "initial" and clean_cap == "research" and lineage.is_root:
             root_authority = await self._task_store.get_root_authority(clean_task_id)
             if root_authority and ("research", "analysis") in root_authority.allowed_delegation_edges:
                 grant_id = f"grant-{uuid4()}"
-                grant = DelegationGrant(
-                    grant_id=grant_id,
-                    root_task_id=clean_task_id,
-                    issued_to_assignment_id=assignment_id,
-                    issued_to_principal_id=principal.principal_id,
-                    fencing_epoch=candidate_epoch,
-                    turn_id=turn_id,
-                    issued_at=now_iso,
-                )
+                if (
+                    self._allow_wave_delegation_grant
+                    and root_authority.version == 2
+                    and MIN_WAVE_CHILDREN <= root_authority.max_children_per_wave <= MAX_WAVE_CHILDREN
+                ):
+                    grant = DelegationGrantV2(
+                        grant_id=grant_id,
+                        root_task_id=clean_task_id,
+                        issued_to_assignment_id=assignment_id,
+                        issued_to_principal_id=principal.principal_id,
+                        fencing_epoch=candidate_epoch,
+                        turn_id=turn_id,
+                        issued_at=now_iso,
+                        max_children=root_authority.max_children_per_wave,
+                    )
+                else:
+                    grant = DelegationGrant(
+                        grant_id=grant_id,
+                        root_task_id=clean_task_id,
+                        issued_to_assignment_id=assignment_id,
+                        issued_to_principal_id=principal.principal_id,
+                        fencing_epoch=candidate_epoch,
+                        turn_id=turn_id,
+                        issued_at=now_iso,
+                    )
 
         claim_id = f"claim-{uuid4()}"
 
@@ -1188,6 +1224,358 @@ class AcceptDelegationProposal:
             child_claim_deadline=accepted_record.child_claim_deadline,
             accepted_at=accepted_record.accepted_at,
             target_capability=accepted_record.target_capability,
+            continuation_version=accepted_record.continuation_version,
+            status="accepted",
+        )
+
+
+def _assert_wave_consistency(
+    *,
+    request: DelegationWaveProposalRequest,
+    record: DelegationWaveProposalRecord,
+    wave: AcceptedDelegationWave | None,
+    continuation: TaskContinuation | TaskContinuationV2 | None,
+    latest_continuation_version: int | None,
+    parent_status: str | None,
+    parent_children: list[str],
+    wave_yield: WaveYieldRecord | None,
+) -> None:
+    if (
+        record.barrier_policy != request.barrier_policy
+        or record.required_success_fraction != request.required_success_fraction
+    ):
+        raise CorruptAuthoritativeRecordError(
+            f"Wave proposal record '{record.proposal_id}' policy/fraction mismatches request"
+        )
+    if wave is None or not isinstance(continuation, TaskContinuationV2):
+        raise CorruptAuthoritativeRecordError(
+            f"Missing AcceptedDelegationWave or TaskContinuationV2 for wave '{record.wave_id}'"
+        )
+    if latest_continuation_version != 2:
+        raise CorruptAuthoritativeRecordError(
+            f"Invalid continuation_latest for wave '{record.wave_id}': {latest_continuation_version}"
+        )
+    if parent_status != "waiting_for_children":
+        raise CorruptAuthoritativeRecordError(
+            f"Parent status for wave '{record.wave_id}' must be 'waiting_for_children', got '{parent_status}'"
+        )
+    if tuple(sorted(parent_children)) != record.required_child_task_ids or len(parent_children) != len(
+        record.required_child_task_ids
+    ):
+        raise CorruptAuthoritativeRecordError(
+            f"Parent children set is inconsistent with accepted wave '{record.wave_id}'"
+        )
+    if (
+        wave_yield is None
+        or wave_yield.wave_id != record.wave_id
+        or wave_yield.parent_task_id != record.parent_task_id
+        or wave_yield.assignment_id != record.assignment_id
+        or wave_yield.proposal_id != record.proposal_id
+        or wave_yield.principal_id != record.runtime_principal_id
+        or wave_yield.delegation_decision_id != record.delegation_decision_id
+        or wave_yield.required_child_task_ids != record.required_child_task_ids
+        or wave_yield.continuation_version != 2
+    ):
+        raise CorruptAuthoritativeRecordError(
+            f"WaveYieldRecord for wave '{record.wave_id}' is missing or inconsistent"
+        )
+    if (
+        wave.wave_id != record.wave_id
+        or wave.parent_task_id != record.parent_task_id
+        or wave.required_child_task_ids != record.required_child_task_ids
+        or wave.barrier_policy != record.barrier_policy
+        or wave.required_success_fraction != record.required_success_fraction
+        or wave.required_success_count != record.required_success_count
+        or wave.accepted_at != record.accepted_at
+        or wave.wave_deadline != record.wave_deadline
+        or wave.state != "unresolved"
+    ):
+        raise CorruptAuthoritativeRecordError(
+            f"AcceptedDelegationWave '{record.wave_id}' is inconsistent with wave proposal record"
+        )
+    expected_artifacts = tuple(dict.fromkeys(item.artifact_reference for item in request.items))
+    if (
+        continuation.parent_task_id != record.parent_task_id
+        or continuation.wave_id != record.wave_id
+        or continuation.required_child_task_ids != record.required_child_task_ids
+        or continuation.stage != "incorporate_analysis_child"
+        or continuation.continuation_capability != "research"
+        or continuation.input_version != request.parent_input_version
+        or continuation.artifact_references != expected_artifacts
+        or continuation.continuation_version != 2
+        or continuation.version != 2
+        or continuation.state != "active"
+        or continuation.wave_resolution is not None
+    ):
+        raise CorruptAuthoritativeRecordError(
+            f"TaskContinuationV2 for wave '{record.wave_id}' is inconsistent with accepted wave"
+        )
+
+
+class AcceptDelegationWave:
+    """Authenticated Research -> Analysis bounded multi-child wave acceptance use case."""
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        assignment_proof_pepper: str,
+        child_claim_deadline_seconds: float = 120.0,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("AcceptDelegationWave requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._master_secret = parse_master_secret(assignment_proof_pepper)
+        self._token_key, self._verifier_key = derive_proof_subkeys(self._master_secret)
+        self._child_claim_deadline_seconds = float(child_claim_deadline_seconds)
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        parent_task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        request: DelegationWaveProposalRequest,
+    ) -> DelegationWaveResponse:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+
+        if not principal.has_capability("research"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks capability 'research' required to propose delegation wave"
+            )
+
+        if not isinstance(request, DelegationWaveProposalRequest):
+            raise TypeError("request must be a DelegationWaveProposalRequest")
+
+        clean_parent = str(parent_task_id).strip()
+        clean_assign_id = str(assignment_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        if not clean_parent or not clean_assign_id:
+            raise ValueError("parent_task_id and assignment_id must be non-empty strings")
+        if not clean_proof:
+            raise ValueError("assignment_proof must be a non-empty string")
+
+        fp = compute_wave_proposal_fingerprint(
+            parent_task_id=clean_parent,
+            assignment_id=clean_assign_id,
+            request=request,
+        )
+
+        claim = await self._task_store.get_active_claim(clean_parent)
+        now_dt = self._clock()
+        now_iso = normalize_canonical_utc_timestamp(now_dt)
+
+        if claim is not None and claim.assignment_id == clean_assign_id:
+            if claim.runtime_principal_id != principal.principal_id:
+                raise ClaimNotFoundError(
+                    f"Assignment '{clean_assign_id}' is not owned by principal '{principal.principal_id}'"
+                )
+            if claim.bound_agent_id != principal.bound_agent_id:
+                raise ClaimNotFoundError(
+                    f"Assignment '{clean_assign_id}' is bound to agent '{claim.bound_agent_id}', not '{principal.bound_agent_id}'"
+                )
+            if claim.assigned_capability != "research":
+                raise CapabilityMismatchError(
+                    f"Principal '{principal.principal_id}' lacks capability '{claim.assigned_capability}'"
+                )
+            if claim.state != "acknowledged":
+                raise TaskNotClaimableError("Assignment must be acknowledged before proposing delegation wave")
+
+            cur_epoch = await self._task_store.get_fencing_epoch(clean_parent)
+            if claim.fencing_epoch != cur_epoch:
+                raise TaskAlreadyClaimedError(
+                    f"Fencing epoch mismatch for assignment '{clean_assign_id}': claim={claim.fencing_epoch}, current={cur_epoch}"
+                )
+
+            if not verify_assignment_proof(self._verifier_key, clean_proof, claim.proof_digest):
+                raise InvalidClaimProofError("Assignment proof verification failed")
+
+            if not claim.delegation_grant_id:
+                raise TaskNotClaimableError("Active assignment has no delegation grant")
+
+            wave_id = f"wave-{uuid4()}"
+            delegation_decision_id = f"dec-{uuid4()}"
+            child_ids = [f"task-analysis-{uuid4()}" for _ in request.items]
+            sorted_child_ids = tuple(sorted(child_ids))
+
+            deadline_derivation = derive_wave_deadline(
+                work_complexity=request.work_complexity,
+                uncertainty_level=request.uncertainty_level,
+                required_child_count=len(request.items),
+                planned_parallelism=request.planned_parallelism or len(request.items),
+                min_duration_seconds=MIN_WAVE_DURATION_SECONDS,
+                max_duration_seconds=MAX_WAVE_DURATION_SECONDS,
+                accepted_at=now_iso,
+            )
+            child_claim_deadline = normalize_canonical_utc_timestamp(
+                now_dt + timedelta(seconds=self._child_claim_deadline_seconds)
+            )
+
+            accepted_wave = AcceptedDelegationWave(
+                wave_id=wave_id,
+                parent_task_id=clean_parent,
+                required_child_task_ids=sorted_child_ids,
+                barrier_policy=request.barrier_policy,
+                required_success_fraction=request.required_success_fraction,
+                deadline_derivation=deadline_derivation,
+                accepted_at=now_iso,
+            )
+
+            all_artifacts = tuple(dict.fromkeys(item.artifact_reference for item in request.items))
+            continuation = TaskContinuationV2(
+                parent_task_id=clean_parent,
+                wave_id=wave_id,
+                required_child_task_ids=sorted_child_ids,
+                created_at=now_iso,
+                updated_at=now_iso,
+                input_version=request.parent_input_version,
+                continuation_capability="research",
+                stage="incorporate_analysis_child",
+                control_fields={},
+                artifact_references=all_artifacts,
+                continuation_version=2,
+                state="active",
+                wave_resolution=None,
+            )
+
+            candidate_record = DelegationWaveProposalRecord(
+                parent_task_id=clean_parent,
+                proposal_id=request.proposal_id,
+                wave_id=wave_id,
+                delegation_decision_id=delegation_decision_id,
+                assignment_id=clean_assign_id,
+                runtime_principal_id=principal.principal_id,
+                bound_agent_id=principal.bound_agent_id,
+                fencing_epoch=claim.fencing_epoch,
+                proof_digest=claim.proof_digest,
+                proposal_fingerprint=fp,
+                delegation_grant_id=claim.delegation_grant_id,
+                required_child_task_ids=sorted_child_ids,
+                barrier_policy=accepted_wave.barrier_policy,
+                required_success_fraction=accepted_wave.required_success_fraction,
+                required_success_count=accepted_wave.required_success_count,
+                accepted_at=now_iso,
+                wave_deadline=accepted_wave.wave_deadline or deadline_derivation.wave_deadline,
+                child_claim_deadline=child_claim_deadline,
+            )
+
+            child_inputs = [
+                TaskInput(
+                    task_id=child_id,
+                    prompt=item.child_intent,
+                    created_at=now_iso,
+                    input_version=1,
+                    artifact_references=(item.artifact_reference,),
+                )
+                for child_id, item in zip(child_ids, request.items, strict=True)
+            ]
+            # Order child inputs and wake-up hints canonically by child_task_id
+            child_inputs.sort(key=lambda ti: ti.task_id)
+            wake_up_hints = [
+                WakeUpHint(
+                    hint_id=f"hint-{uuid4()}",
+                    capability="analysis",
+                    created_at=now_iso,
+                    execution_kind="delegated_child",
+                    task_id=child_input.task_id,
+                )
+                for child_input in child_inputs
+            ]
+            yield_rec = WaveYieldRecord(
+                assignment_id=clean_assign_id,
+                parent_task_id=clean_parent,
+                principal_id=principal.principal_id,
+                proposal_id=request.proposal_id,
+                wave_id=wave_id,
+                required_child_task_ids=sorted_child_ids,
+                delegation_decision_id=delegation_decision_id,
+                yielded_at=now_iso,
+            )
+
+            accepted_record, _is_replay = await self._task_store.accept_delegation_wave(
+                parent_task_id=clean_parent,
+                proposal=candidate_record,
+                accepted_wave=accepted_wave,
+                child_task_inputs=child_inputs,
+                parent_continuation=continuation,
+                yield_record=yield_rec,
+                wake_up_hints=wake_up_hints,
+                expected_fencing_epoch=claim.fencing_epoch,
+                now=now_iso,
+            )
+        else:
+            record = await self._task_store.get_delegation_wave_proposal(
+                clean_parent, request.proposal_id
+            )
+            if record is None:
+                raise DelegationReplayAuthorizationError("Delegation wave replay authorization failed")
+            if (
+                record.parent_task_id != clean_parent
+                or record.proposal_id != request.proposal_id
+                or record.assignment_id != clean_assign_id
+                or record.runtime_principal_id != principal.principal_id
+                or record.bound_agent_id != principal.bound_agent_id
+                or record.proposal_fingerprint != fp
+                or not verify_assignment_proof(self._verifier_key, clean_proof, record.proof_digest)
+            ):
+                raise DelegationReplayAuthorizationError("Delegation wave replay authorization failed")
+
+            wave = await self._task_store.get_accepted_delegation_wave(clean_parent, record.wave_id)
+            cont = await self._task_store.get_continuation(clean_parent, 2)
+            latest_cont = await self._task_store.get_latest_continuation_version(clean_parent)
+            parent_status = await self._task_store.get_status(clean_parent)
+            parent_children = await self._task_store.get_children(clean_parent)
+            wave_yield = await self._task_store.get_wave_yield(clean_parent, clean_assign_id)
+            _assert_wave_consistency(
+                request=request,
+                record=record,
+                wave=wave,
+                continuation=cont,
+                latest_continuation_version=latest_cont,
+                parent_status=parent_status,
+                parent_children=parent_children,
+                wave_yield=wave_yield,
+            )
+            for child_id in record.required_child_task_ids:
+                child_status = await self._task_store.get_status(child_id)
+                child_lineage = await self._task_store.get_lineage(child_id)
+                child_cap = await self._task_store.get_required_capability(child_id)
+                child_input = await self._task_store.get_task_input(child_id, 1)
+                child_deadline = await self._task_store.get_child_claim_deadline(child_id)
+                child_fence = await self._task_store.get_fencing_epoch(child_id)
+                if (
+                    child_status != "pending"
+                    or child_lineage is None
+                    or child_lineage.task_id != child_id
+                    or child_lineage.parent_task_id != clean_parent
+                    or child_lineage.root_task_id != clean_parent
+                    or child_cap is None
+                    or child_cap.required_capability != "analysis"
+                    or child_input is None
+                    or child_input.task_id != child_id
+                    or child_input.input_version != 1
+                    or child_deadline != record.child_claim_deadline
+                    or child_fence != 0
+                ):
+                    raise CorruptAuthoritativeRecordError(
+                        f"Child record '{child_id}' is missing or inconsistent with accepted wave '{record.wave_id}'"
+                    )
+            accepted_record = record
+
+        return DelegationWaveResponse(
+            parent_task_id=accepted_record.parent_task_id,
+            proposal_id=accepted_record.proposal_id,
+            wave_id=accepted_record.wave_id,
+            delegation_decision_id=accepted_record.delegation_decision_id,
+            required_child_task_ids=accepted_record.required_child_task_ids,
+            barrier_policy=accepted_record.barrier_policy,
+            required_success_fraction=accepted_record.required_success_fraction,
+            required_success_count=accepted_record.required_success_count,
+            accepted_at=accepted_record.accepted_at,
+            wave_deadline=accepted_record.wave_deadline,
+            child_claim_deadline=accepted_record.child_claim_deadline,
             continuation_version=accepted_record.continuation_version,
             status="accepted",
         )

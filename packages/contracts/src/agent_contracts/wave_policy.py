@@ -239,9 +239,12 @@ def derive_wave_deadline(
         min_duration_seconds=min_duration_seconds,
         max_duration_seconds=max_duration_seconds,
     )
-    deadline_utc = normalize_canonical_utc_timestamp(
-        datetime.fromisoformat(clean_accepted) + timedelta(seconds=duration)
-    )
+    try:
+        deadline_utc = normalize_canonical_utc_timestamp(
+            datetime.fromisoformat(clean_accepted) + timedelta(seconds=duration)
+        )
+    except OverflowError as exc:
+        raise ValueError("Wave deadline timestamp overflows supported datetime range") from exc
     return WaveDeadlineDerivation(
         policy_id=policy_id,
         policy_version=policy_version,

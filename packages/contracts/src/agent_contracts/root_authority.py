@@ -9,6 +9,7 @@ BASELINE_POLICY_CONTEXT = "default"
 BASELINE_MAX_DEPTH = 1
 BASELINE_MAX_WAVES = 1
 BASELINE_MAX_CHILDREN_PER_WAVE = 1
+WAVE_MAX_CHILDREN_PER_WAVE = 4
 BASELINE_DELEGATION_EDGES: tuple[tuple[str, str], ...] = (("research", "analysis"),)
 
 
@@ -35,7 +36,7 @@ class RootAuthorityRecord:
     def __post_init__(self) -> None:
         if type(self.version) is bool or not isinstance(self.version, int):
             raise TypeError(f"version must be an int, got {type(self.version).__name__}")
-        if self.version != 1:
+        if self.version not in (1, 2):
             raise ValueError(f"Unsupported contract version: {self.version}")
 
         if not isinstance(self.root_task_id, str) or not self.root_task_id.strip():
@@ -51,20 +52,38 @@ class RootAuthorityRecord:
                 f"RootAuthorityRecord policy_context must be '{BASELINE_POLICY_CONTEXT}', got '{self.policy_context}'"
             )
 
+        if type(self.max_delegation_depth) is bool or not isinstance(self.max_delegation_depth, int):
+            raise TypeError(
+                f"max_delegation_depth must be an int, got {type(self.max_delegation_depth).__name__}"
+            )
         if self.max_delegation_depth != BASELINE_MAX_DEPTH:
             raise ValueError(
                 f"RootAuthorityRecord max_delegation_depth must be {BASELINE_MAX_DEPTH}, got {self.max_delegation_depth}"
             )
 
+        if type(self.max_delegation_waves) is bool or not isinstance(self.max_delegation_waves, int):
+            raise TypeError(
+                f"max_delegation_waves must be an int, got {type(self.max_delegation_waves).__name__}"
+            )
         if self.max_delegation_waves != BASELINE_MAX_WAVES:
             raise ValueError(
                 f"RootAuthorityRecord max_delegation_waves must be {BASELINE_MAX_WAVES}, got {self.max_delegation_waves}"
             )
 
-        if self.max_children_per_wave != BASELINE_MAX_CHILDREN_PER_WAVE:
+        if type(self.max_children_per_wave) is bool or not isinstance(self.max_children_per_wave, int):
+            raise TypeError(
+                f"max_children_per_wave must be an int, got {type(self.max_children_per_wave).__name__}"
+            )
+        if self.version == 1:
+            if self.max_children_per_wave != BASELINE_MAX_CHILDREN_PER_WAVE:
+                raise ValueError(
+                    f"RootAuthorityRecord max_children_per_wave must be {BASELINE_MAX_CHILDREN_PER_WAVE}, "
+                    f"got {self.max_children_per_wave}"
+                )
+        elif not (2 <= self.max_children_per_wave <= WAVE_MAX_CHILDREN_PER_WAVE):
             raise ValueError(
-                f"RootAuthorityRecord max_children_per_wave must be {BASELINE_MAX_CHILDREN_PER_WAVE}, "
-                f"got {self.max_children_per_wave}"
+                f"RootAuthorityRecord v2 max_children_per_wave must be between 2 and "
+                f"{WAVE_MAX_CHILDREN_PER_WAVE}, got {self.max_children_per_wave}"
             )
 
         if not isinstance(self.allowed_delegation_edges, (list, tuple)):
@@ -100,6 +119,25 @@ class RootAuthorityRecord:
             allowed_delegation_edges=BASELINE_DELEGATION_EDGES,
             created_at=now,
             version=1,
+        )
+
+    @classmethod
+    def create_wave_baseline(
+        cls,
+        root_task_id: str,
+        max_children_per_wave: int = WAVE_MAX_CHILDREN_PER_WAVE,
+        created_at: str | None = None,
+    ) -> "RootAuthorityRecord":
+        now = created_at or datetime.now(UTC).isoformat()
+        return cls(
+            root_task_id=root_task_id,
+            policy_context=BASELINE_POLICY_CONTEXT,
+            max_delegation_depth=BASELINE_MAX_DEPTH,
+            max_delegation_waves=BASELINE_MAX_WAVES,
+            max_children_per_wave=max_children_per_wave,
+            allowed_delegation_edges=BASELINE_DELEGATION_EDGES,
+            created_at=now,
+            version=2,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -140,7 +178,7 @@ class RootAuthorityRecord:
             version = data["version"]
             if type(version) is bool or not isinstance(version, int):
                 raise TypeError(f"version must be an int, got {type(version).__name__}")
-            if version != 1:
+            if version not in (1, 2):
                 raise ValueError(f"Unsupported contract version: {version}")
         else:
             version = 1
