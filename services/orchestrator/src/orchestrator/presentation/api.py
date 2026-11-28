@@ -57,6 +57,7 @@ from orchestrator.application.queries import (
     GetRecentEvents,
     GetRoutingDecision,
     GetTaskChildren,
+    GetTaskCollaboration,
     GetTaskInferenceTelemetry,
     GetTaskResult,
 )
@@ -194,6 +195,28 @@ async def task_children(task_id: str, request: Request) -> dict[str, Any]:
         "parent_task_id": clean_id,
         "child_task_ids": children,
     }
+
+
+async def task_collaboration(task_id: str, request: Request) -> dict[str, Any]:
+    get_task_collaboration: GetTaskCollaboration | None = getattr(
+        request.app.state, "get_task_collaboration", None
+    )
+    if get_task_collaboration is None:
+        raise HTTPException(
+            status_code=503, detail="Task collaboration reader not configured"
+        )
+    clean_id = str(task_id).strip()
+    try:
+        collab = await get_task_collaboration.execute(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(
+            status_code=500, detail="Authoritative record corruption detected"
+        ) from exc
+    if collab is None:
+        raise HTTPException(status_code=404, detail=f"Task '{clean_id}' not found")
+    return collab
 
 
 async def candidates(capability: str, request: Request) -> list[dict[str, Any]]:
@@ -1090,6 +1113,15 @@ def create_app(
         GetTaskInferenceTelemetry(reader) if reader else None
     )
     get_task_children = GetTaskChildren(resolved_task_store)
+    completion_store_reader: TurnCompletionStore | None = (
+        resolved_task_store
+        if isinstance(resolved_task_store, TurnCompletionStore)
+        else None
+    )
+    get_task_collaboration = GetTaskCollaboration(
+        task_store=resolved_task_store,
+        completion_store=completion_store_reader,
+    )
     claim_task: ClaimTask | None = None
     acknowledge_assignment: AcknowledgeAssignment | None = None
     stage_artifact: StageArtifactUseCase | None = None
@@ -1203,6 +1235,7 @@ def create_app(
     app.state.get_routing_decision = get_routing_decision
     app.state.get_task_inference_telemetry = get_task_inference_telemetry
     app.state.get_task_children = get_task_children
+    app.state.get_task_collaboration = get_task_collaboration
     app.state.claim_task = claim_task
     app.state.acknowledge_assignment = acknowledge_assignment
     app.state.stage_artifact = stage_artifact
@@ -1240,6 +1273,9 @@ def create_app(
     app.add_api_route("/api/tasks/{task_id}/routing", task_routing, methods=["GET"])
     app.add_api_route("/api/tasks/{task_id}/telemetry", task_telemetry, methods=["GET"])
     app.add_api_route("/api/tasks/{task_id}/children", task_children, methods=["GET"])
+    app.add_api_route(
+        "/api/tasks/{task_id}/collaboration", task_collaboration, methods=["GET"]
+    )
     app.add_api_route("/api/candidates", candidates, methods=["GET"])
     app.add_api_route("/api/tasks/claim", claim_task_endpoint, methods=["POST"])
     app.add_api_route(

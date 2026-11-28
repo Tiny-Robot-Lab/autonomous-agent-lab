@@ -5,13 +5,20 @@ from typing import Any
 from agent_contracts import (
     AgentCandidate,
     LivenessPolicy,
+    TaskContinuationV2,
     evaluate_agent_record,
 )
 from agent_contracts.capabilities import DISALLOWED_METADATA_KEYS
 
 from orchestrator.domain.capability import AgentCapability
+from orchestrator.domain.task import CorruptAuthoritativeRecordError
 
-from .ports import AuthoritativeTaskStore, ResultReader, StateReader
+from .ports import (
+    AuthoritativeTaskStore,
+    ResultReader,
+    StateReader,
+    TurnCompletionStore,
+)
 
 
 class GetAgentStates:
@@ -190,3 +197,127 @@ class FindCandidatesByCapability:
 
 QueryAgentsByCapability = FindCandidatesByCapability
 
+
+class GetTaskCollaboration:
+    """Query authoritative collaboration lifecycle state for a parent task."""
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        completion_store: TurnCompletionStore | None = None,
+    ) -> None:
+        self._task_store = task_store
+        self._completion_store = (
+            completion_store
+            if completion_store is not None
+            else (task_store if isinstance(task_store, TurnCompletionStore) else None)
+        )
+
+    async def execute(self, parent_task_id: str) -> dict[str, Any] | None:
+        if not parent_task_id or not str(parent_task_id).strip():
+            raise ValueError("task_id must not be empty")
+        clean_id = str(parent_task_id).strip()
+
+        # 1. Authoritative parent status and existence
+        parent_status = await self._task_store.get_status(clean_id)
+        if parent_status is None:
+            # Check if parent task exists via lineage or input
+            lineage = await self._task_store.get_lineage(clean_id)
+            if lineage is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Parent task '{clean_id}' exists in lineage but status record is missing"
+                )
+            parent_input = await self._task_store.get_task_input(clean_id, 1)
+            if parent_input is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Parent task '{clean_id}' exists in task input but status record is missing"
+                )
+            return None
+
+        # 2. Check continuation version and record
+        latest_ver = await self._task_store.get_latest_continuation_version(clean_id)
+        if latest_ver is None or latest_ver < 2:
+            return {
+                "parent_task_id": clean_id,
+                "parent_status": parent_status,
+                "has_collaboration": False,
+                "continuation_version": None,
+                "continuation_state": None,
+                "wave_id": None,
+                "barrier_policy": None,
+                "wave_resolution": None,
+                "children": [],
+            }
+
+        continuation = await self._task_store.get_continuation(
+            clean_id, continuation_version=latest_ver
+        )
+        if continuation is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Continuation version {latest_ver} recorded for task '{clean_id}' but continuation record is missing"
+            )
+
+        if not isinstance(continuation, TaskContinuationV2):
+            raise CorruptAuthoritativeRecordError(
+                f"Continuation version {latest_ver} for task '{clean_id}' is not TaskContinuationV2 (got {type(continuation).__name__})"
+            )
+
+        wave_id = continuation.wave_id
+        accepted_wave = await self._task_store.get_accepted_delegation_wave(
+            clean_id, wave_id
+        )
+        if accepted_wave is None:
+            raise CorruptAuthoritativeRecordError(
+                f"Accepted delegation wave '{wave_id}' missing for collaborative task '{clean_id}'"
+            )
+
+        resolved_wave = await self._task_store.get_resolved_delegation_wave(
+            clean_id, wave_id
+        )
+        wave_resolution = (
+            resolved_wave.resolution
+            if resolved_wave is not None
+            else continuation.wave_resolution
+        )
+
+        children_list: list[dict[str, Any]] = []
+        for child_id in accepted_wave.required_child_task_ids:
+            child_status = await self._task_store.get_status(child_id)
+            if child_status is None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Required child '{child_id}' for wave '{wave_id}' missing status record"
+                )
+
+            child_input = await self._task_store.get_task_input(
+                child_id, input_version=1
+            )
+            if child_input is None:
+                raise CorruptAuthoritativeRecordError(
+                    f"Required child '{child_id}' for wave '{wave_id}' missing TaskInput v1"
+                )
+            intent = child_input.prompt
+
+            terminal_status = None
+            if self._completion_store is not None:
+                outcome = await self._completion_store.get_terminal_outcome(child_id)
+                if outcome is not None:
+                    terminal_status = outcome.terminal_status
+
+            children_list.append({
+                "task_id": child_id,
+                "intent": intent,
+                "status": child_status,
+                "terminal_status": terminal_status,
+            })
+
+        return {
+            "parent_task_id": clean_id,
+            "parent_status": parent_status,
+            "has_collaboration": True,
+            "continuation_version": continuation.continuation_version,
+            "continuation_state": continuation.state,
+            "wave_id": wave_id,
+            "barrier_policy": accepted_wave.barrier_policy,
+            "wave_resolution": wave_resolution,
+            "children": children_list,
+        }
