@@ -1283,7 +1283,7 @@ async def test_redis_timeout_corruption_and_replay_hardening(
         await clean_gateway.materialize_claim_timeout(child_id, now_iso)
     assert await clean_gateway._client.llen("agent.hints.research") == 1
 
-    # 13. Wrong continuation version / latest on replay -> TaskNotClaimableError
+    # 13. Authoritative v2 latest pointer without TaskContinuationV2 is a corrupt projection -> CorruptAuthoritativeRecordError
     good_cont = TaskContinuation(
         parent_task_id=parent_id,
         child_task_id=child_id,
@@ -1294,7 +1294,7 @@ async def test_redis_timeout_corruption_and_replay_hardening(
     )
     await clean_gateway._client.set(f"task.continuation:{parent_id}:1", good_cont.to_json())
     await clean_gateway._client.set(f"task.continuation_latest:{parent_id}", "2")
-    with pytest.raises(TaskNotClaimableError):
+    with pytest.raises(CorruptAuthoritativeRecordError):
         await clean_gateway.materialize_claim_timeout(child_id, now_iso)
     assert await clean_gateway._client.llen("agent.hints.research") == 1
     await clean_gateway._client.set(f"task.continuation_latest:{parent_id}", "1")

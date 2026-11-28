@@ -48,6 +48,7 @@ def test_task_lifecycle_statuses_defined_and_categorized() -> None:
         "completed",
         "failed",
         "dispatch_failed",
+        "cancelled",
     }
     assert PARENT_LIFECYCLE_STATUSES == expected_parent
 
@@ -71,6 +72,7 @@ def test_task_lifecycle_statuses_defined_and_categorized() -> None:
     assert "claim_timed_out" in TERMINAL_TASK_LIFECYCLE_STATUSES
     assert "completed" in TERMINAL_TASK_LIFECYCLE_STATUSES
     assert "failed" in TERMINAL_TASK_LIFECYCLE_STATUSES
+    assert "cancelled" in TERMINAL_TASK_LIFECYCLE_STATUSES
     assert "waiting_for_children" in NONTERMINAL_TASK_LIFECYCLE_STATUSES
     assert "resumable" in NONTERMINAL_TASK_LIFECYCLE_STATUSES
     assert "working" in NONTERMINAL_TASK_LIFECYCLE_STATUSES

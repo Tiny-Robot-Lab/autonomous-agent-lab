@@ -1168,7 +1168,7 @@ async def test_v2_resumed_claim_happy_path_and_fail_closed_checks(target_resolut
         )
     store.resolved_waves[(parent_id, ctx["wave_id"])] = saved_rw
 
-    # Reject TIMED_OUT or CANCELLED continuation state
+    # Reject CANCELLED or closed continuation state
     saved_cont = store.continuations[(parent_id, 2)]
     store.continuations[(parent_id, 2)] = TaskContinuationV2(
         parent_task_id=saved_cont.parent_task_id,
@@ -1182,8 +1182,8 @@ async def test_v2_resumed_claim_happy_path_and_fail_closed_checks(target_resolut
         control_fields=dict(saved_cont.control_fields),
         artifact_references=saved_cont.artifact_references,
         continuation_version=2,
-        state="released",
-        wave_resolution="TIMED_OUT",
+        state="closed",
+        wave_resolution=None,
     )
     with pytest.raises(TaskNotClaimableError):
         await store.atomic_claim_task(

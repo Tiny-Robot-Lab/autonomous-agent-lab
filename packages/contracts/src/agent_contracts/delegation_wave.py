@@ -29,6 +29,8 @@ DELEGATION_WAVE_PROPOSAL_CONTRACT_VERSION: int = 2
 DELEGATION_WAVE_RESPONSE_CONTRACT_VERSION: int = 2
 WAVE_YIELD_CONTRACT_VERSION: int = 2
 WAVE_DEADLINE_POLICY_CONTRACT_VERSION: int = 1
+WAVE_TIMEOUT_CONTRACT_VERSION: int = 1
+WAVE_CANCELLATION_CONTRACT_VERSION: int = 1
 
 MIN_WAVE_CHILDREN: int = 2
 MAX_WAVE_CHILDREN: int = 4
@@ -962,6 +964,13 @@ class ResolvedDelegationWave:
                     raise ValueError(
                         "WAIT_ALL SATISFIED resolution requires all required children terminal with no residuals"
                     )
+                if clean_resolution in (
+                    WaveResolution.TIMED_OUT.value,
+                    WaveResolution.CANCELLED.value,
+                ) and (u_cnt < 1 or len(clean_residual) < 1 or t_cnt >= len(clean_children)):
+                    raise ValueError(
+                        f"WAIT_ALL {clean_resolution} resolution requires at least one unresolved residual child"
+                    )
             else:
                 assert derived_count is not None
                 if clean_resolution == WaveResolution.SATISFIED.value and c_cnt < derived_count:
@@ -974,6 +983,19 @@ class ResolvedDelegationWave:
                 ):
                     raise ValueError(
                         f"PARTIAL UNSATISFIABLE resolution inconsistent with counts "
+                        f"(completed={c_cnt}, unresolved={u_cnt}, required={derived_count})"
+                    )
+                if clean_resolution in (
+                    WaveResolution.TIMED_OUT.value,
+                    WaveResolution.CANCELLED.value,
+                ) and (
+                    u_cnt < 1
+                    or len(clean_residual) < 1
+                    or c_cnt >= derived_count
+                    or c_cnt + u_cnt < derived_count
+                ):
+                    raise ValueError(
+                        f"PARTIAL {clean_resolution} resolution requires an unresolved wave with residual children "
                         f"(completed={c_cnt}, unresolved={u_cnt}, required={derived_count})"
                     )
 
@@ -1010,19 +1032,15 @@ class ResolvedDelegationWave:
                         f"triggering_child_task_id '{clean_trig_child}' must have a canonical terminal outcome"
                     )
                 object.__setattr__(self, "triggering_child_task_id", clean_trig_child)
-            elif self.triggering_child_task_id is not None:
-                clean_trig_child = _require_utf8_bound(
-                    _require_nonempty_str(
-                        self.triggering_child_task_id, "triggering_child_task_id"
-                    ),
-                    "triggering_child_task_id",
-                    MAX_WAVE_IDENTIFIER_BYTES,
-                )
-                if clean_trig_child not in clean_children:
+            else:
+                if (
+                    self.triggering_child_task_id is not None
+                    or self.triggering_assignment_id is not None
+                    or self.triggering_fencing_epoch is not None
+                ):
                     raise ValueError(
-                        f"triggering_child_task_id '{clean_trig_child}' is not in required_child_task_ids"
+                        f"{clean_resolution} resolution must not carry triggering child/assignment/fence fields"
                     )
-                object.__setattr__(self, "triggering_child_task_id", clean_trig_child)
 
             if (self.triggering_assignment_id is None) != (self.triggering_fencing_epoch is None):
                 raise ValueError(
@@ -1918,6 +1936,325 @@ class DelegationWaveResponse:
 
     @classmethod
     def from_json(cls, value: str) -> "DelegationWaveResponse":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+def compute_wave_timeout_fingerprint(
+    *,
+    parent_task_id: str,
+    wave_id: str,
+) -> str:
+    """Compute deterministic canonical SHA-256 fingerprint for wave-deadline evaluation."""
+    payload = {
+        "parent_task_id": str(parent_task_id).strip(),
+        "resolution": WaveResolution.TIMED_OUT.value,
+        "version": WAVE_TIMEOUT_CONTRACT_VERSION,
+        "wave_id": str(wave_id).strip(),
+    }
+    return hashlib.sha256(canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def compute_wave_cancellation_fingerprint(
+    *,
+    parent_task_id: str,
+    wave_id: str,
+) -> str:
+    """Compute deterministic canonical SHA-256 fingerprint for authorized wave cancellation."""
+    payload = {
+        "parent_task_id": str(parent_task_id).strip(),
+        "resolution": WaveResolution.CANCELLED.value,
+        "version": WAVE_CANCELLATION_CONTRACT_VERSION,
+        "wave_id": str(wave_id).strip(),
+    }
+    return hashlib.sha256(canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class WaveTimeoutEvaluationCommand:
+    """Trusted platform command to evaluate a frozen authoritative delegation-wave deadline."""
+
+    parent_task_id: str
+    wave_id: str
+    version: int = WAVE_TIMEOUT_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != WAVE_TIMEOUT_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        clean_parent = _require_utf8_bound(
+            _require_nonempty_str(self.parent_task_id, "parent_task_id"),
+            "parent_task_id",
+            MAX_WAVE_IDENTIFIER_BYTES,
+        )
+        clean_wave = _require_utf8_bound(
+            _require_nonempty_str(self.wave_id, "wave_id"),
+            "wave_id",
+            MAX_WAVE_IDENTIFIER_BYTES,
+        )
+        object.__setattr__(self, "parent_task_id", clean_parent)
+        object.__setattr__(self, "wave_id", clean_wave)
+        _require_json_byte_bound(self.to_json(), "WaveTimeoutEvaluationCommand")
+
+    def semantic_fingerprint(self) -> str:
+        return compute_wave_timeout_fingerprint(
+            parent_task_id=self.parent_task_id,
+            wave_id=self.wave_id,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "parent_task_id": self.parent_task_id,
+            "version": self.version,
+            "wave_id": self.wave_id,
+        }
+        check_no_credential_bearing_keys(data, "WaveTimeoutEvaluationCommand.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WaveTimeoutEvaluationCommand":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "WaveTimeoutEvaluationCommand payload")
+        forbidden = set(data.keys()) & (
+            FORBIDDEN_WAVE_AUTHORITY_FIELDS - {"wave_id"}
+        )
+        if forbidden:
+            raise ValueError(f"Forbidden authority fields supplied by caller: {sorted(forbidden)}")
+        allowed = {"parent_task_id", "wave_id", "version"}
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(
+                f"unexpected WaveTimeoutEvaluationCommand fields: {sorted(unexpected)}"
+            )
+        for req in ("parent_task_id", "wave_id"):
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            parent_task_id=data["parent_task_id"],
+            wave_id=data["wave_id"],
+            version=data.get("version", WAVE_TIMEOUT_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "WaveTimeoutEvaluationCommand":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class WaveCancellationCommand:
+    """Authorized operator command to cancel an active unresolved delegation wave."""
+
+    cancellation_decision_id: str
+    parent_task_id: str
+    wave_id: str
+    version: int = WAVE_CANCELLATION_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != WAVE_CANCELLATION_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        for str_field in ("cancellation_decision_id", "parent_task_id", "wave_id"):
+            clean_val = _require_utf8_bound(
+                _require_nonempty_str(getattr(self, str_field), str_field),
+                str_field,
+                MAX_WAVE_IDENTIFIER_BYTES,
+            )
+            object.__setattr__(self, str_field, clean_val)
+        _require_json_byte_bound(self.to_json(), "WaveCancellationCommand")
+
+    def semantic_fingerprint(self) -> str:
+        return compute_wave_cancellation_fingerprint(
+            parent_task_id=self.parent_task_id,
+            wave_id=self.wave_id,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "cancellation_decision_id": self.cancellation_decision_id,
+            "parent_task_id": self.parent_task_id,
+            "version": self.version,
+            "wave_id": self.wave_id,
+        }
+        check_no_credential_bearing_keys(data, "WaveCancellationCommand.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WaveCancellationCommand":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "WaveCancellationCommand payload")
+        forbidden = set(data.keys()) & (
+            FORBIDDEN_WAVE_AUTHORITY_FIELDS - {"wave_id"}
+        )
+        if forbidden:
+            raise ValueError(f"Forbidden authority fields supplied by caller: {sorted(forbidden)}")
+        allowed = {"cancellation_decision_id", "parent_task_id", "wave_id", "version"}
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(
+                f"unexpected WaveCancellationCommand fields: {sorted(unexpected)}"
+            )
+        for req in ("cancellation_decision_id", "parent_task_id", "wave_id"):
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            cancellation_decision_id=data["cancellation_decision_id"],
+            parent_task_id=data["parent_task_id"],
+            wave_id=data["wave_id"],
+            version=data.get("version", WAVE_CANCELLATION_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "WaveCancellationCommand":
+        if not isinstance(value, str):
+            raise TypeError(f"value must be a string, got {type(value).__name__}")
+        return cls.from_dict(json.loads(value))
+
+
+@dataclass(frozen=True)
+class WaveCancellationRecord:
+    """Authoritative Redis-persisted decision record for authorized wave cancellation."""
+
+    cancellation_decision_id: str
+    parent_task_id: str
+    wave_id: str
+    operator_principal_id: str
+    semantic_fingerprint: str
+    cancelled_at: str
+    resolution: str = WaveResolution.CANCELLED.value
+    prior_parent_status: str = TaskLifecycleStatus.WAITING_FOR_CHILDREN.value
+    terminal_parent_status: str = TaskLifecycleStatus.CANCELLED.value
+    version: int = WAVE_CANCELLATION_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        ver = _require_int(self.version, "version", minimum=1)
+        if ver != WAVE_CANCELLATION_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported contract version: {ver}")
+
+        for str_field in (
+            "cancellation_decision_id",
+            "parent_task_id",
+            "wave_id",
+            "operator_principal_id",
+            "semantic_fingerprint",
+            "resolution",
+            "prior_parent_status",
+            "terminal_parent_status",
+        ):
+            clean_val = _require_utf8_bound(
+                _require_nonempty_str(getattr(self, str_field), str_field),
+                str_field,
+                MAX_WAVE_IDENTIFIER_BYTES,
+            )
+            object.__setattr__(self, str_field, clean_val)
+
+        if self.resolution != WaveResolution.CANCELLED.value:
+            raise ValueError(
+                f"WaveCancellationRecord resolution must be 'CANCELLED', got '{self.resolution}'"
+            )
+        if self.prior_parent_status != TaskLifecycleStatus.WAITING_FOR_CHILDREN.value:
+            raise ValueError(
+                f"WaveCancellationRecord prior_parent_status must be 'waiting_for_children', got '{self.prior_parent_status}'"
+            )
+        if self.terminal_parent_status != TaskLifecycleStatus.CANCELLED.value:
+            raise ValueError(
+                f"WaveCancellationRecord terminal_parent_status must be 'cancelled', got '{self.terminal_parent_status}'"
+            )
+
+        expected_fp = compute_wave_cancellation_fingerprint(
+            parent_task_id=self.parent_task_id,
+            wave_id=self.wave_id,
+        )
+        if self.semantic_fingerprint != expected_fp:
+            raise ValueError("WaveCancellationRecord semantic_fingerprint mismatch")
+
+        object.__setattr__(
+            self, "cancelled_at", normalize_canonical_utc_timestamp(self.cancelled_at)
+        )
+        _require_json_byte_bound(self.to_json(), "WaveCancellationRecord")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "cancellation_decision_id": self.cancellation_decision_id,
+            "cancelled_at": self.cancelled_at,
+            "operator_principal_id": self.operator_principal_id,
+            "parent_task_id": self.parent_task_id,
+            "prior_parent_status": self.prior_parent_status,
+            "resolution": self.resolution,
+            "semantic_fingerprint": self.semantic_fingerprint,
+            "terminal_parent_status": self.terminal_parent_status,
+            "version": self.version,
+            "wave_id": self.wave_id,
+        }
+        check_no_credential_bearing_keys(data, "WaveCancellationRecord.to_dict")
+        return data
+
+    def to_json(self) -> str:
+        return canonical_json_dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WaveCancellationRecord":
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict")
+        check_no_credential_bearing_keys(data, "WaveCancellationRecord payload")
+        allowed = {
+            "cancellation_decision_id",
+            "cancelled_at",
+            "operator_principal_id",
+            "parent_task_id",
+            "prior_parent_status",
+            "resolution",
+            "semantic_fingerprint",
+            "terminal_parent_status",
+            "version",
+            "wave_id",
+        }
+        unexpected = set(data.keys()) - allowed
+        if unexpected:
+            raise TypeError(
+                f"unexpected WaveCancellationRecord fields: {sorted(unexpected)}"
+            )
+        for req in (
+            "cancellation_decision_id",
+            "parent_task_id",
+            "wave_id",
+            "operator_principal_id",
+            "semantic_fingerprint",
+            "cancelled_at",
+        ):
+            if req not in data:
+                raise ValueError(f"{req} is required")
+        return cls(
+            cancellation_decision_id=data["cancellation_decision_id"],
+            parent_task_id=data["parent_task_id"],
+            wave_id=data["wave_id"],
+            operator_principal_id=data["operator_principal_id"],
+            semantic_fingerprint=data["semantic_fingerprint"],
+            cancelled_at=data["cancelled_at"],
+            resolution=data.get("resolution", WaveResolution.CANCELLED.value),
+            prior_parent_status=data.get(
+                "prior_parent_status", TaskLifecycleStatus.WAITING_FOR_CHILDREN.value
+            ),
+            terminal_parent_status=data.get(
+                "terminal_parent_status", TaskLifecycleStatus.CANCELLED.value
+            ),
+            version=data.get("version", WAVE_CANCELLATION_CONTRACT_VERSION),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "WaveCancellationRecord":
         if not isinstance(value, str):
             raise TypeError(f"value must be a string, got {type(value).__name__}")
         return cls.from_dict(json.loads(value))

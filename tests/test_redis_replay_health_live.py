@@ -918,6 +918,204 @@ def _write_full_envelope_state(cluster: LiveRedisAclCluster) -> None:
                     "principal-analysis-1",
                     "analysis-agent-1",
                 )
+            # Second wave -> cancel via real orchestrator boundary -> task.delegation_wave_cancellation:*
+            from agent_contracts import WaveCancellationCommand
+
+            wcan_parent_id = "task-env-wave-cancel-1"
+            await gw.register_root_task(
+                TaskRequested(
+                    task_id=wcan_parent_id,
+                    root_task_id=wcan_parent_id,
+                    parent_task_id=None,
+                    prompt="Envelope wave cancel parent",
+                    created_at=t0,
+                    version=2,
+                ),
+                initial_status="pending",
+                required_capability="research",
+            )
+            cluster.admin_cli(
+                "SET",
+                f"task.authority:{wcan_parent_id}",
+                RootAuthorityRecord.create_wave_baseline(
+                    wcan_parent_id, max_children_per_wave=2, created_at=t0
+                ).to_json(),
+            )
+            wk_grant = DelegationGrantV2(
+                grant_id="grant-env-wk-1",
+                root_task_id=wcan_parent_id,
+                issued_to_assignment_id="assign-env-wk-1",
+                issued_to_principal_id="principal-research-1",
+                fencing_epoch=1,
+                turn_id="turn-env-wk-1",
+                issued_at=t0,
+                max_children=2,
+            )
+            wk_claim = ActiveClaim(
+                task_id=wcan_parent_id,
+                assignment_id="assign-env-wk-1",
+                claim_id="claim-env-wk-1",
+                root_task_id=wcan_parent_id,
+                turn_id="turn-env-wk-1",
+                runtime_principal_id="principal-research-1",
+                bound_agent_id="research-agent-1",
+                assigned_capability="research",
+                execution_kind="initial",
+                fencing_epoch=1,
+                proof_digest="f" * 64,
+                request_id="req-env-wk-1",
+                claimed_at=t0,
+                delivery_expires_at=future_lease,
+                delegation_grant_id="grant-env-wk-1",
+                prior_claimable_status="pending",
+            )
+            await gw.atomic_claim_task(
+                wcan_parent_id, wk_claim, grant=wk_grant, now=t0, is_root=True
+            )
+            await gw.acknowledge_claim(
+                wcan_parent_id, "assign-env-wk-1", "principal-research-1", t0
+            )
+            wk_art = StageArtifact(
+                artifact_id="art-env-wk-1",
+                producing_task_id=wcan_parent_id,
+                artifact_type="research_material",
+                content={"material": "envelope cancel wave artifact"},
+                created_at=t0,
+                producing_turn_id="turn-env-wk-1",
+                artifact_version=1,
+                payload_schema_version=1,
+                sealed=True,
+                metadata={"turn_id": "turn-env-wk-1"},
+            )
+            await gw.save_stage_artifact(
+                wk_art, "assign-env-wk-1", "principal-research-1", 1
+            )
+            wk_ref = ArtifactReference(
+                artifact_id="art-env-wk-1",
+                producing_task_id=wcan_parent_id,
+                artifact_version=1,
+            )
+            wk_req = DelegationWaveProposalRequest(
+                proposal_id="prop-env-wk-1",
+                items=(
+                    DelegationWaveProposalItem(
+                        item_id="item-1",
+                        child_intent="Cancel wave branch 1",
+                        artifact_reference=wk_ref,
+                    ),
+                    DelegationWaveProposalItem(
+                        item_id="item-2",
+                        child_intent="Cancel wave branch 2",
+                        artifact_reference=wk_ref,
+                    ),
+                ),
+                barrier_policy="WAIT_ALL",
+            )
+            wk_children = ("task-env-wk-c1", "task-env-wk-c2")
+            wk_dd = derive_wave_deadline(
+                work_complexity=wk_req.work_complexity,
+                uncertainty_level=wk_req.uncertainty_level,
+                required_child_count=2,
+                planned_parallelism=2,
+                min_duration_seconds=MIN_WAVE_DURATION_SECONDS,
+                max_duration_seconds=MAX_WAVE_DURATION_SECONDS,
+                accepted_at=t0,
+            )
+            wk_acc = AcceptedDelegationWave(
+                wave_id="wave-env-wk-1",
+                parent_task_id=wcan_parent_id,
+                required_child_task_ids=wk_children,
+                barrier_policy=wk_req.barrier_policy,
+                deadline_derivation=wk_dd,
+                accepted_at=t0,
+            )
+            wk_prop = DelegationWaveProposalRecord(
+                parent_task_id=wcan_parent_id,
+                proposal_id=wk_req.proposal_id,
+                wave_id=wk_acc.wave_id,
+                delegation_decision_id="dec-env-wk-1",
+                assignment_id="assign-env-wk-1",
+                runtime_principal_id="principal-research-1",
+                bound_agent_id="research-agent-1",
+                fencing_epoch=1,
+                proof_digest="f" * 64,
+                proposal_fingerprint=compute_wave_proposal_fingerprint(
+                    parent_task_id=wcan_parent_id,
+                    assignment_id="assign-env-wk-1",
+                    request=wk_req,
+                ),
+                delegation_grant_id="grant-env-wk-1",
+                required_child_task_ids=wk_children,
+                barrier_policy=wk_acc.barrier_policy,
+                accepted_at=t0,
+                wave_deadline=wk_dd.wave_deadline,
+                child_claim_deadline=future_now,
+            )
+            wk_cont = TaskContinuationV2(
+                parent_task_id=wcan_parent_id,
+                wave_id=wk_acc.wave_id,
+                required_child_task_ids=wk_children,
+                created_at=t0,
+                updated_at=t0,
+                input_version=1,
+                continuation_capability="research",
+                stage="incorporate_analysis_child",
+                control_fields={},
+                artifact_references=(wk_ref,),
+                continuation_version=2,
+                state="active",
+                wave_resolution=None,
+            )
+            wk_inputs = [
+                TaskInput(
+                    task_id=cid,
+                    prompt=item.child_intent,
+                    created_at=t0,
+                    input_version=1,
+                    artifact_references=(item.artifact_reference,),
+                )
+                for cid, item in zip(wk_children, wk_req.items, strict=True)
+            ]
+            wk_hints = [
+                WakeUpHint(
+                    hint_id=f"hint-{cid}",
+                    capability="analysis",
+                    created_at=t0,
+                    execution_kind="delegated_child",
+                    task_id=cid,
+                )
+                for cid in wk_children
+            ]
+            wk_yield = WaveYieldRecord(
+                assignment_id="assign-env-wk-1",
+                parent_task_id=wcan_parent_id,
+                principal_id="principal-research-1",
+                proposal_id=wk_req.proposal_id,
+                wave_id=wk_acc.wave_id,
+                required_child_task_ids=wk_children,
+                delegation_decision_id="dec-env-wk-1",
+                yielded_at=t0,
+            )
+            await gw.accept_delegation_wave(
+                parent_task_id=wcan_parent_id,
+                proposal=wk_prop,
+                accepted_wave=wk_acc,
+                child_task_inputs=wk_inputs,
+                parent_continuation=wk_cont,
+                yield_record=wk_yield,
+                wake_up_hints=wk_hints,
+                expected_fencing_epoch=1,
+                now=t0,
+            )
+            await gw.cancel_delegation_wave(
+                WaveCancellationCommand(
+                    cancellation_decision_id="can-env-1",
+                    parent_task_id=wcan_parent_id,
+                    wave_id=wk_acc.wave_id,
+                ),
+                operator_principal_id="operator-cancel-env",
+                now=t0,
+            )
         finally:
             await gw_legacy.aclose()
             await gw.aclose()

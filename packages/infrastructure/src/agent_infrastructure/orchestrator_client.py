@@ -17,6 +17,7 @@ from agent_contracts import (
     ResumedContinuationContext,
     StageArtifact,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskResult,
     TerminalOutcome,
@@ -290,7 +291,9 @@ class OrchestratorClient:
             return ctx.parent_task_input
         return None
 
-    async def get_continuation(self, task_id: str, version: int = 1) -> TaskContinuation | None:
+    async def get_continuation(
+        self, task_id: str, version: int = 1
+    ) -> TaskContinuation | TaskContinuationV2 | None:
         clean_task = str(task_id).strip()
         ctx = self._cached_contexts.get(clean_task)
         if ctx is not None and ctx.continuation.continuation_version == version:
@@ -318,8 +321,9 @@ class OrchestratorClient:
     async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None:
         clean_task = str(task_id).strip()
         for ctx in self._cached_contexts.values():
-            if ctx.child_outcome.task_id == clean_task:
-                return ctx.child_outcome
+            outcome = ctx.child_outcome
+            if outcome is not None and outcome.task_id == clean_task:
+                return outcome
         return None
 
     async def get_canonical_result(self, task_id: str) -> TaskResult | None:
