@@ -180,7 +180,7 @@ async def run_research_agent(
 
                 if execution_kind == "resumed_continuation":
                     expected_continuation_version = getattr(hint, "expected_continuation_version", None)
-                    if expected_continuation_version != 1:
+                    if expected_continuation_version not in (1, 2):
                         logger.warning(
                             "Ignoring hint for task %s: unsupported continuation_version %s",
                             task_id,

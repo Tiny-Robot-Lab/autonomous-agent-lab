@@ -3878,14 +3878,14 @@ def _make_malformed_hint() -> Any:
         ),
         ("expected_continuation_version_zero", _make_hint(expected_continuation_version=0)),
         (
-            "expected_continuation_version_two",
+            "expected_continuation_version_unsupported",
             WakeUpHint(
-                hint_id="h-ver-two",
+                hint_id="h-ver-unsupported",
                 capability="research",
                 created_at="2026-11-22T00:00:00Z",
                 execution_kind="resumed_continuation",
-                task_id="task-ver-two",
-                expected_continuation_version=2,
+                task_id="task-ver-unsupported",
+                expected_continuation_version=3,
             ),
         ),
         (
@@ -4254,3 +4254,303 @@ async def test_research_processor_delegation_with_exact_2000_char_prompt() -> No
     child_intent = call_kwargs["child_intent"]
     assert len(child_intent) <= 2000
     assert child_intent == "Analyze the sealed Research evidence for this delegated task."
+
+
+@pytest.mark.anyio
+async def test_research_delegation_coordinator_wave_mode() -> None:
+    from research_agent.application.delegation import ResearchDelegationCoordinator
+
+    coord = ResearchDelegationCoordinator("delegate_analysis_wave")
+    assert coord.mode == "delegate_analysis_wave"
+    task = TaskRequested.create("Sample research prompt")
+    assert coord.decide(task, "initial") == "delegate_analysis_wave"
+    assert coord.decide(task, "resumed_continuation") == "complete_locally"
+
+
+@pytest.mark.anyio
+async def test_research_processor_proposes_wave_and_yields() -> None:
+    from agent_contracts import BarrierPolicy, DelegationWaveProposalRequest
+    from research_agent.application.delegation import ResearchDelegationCoordinator
+
+    mock_bus = AsyncMock()
+    mock_executor = AsyncMock()
+    mock_executor.execute.return_value = ResearchResult(
+        task_id="task-wave-1",
+        output="Primary research deployment plan material.",
+        acknowledged=True,
+    )
+    mock_client = AsyncMock()
+
+    processor = ResearchProcessor(
+        agent_id="research-test",
+        bus=mock_bus,
+        executor=mock_executor,
+        completion_client=mock_client,
+        delegation_client=mock_client,
+        delegation_coordinator=ResearchDelegationCoordinator("delegate_analysis_wave"),
+    )
+
+    task = TaskRequested.create("Propose a practical deployment plan for a small self-hosted learning service.")
+    await processor.run_once(
+        task,
+        assignment_id="asgn-wave-1",
+        assignment_proof="proof-wave-1",
+        execution_kind="initial",
+    )
+
+    mock_client.stage_artifact.assert_awaited_once()
+    mock_client.propose_delegation_wave.assert_awaited_once()
+    call_kwargs = mock_client.propose_delegation_wave.call_args.kwargs
+    assert call_kwargs["task_id"] == task.task_id
+    assert call_kwargs["assignment_id"] == "asgn-wave-1"
+    assert call_kwargs["assignment_proof"] == "proof-wave-1"
+    wave_req: DelegationWaveProposalRequest = call_kwargs["request"]
+    assert wave_req.barrier_policy == BarrierPolicy.WAIT_ALL.value
+    assert len(wave_req.items) == 3
+    assert [it.child_intent for it in wave_req.items] == [
+        "Security analysis",
+        "Reliability analysis",
+        "Operations and capacity analysis",
+    ]
+    assert [it.item_id for it in wave_req.items] == [
+        "analysis-security",
+        "analysis-reliability",
+        "analysis-operations",
+    ]
+    # Verified yield: no turn completion submitted
+    mock_client.submit_completion.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_research_processor_resumed_v2_lifecycle_only() -> None:
+    from agent_contracts import (
+        CONTINUATION_V2_STATE_RELEASED,
+        ArtifactReference,
+        StageArtifact,
+        TaskContinuationV2,
+        TaskInput,
+        WaveResolution,
+    )
+
+    mock_bus = AsyncMock()
+    mock_executor = AsyncMock()
+    mock_client = AsyncMock()
+    mock_reader = AsyncMock()
+
+    parent_id = "task-resumed-wave-1"
+    task_input = TaskInput(
+        task_id=parent_id,
+        prompt="Propose deployment plan",
+        created_at="2026-11-27T00:00:00Z",
+        input_version=1,
+        artifact_references=(),
+        metadata={},
+        version=1,
+    )
+    mock_reader.get_task_input.return_value = task_input
+
+    art_ref = ArtifactReference(
+        artifact_id="art-primary-1",
+        producing_task_id=parent_id,
+        artifact_version=1,
+    )
+    continuation_v2 = TaskContinuationV2(
+        parent_task_id=parent_id,
+        wave_id="wave-1",
+        continuation_version=2,
+        state=CONTINUATION_V2_STATE_RELEASED,
+        required_child_task_ids=(f"{parent_id}.c1", f"{parent_id}.c2", f"{parent_id}.c3"),
+        wave_resolution=WaveResolution.SATISFIED.value,
+        artifact_references=(art_ref,),
+        input_version=1,
+        created_at="2026-11-27T00:00:00Z",
+        updated_at="2026-11-27T00:01:00Z",
+        version=2,
+    )
+    mock_reader.get_continuation.return_value = continuation_v2
+
+    stage_art = StageArtifact(
+        producing_task_id=parent_id,
+        artifact_id="art-primary-1",
+        artifact_type="research_material",
+        content={"material": "Sealed primary evidence"},
+        created_at="2026-11-27T00:00:00Z",
+        producing_turn_id="turn-1",
+        artifact_version=1,
+        payload_schema_version=1,
+        sealed=True,
+    )
+    mock_reader.get_stage_artifact.return_value = stage_art
+
+    processor = ResearchProcessor(
+        agent_id="research-test",
+        bus=mock_bus,
+        executor=mock_executor,
+        completion_client=mock_client,
+        context_reader=mock_reader,
+    )
+
+    task = TaskRequested.create("Propose deployment plan")
+    await processor.run_once(
+        task,
+        assignment_id="asgn-resumed-2",
+        assignment_proof="proof-resumed-2",
+        execution_kind="resumed_continuation",
+        continuation_version=2,
+    )
+
+    mock_client.submit_completion.assert_awaited_once()
+    cmd = mock_client.submit_completion.call_args.kwargs["command"]
+    assert cmd.execution_kind == "resumed_continuation"
+    assert cmd.continuation_version == 2
+    assert cmd.completed_result is not None
+    output = cmd.completed_result.output
+    assert "Collaborative Research parent lifecycle complete. Authoritative wave resolution: SATISFIED across 3 analysis children (barrier_policy=WAIT_ALL)." in output
+    assert "Structured child-result aggregation remains Issue #35." in output
+
+    # Strict Issue #35 isolation: zero calls to get_canonical_result or get_terminal_outcome
+    mock_reader.get_canonical_result.assert_not_awaited()
+    mock_reader.get_terminal_outcome.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_research_main_processes_v2_resumed_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_contracts import (
+        ResumedContinuationContext,
+        StageArtifact,
+        TaskContinuationV2,
+        TaskInput,
+        WakeUpHint,
+    )
+
+    monkeypatch.setenv("RUNTIME_TOKEN", "test-token")
+    monkeypatch.setenv("AGENT_ID", "research-agent-test")
+    monkeypatch.setenv("RESEARCH_EXECUTOR", "stub")
+    monkeypatch.setenv("INFERENCE_PROVIDER", "stub")
+    monkeypatch.setenv("REDIS_AUTH_MODE", "unauthenticated_local_test")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_USERNAME", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD_FILE", raising=False)
+
+    hint_v2 = WakeUpHint(
+        hint_id="h-wave-resolved",
+        capability="research",
+        created_at="2026-11-27T00:02:00Z",
+        execution_kind="resumed_continuation",
+        task_id="task-wave-resumed",
+        expected_continuation_version=2,
+    )
+
+    with (
+        patch("research_agent.main.RedisBus") as mock_bus_cls,
+        patch("research_agent.main.OrchestratorClient") as mock_orch_cls,
+        patch("research_agent.main.ResearchProcessor") as mock_proc_cls,
+    ):
+        mock_bus = AsyncMock()
+        mock_bus_cls.return_value = mock_bus
+
+        mock_orch = AsyncMock()
+        mock_orch_cls.return_value = mock_orch
+        mock_orch.claim_task.return_value = (
+            {"assignment_id": "asgn-wave-res", "task_id": "task-wave-resumed", "fencing_epoch": 2},
+            "proof-wave-res",
+        )
+        fake_task_input = TaskInput(
+            task_id="task-wave-resumed",
+            prompt="Deployment plan prompt",
+            created_at="2026-11-27T00:00:00Z",
+            input_version=1,
+            artifact_references=(),
+            metadata={},
+            version=1,
+        )
+        from agent_contracts import ArtifactReference, ResolvedDelegationWave
+
+        art_ref = ArtifactReference(
+            producing_task_id="task-wave-resumed",
+            artifact_id="art-1",
+            artifact_version=1,
+        )
+        fake_ctx = ResumedContinuationContext(
+            parent_task_input=fake_task_input,
+            continuation=TaskContinuationV2(
+                parent_task_id="task-wave-resumed",
+                wave_id="w1",
+                continuation_version=2,
+                state="released",
+                required_child_task_ids=("c1", "c2", "c3"),
+                wave_resolution="SATISFIED",
+                artifact_references=(art_ref,),
+                input_version=1,
+                created_at="2026-11-27T00:00:00Z",
+                updated_at="2026-11-27T00:01:00Z",
+                version=2,
+            ),
+            stage_artifact=StageArtifact(
+                producing_task_id="task-wave-resumed",
+                artifact_id="art-1",
+                artifact_type="research_material",
+                content={"material": "text"},
+                created_at="2026-11-27T00:00:00Z",
+                producing_turn_id="turn-1",
+                artifact_version=1,
+                payload_schema_version=1,
+                sealed=True,
+            ),
+            resolved_wave=ResolvedDelegationWave(
+                parent_task_id="task-wave-resumed",
+                wave_id="w1",
+                resolution="SATISFIED",
+                required_child_task_ids=("c1", "c2", "c3"),
+                barrier_policy="WAIT_ALL",
+                resolved_at="2026-11-27T00:01:00Z",
+                wave_deadline="2026-11-27T00:10:00Z",
+                accepted_at="2026-11-27T00:00:10Z",
+                accepted_wave_fingerprint="a" * 64,
+                child_outcomes={
+                    "c1": {"status": "completed", "outcome_id": "out-1"},
+                    "c2": {"status": "completed", "outcome_id": "out-2"},
+                    "c3": {"status": "completed", "outcome_id": "out-3"},
+                },
+                residual_child_task_ids=(),
+                completed_count=3,
+                terminal_count=3,
+                unresolved_count=0,
+                deadline_policy_id="deterministic_bounded_baseline_v1",
+                deadline_policy_version=1,
+                triggering_child_task_id="c3",
+                triggering_assignment_id="asgn-c3",
+                triggering_fencing_epoch=1,
+                version=2,
+            ),
+            root_task_id="task-wave-resumed",
+            assignment_id="asgn-wave-res",
+            fencing_epoch=2,
+            version=2,
+        )
+        mock_orch.get_resumed_continuation_context.return_value = fake_ctx
+
+        mock_proc = AsyncMock()
+        mock_proc_cls.return_value = mock_proc
+
+        mock_bus.next_signal.side_effect = [
+            hint_v2,
+            asyncio.CancelledError(),
+        ]
+
+        from research_agent.main import run_research_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_research_agent()
+
+        mock_orch.claim_task.assert_awaited_once_with(
+            task_id="task-wave-resumed",
+            request_id=mock_orch.claim_task.call_args.kwargs["request_id"],
+            capability="research",
+            execution_kind="resumed_continuation",
+            expected_continuation_version=2,
+        )
+        mock_proc.run_once.assert_awaited_once()
+        call_kwargs = mock_proc.run_once.call_args.kwargs
+        assert call_kwargs["execution_kind"] == "resumed_continuation"
+        assert call_kwargs["continuation_version"] == 2

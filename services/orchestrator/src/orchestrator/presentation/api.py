@@ -5,7 +5,10 @@ from typing import Annotated, Any
 from agent_contracts import (
     FORBIDDEN_AUTHORITY_FIELDS,
     ArtifactReference,
+    DelegationWaveProposalItem,
+    DelegationWaveProposalRequest,
     RecoveryDecisionCommand,
+    RequiredSuccessFraction,
     WaveCancellationCommand,
     __version__,
     sanitize_redis_url,
@@ -59,6 +62,7 @@ from orchestrator.application.queries import (
 )
 from orchestrator.application.use_cases import (
     AcceptDelegationProposal,
+    AcceptDelegationWave,
     AcknowledgeAssignment,
     CancelDelegationWave,
     ClaimTask,
@@ -233,6 +237,31 @@ class DelegationProposalInput(BaseModel):
     target_capability: str = "analysis"
     parent_input_version: int = 1
     control_fields: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class DelegationWaveProposalItemInput(BaseModel):
+    item_id: str = Field(min_length=1)
+    child_intent: str = Field(min_length=1)
+    artifact_reference: dict[str, Any]
+    target_capability: str = "analysis"
+    control_fields: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class DelegationWaveProposalInput(BaseModel):
+    proposal_id: str = Field(min_length=1)
+    assignment_id: str = Field(min_length=1)
+    items: list[DelegationWaveProposalItemInput] = Field(min_length=1)
+    barrier_policy: str = "WAIT_ALL"
+    required_success_fraction: dict[str, Any] | None = None
+    work_complexity: str = "medium"
+    uncertainty_level: str = "low"
+    planned_parallelism: int | None = None
+    parent_input_version: int = 1
+    version: int = 2
 
     model_config = {"extra": "allow"}
 
@@ -553,6 +582,116 @@ async def accept_delegation_endpoint(
             target_capability=value.target_capability,
             parent_input_version=value.parent_input_version,
             control_fields=value.control_fields,
+        )
+        return resp.to_dict()
+    except DelegationReplayAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Delegation replay authorization failed") from exc
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (InvalidClaimProofError, CapabilityMismatchError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ClaimNotFoundError, ParentTaskNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        TaskAlreadyClaimedError,
+        TaskNotClaimableError,
+        ClaimDeliveryLeaseExpiredError,
+        DelegationConflictError,
+        WaveBudgetExceededError,
+        GrantAlreadyConsumedError,
+        ConflictingContinuationError,
+        ConflictingChildTaskRegistrationError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
+
+
+async def accept_delegation_wave_endpoint(
+    task_id: str,
+    value: DelegationWaveProposalInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    wave_uc: AcceptDelegationWave | None = getattr(
+        request.app.state, "accept_delegation_wave", None
+    )
+    if wave_uc is None:
+        raise HTTPException(
+            status_code=503, detail="Delegation wave service is not enabled"
+        )
+
+    header_proof = request.headers.get("X-Assignment-Proof", "").strip()
+    if not header_proof:
+        raise HTTPException(
+            status_code=401, detail="Missing assignment proof in X-Assignment-Proof header"
+        )
+
+    try:
+        extra = getattr(value, "__pydantic_extra__", None)
+        if extra:
+            if "assignment_proof" in extra:
+                raise ValueError(
+                    "assignment_proof must not be provided in request body; use X-Assignment-Proof header"
+                )
+            forbidden = set(extra.keys()) & FORBIDDEN_AUTHORITY_FIELDS
+            if forbidden:
+                raise ValueError(f"Forbidden authority fields supplied: {sorted(forbidden)}")
+            raise ValueError(f"Unexpected fields supplied: {sorted(extra.keys())}")
+
+        parsed_items: list[DelegationWaveProposalItem] = []
+        for item in value.items:
+            item_extra = getattr(item, "__pydantic_extra__", None)
+            if item_extra:
+                if "assignment_proof" in item_extra:
+                    raise ValueError(
+                        "assignment_proof must not be provided in request body; use X-Assignment-Proof header"
+                    )
+                forbidden_item = set(item_extra.keys()) & FORBIDDEN_AUTHORITY_FIELDS
+                if forbidden_item:
+                    raise ValueError(
+                        f"Forbidden authority fields supplied: {sorted(forbidden_item)}"
+                    )
+                raise ValueError(f"Unexpected fields supplied: {sorted(item_extra.keys())}")
+
+            raw_ref = item.artifact_reference
+            if not isinstance(raw_ref, dict):
+                raise TypeError("artifact_reference must be an object")
+            art_ref = ArtifactReference.from_dict(raw_ref)
+            parsed_items.append(
+                DelegationWaveProposalItem(
+                    item_id=item.item_id,
+                    child_intent=item.child_intent,
+                    artifact_reference=art_ref,
+                    target_capability=item.target_capability,
+                    control_fields=item.control_fields,
+                )
+            )
+
+        parsed_frac: RequiredSuccessFraction | None = None
+        if value.required_success_fraction is not None:
+            parsed_frac = RequiredSuccessFraction.from_dict(value.required_success_fraction)
+
+        req = DelegationWaveProposalRequest(
+            proposal_id=value.proposal_id,
+            items=tuple(parsed_items),
+            barrier_policy=value.barrier_policy,
+            required_success_fraction=parsed_frac,
+            work_complexity=value.work_complexity,
+            uncertainty_level=value.uncertainty_level,
+            planned_parallelism=value.planned_parallelism,
+            parent_input_version=value.parent_input_version,
+            version=value.version,
+        )
+
+        resp = await wave_uc.execute(
+            principal=principal,
+            parent_task_id=task_id,
+            assignment_id=value.assignment_id,
+            assignment_proof=header_proof,
+            request=req,
         )
         return resp.to_dict()
     except DelegationReplayAuthorizationError as exc:
@@ -955,6 +1094,7 @@ def create_app(
     acknowledge_assignment: AcknowledgeAssignment | None = None
     stage_artifact: StageArtifactUseCase | None = None
     accept_delegation: AcceptDelegationProposal | None = None
+    accept_delegation_wave: AcceptDelegationWave | None = None
     complete_turn: CompleteTurn | None = None
     get_resumed_continuation_context: GetResumedContinuationContext | None = None
     get_child_task_input: GetChildTaskInput | None = None
@@ -990,6 +1130,7 @@ def create_app(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             delivery_lease_seconds=resolved_settings.claim_delivery_lease_seconds,
+            allow_wave_delegation_grant=executable_delegation_enabled,
         )
         acknowledge_assignment = AcknowledgeAssignment(
             task_store=resolved_task_store,
@@ -1018,6 +1159,11 @@ def create_app(
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
         )
         accept_delegation = AcceptDelegationProposal(
+            task_store=resolved_task_store,
+            assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
+            child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
+        )
+        accept_delegation_wave = AcceptDelegationWave(
             task_store=resolved_task_store,
             assignment_proof_pepper=resolved_settings.assignment_proof_pepper,
             child_claim_deadline_seconds=resolved_settings.child_claim_deadline_seconds,
@@ -1061,6 +1207,7 @@ def create_app(
     app.state.acknowledge_assignment = acknowledge_assignment
     app.state.stage_artifact = stage_artifact
     app.state.accept_delegation = accept_delegation
+    app.state.accept_delegation_wave = accept_delegation_wave
     app.state.complete_turn = complete_turn
     app.state.get_resumed_continuation_context = get_resumed_continuation_context
     app.state.get_child_task_input = get_child_task_input
@@ -1108,6 +1255,11 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/delegations",
         accept_delegation_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/delegation-waves",
+        accept_delegation_wave_endpoint,
         methods=["POST"],
     )
     app.add_api_route(

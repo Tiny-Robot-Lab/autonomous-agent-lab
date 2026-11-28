@@ -2,7 +2,8 @@
 
 Governed by ADR-0006, ADR-0007, and Issue #224:
 - Injectable production seam for turn-boundary delegation decisions;
-- Decision domain: 'complete_locally' (production default) or 'delegate_analysis';
+- Decision domain: 'complete_locally' (production default), 'delegate_analysis',
+  or 'delegate_analysis_wave';
 - No speculative autonomous planning or keyword heuristics.
 """
 
@@ -18,10 +19,12 @@ class ResearchDelegationCoordinator:
     """Bounded Research delegation decision coordinator.
 
     Production default: complete_locally.
-    Injectable for collaborative workflows: delegate_analysis.
+    Injectable for collaborative workflows: delegate_analysis, delegate_analysis_wave.
     """
 
-    ALLOWED_DECISIONS = frozenset({"complete_locally", "delegate_analysis"})
+    ALLOWED_DECISIONS = frozenset(
+        {"complete_locally", "delegate_analysis", "delegate_analysis_wave"}
+    )
 
     def __init__(self, mode: str = "complete_locally") -> None:
         clean_mode = str(mode).strip()
