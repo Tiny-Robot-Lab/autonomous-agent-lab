@@ -6,6 +6,8 @@ import pytest
 from agent_contracts import (
     ArtifactReference,
     DelegationGrant,
+    DelegationGrantV2,
+    RootAuthorityRecord,
     StageArtifact,
     TaskRequested,
 )
@@ -82,7 +84,11 @@ def test_settings() -> Settings:
     )
 
 
-async def setup_acknowledged_research_claim(store: InMemoryAuthoritativeTaskStore, parent_id: str = "task-parent-1") -> tuple[str, str, ArtifactReference]:
+async def setup_acknowledged_research_claim(
+    store: InMemoryAuthoritativeTaskStore,
+    parent_id: str = "task-parent-1",
+    grant_v2: bool = False,
+) -> tuple[str, str, ArtifactReference]:
     master = parse_master_secret(PROOF_PEPPER)
     token_key, verifier_key = derive_proof_subkeys(master)
 
@@ -96,19 +102,35 @@ async def setup_acknowledged_research_claim(store: InMemoryAuthoritativeTaskStor
         version=2,
     )
     await store.register_root_task(root_task, required_capability="research")
+    if grant_v2:
+        store.authorities[parent_id] = RootAuthorityRecord.create_wave_baseline(
+            parent_id, max_children_per_wave=4, created_at=now_iso
+        )
     # Set status to working (simulating claim and acknowledge)
     await store.update_status(parent_id, "working")
 
     assignment_id = f"asgn-{parent_id}"
-    grant = DelegationGrant(
-        grant_id=f"grant-{parent_id}",
-        root_task_id=parent_id,
-        issued_to_assignment_id=assignment_id,
-        issued_to_principal_id="principal-research-1",
-        fencing_epoch=1,
-        turn_id="turn-1",
-        issued_at=now_iso,
-    )
+    if grant_v2:
+        grant = DelegationGrantV2(
+            grant_id=f"grant-{parent_id}",
+            root_task_id=parent_id,
+            issued_to_assignment_id=assignment_id,
+            issued_to_principal_id="principal-research-1",
+            fencing_epoch=1,
+            turn_id="turn-1",
+            issued_at=now_iso,
+            max_children=4,
+        )
+    else:
+        grant = DelegationGrant(
+            grant_id=f"grant-{parent_id}",
+            root_task_id=parent_id,
+            issued_to_assignment_id=assignment_id,
+            issued_to_principal_id="principal-research-1",
+            fencing_epoch=1,
+            turn_id="turn-1",
+            issued_at=now_iso,
+        )
     claim_id = f"claim-{parent_id}"
     delivery_expires_at = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
     canonical_identity = encode_canonical_proof_identity(
@@ -658,6 +680,174 @@ async def test_child_claim_deadline_enforcement(test_settings: Settings) -> None
         )
         assert res_claim_expired.status_code == 409
         assert "has expired" in res_claim_expired.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_propose_delegation_wave_success(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+    parent_id = "task-parent-wave-1"
+    assignment_id, proof, art_ref = await setup_acknowledged_research_claim(store, parent_id, grant_v2=True)
+
+    payload = {
+        "proposal_id": "wave-prop-1",
+        "assignment_id": assignment_id,
+        "barrier_policy": "WAIT_ALL",
+        "parent_input_version": 1,
+        "version": 2,
+        "items": [
+            {
+                "item_id": "analysis-security",
+                "child_intent": "Security analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+            {
+                "item_id": "analysis-reliability",
+                "child_intent": "Reliability analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+            {
+                "item_id": "analysis-operations",
+                "child_intent": "Operations and capacity analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+        ],
+    }
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            f"/api/tasks/{parent_id}/delegation-waves",
+            json=payload,
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}", "X-Assignment-Proof": proof},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "accepted"
+        assert data["parent_task_id"] == parent_id
+        assert data["proposal_id"] == "wave-prop-1"
+        assert data["barrier_policy"] == "WAIT_ALL"
+        assert data["continuation_version"] == 2
+        assert len(data["required_child_task_ids"]) == 3
+        assert proof not in str(data)
+
+
+@pytest.mark.anyio
+async def test_propose_delegation_wave_missing_proof_rejected(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+    parent_id = "task-parent-wave-noproof"
+    assignment_id, _proof, art_ref = await setup_acknowledged_research_claim(store, parent_id, grant_v2=True)
+
+    payload = {
+        "proposal_id": "wave-prop-noproof",
+        "assignment_id": assignment_id,
+        "barrier_policy": "WAIT_ALL",
+        "parent_input_version": 1,
+        "version": 2,
+        "items": [
+            {
+                "item_id": "analysis-security",
+                "child_intent": "Security analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+            {
+                "item_id": "analysis-reliability",
+                "child_intent": "Reliability analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+        ],
+    }
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            f"/api/tasks/{parent_id}/delegation-waves",
+            json=payload,
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}"},
+        )
+        assert res.status_code == 401
+        assert "missing assignment proof" in res.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_propose_delegation_wave_extra_field_rejected(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+    parent_id = "task-parent-wave-extra"
+    assignment_id, proof, art_ref = await setup_acknowledged_research_claim(store, parent_id, grant_v2=True)
+
+    payload = {
+        "proposal_id": "wave-prop-extra",
+        "assignment_id": assignment_id,
+        "barrier_policy": "WAIT_ALL",
+        "parent_input_version": 1,
+        "version": 2,
+        "items": [
+            {
+                "item_id": "analysis-security",
+                "child_intent": "Security analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+            {
+                "item_id": "analysis-reliability",
+                "child_intent": "Reliability analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+        ],
+        "forbidden_authority": "inject",
+    }
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            f"/api/tasks/{parent_id}/delegation-waves",
+            json=payload,
+            headers={"Authorization": f"Bearer {RESEARCH_TOKEN}", "X-Assignment-Proof": proof},
+        )
+        assert res.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_propose_delegation_wave_capability_mismatch(test_settings: Settings) -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(settings=test_settings, task_store=store, dispatcher=MockAtomicDispatcher(store))
+    parent_id = "task-parent-wave-cap"
+    assignment_id, proof, art_ref = await setup_acknowledged_research_claim(store, parent_id, grant_v2=True)
+
+    payload = {
+        "proposal_id": "wave-prop-cap",
+        "assignment_id": assignment_id,
+        "barrier_policy": "WAIT_ALL",
+        "parent_input_version": 1,
+        "version": 2,
+        "items": [
+            {
+                "item_id": "analysis-security",
+                "child_intent": "Security analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+            {
+                "item_id": "analysis-reliability",
+                "child_intent": "Reliability analysis",
+                "artifact_reference": art_ref.to_dict(),
+                "target_capability": "analysis",
+            },
+        ],
+    }
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            f"/api/tasks/{parent_id}/delegation-waves",
+            json=payload,
+            headers={"Authorization": f"Bearer {WORKER_TOKEN}", "X-Assignment-Proof": proof},
+        )
+        assert res.status_code == 403
 
 
 def test_index_html_analysis_agent_friendly_name() -> None:

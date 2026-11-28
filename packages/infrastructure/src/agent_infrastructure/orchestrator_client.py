@@ -14,6 +14,7 @@ import httpx
 from agent_contracts import (
     ChildTaskExecutionMaterial,
     CompletionCommand,
+    DelegationWaveProposalRequest,
     ResumedContinuationContext,
     StageArtifact,
     TaskContinuation,
@@ -215,6 +216,33 @@ class OrchestratorClient:
             async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
                 response = await client.post(
                     f"{self._base_url}/api/tasks/{clean_task}/delegations",
+                    json=payload,
+                    headers=self._headers(clean_proof),
+                )
+        except httpx.HTTPError as exc:
+            raise CompletionSubmissionError(clean_task, None) from exc
+        if response.status_code != 200:
+            raise CompletionSubmissionError(clean_task, response.status_code)
+        return response.json()
+
+    async def propose_delegation_wave(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        request: DelegationWaveProposalRequest,
+    ) -> dict[str, Any]:
+        """Propose bounded multi-child delegation wave via POST /api/tasks/{task_id}/delegation-waves."""
+        clean_task = str(task_id).strip()
+        clean_proof = str(assignment_proof).strip()
+        if not isinstance(request, DelegationWaveProposalRequest):
+            raise TypeError("request must be a DelegationWaveProposalRequest")
+        payload = request.to_dict()
+        payload["assignment_id"] = str(assignment_id).strip()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+                response = await client.post(
+                    f"{self._base_url}/api/tasks/{clean_task}/delegation-waves",
                     json=payload,
                     headers=self._headers(clean_proof),
                 )

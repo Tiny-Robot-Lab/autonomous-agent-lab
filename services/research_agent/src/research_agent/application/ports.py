@@ -5,9 +5,11 @@ from agent_contracts import (
     AgentEvent,
     AgentHeartbeat,
     CompletionCommand,
+    DelegationWaveProposalRequest,
     InferenceProviderHealth,
     StageArtifact,
     TaskContinuation,
+    TaskContinuationV2,
     TaskInput,
     TaskRequested,
     TaskResult,
@@ -68,7 +70,9 @@ class ContinuationContextReader(Protocol):
     """Port for loading authoritative parent and child context for resumed continuation."""
 
     async def get_task_input(self, task_id: str, version: int = 1) -> TaskInput | None: ...
-    async def get_continuation(self, task_id: str, version: int = 1) -> TaskContinuation | None: ...
+    async def get_continuation(
+        self, task_id: str, version: int = 1
+    ) -> TaskContinuation | TaskContinuationV2 | None: ...
     async def get_stage_artifact(self, producing_task_id: str, artifact_id: str, artifact_version: int = 1) -> StageArtifact | None: ...
     async def get_terminal_outcome(self, task_id: str) -> TerminalOutcome | None: ...
     async def get_canonical_result(self, task_id: str) -> TaskResult | None: ...
@@ -101,4 +105,12 @@ class DelegationClient(Protocol):
         target_capability: str = "analysis",
         parent_input_version: int = 1,
         control_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def propose_delegation_wave(
+        self,
+        task_id: str,
+        assignment_id: str,
+        assignment_proof: str,
+        request: DelegationWaveProposalRequest,
     ) -> dict[str, Any]: ...
