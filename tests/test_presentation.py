@@ -14,6 +14,7 @@ from orchestrator.presentation.api import (
     events,
     health,
     task_children,
+    task_collaboration,
     task_result,
     task_telemetry,
 )
@@ -1988,3 +1989,893 @@ async def test_api_events_serves_tool_execution_telemetry_failure_with_error_cod
     assert telem_dict["result_size_bytes"] is None
     assert telem_dict["error_code"] == "timeout"
 
+
+def _make_terminal_outcome(
+    task_id: str,
+    terminal_status: str = "completed",
+    completed_at: str = "2026-11-28T12:00:00.000000Z",
+    bound_agent_id: str = "analysis-agent-1",
+    runtime_principal_id: str = "principal-analysis-1",
+    safe_summary: str = "Analysis task completed.",
+):
+    import hashlib
+
+    from agent_contracts import TerminalOutcome, derive_terminal_outcome_id
+
+    fp = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+    return TerminalOutcome(
+        outcome_id=derive_terminal_outcome_id(fp),
+        task_id=task_id,
+        assignment_id=f"asgn-{task_id}",
+        completion_command_id=f"cmd-{task_id}",
+        semantic_fingerprint=fp,
+        runtime_principal_id=runtime_principal_id,
+        bound_agent_id=bound_agent_id,
+        execution_kind="delegated_child",
+        terminal_status=terminal_status,
+        safe_summary=safe_summary,
+        completed_at=completed_at,
+    )
+
+
+def _make_deadline_derivation(count: int, accepted_at: str):
+    from agent_contracts import derive_wave_deadline
+
+    return derive_wave_deadline(
+        work_complexity="medium",
+        uncertainty_level="low",
+        required_child_count=count,
+        planned_parallelism=count,
+        min_duration_seconds=60,
+        max_duration_seconds=600,
+        accepted_at=accepted_at,
+    )
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_non_collaborative() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root non-collaborative task")
+    await store.register_root_task(root)
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    assert res == {
+        "parent_task_id": root.task_id,
+        "parent_status": "pending_dispatch",
+        "has_collaboration": False,
+        "continuation_version": None,
+        "continuation_state": None,
+        "wave_id": None,
+        "barrier_policy": None,
+        "wave_resolution": None,
+        "children": [],
+    }
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_unresolved_wave() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root collaborative parent task")
+    await store.register_root_task(root)
+    store.statuses[root.task_id] = "waiting_for_children"
+
+    wave_id = "wave-test-123"
+    child1_id = "child-1-sec"
+    child2_id = "child-2-rel"
+    child3_id = "child-3-ops"
+    children_tuple = (child1_id, child2_id, child3_id)
+
+    # Store inputs with intents
+    store.inputs[(child1_id, 1)] = ContractTaskInput(
+        task_id=child1_id, prompt="Security analysis", created_at=root.created_at
+    )
+    store.inputs[(child2_id, 1)] = ContractTaskInput(
+        task_id=child2_id, prompt="Reliability analysis", created_at=root.created_at
+    )
+    store.inputs[(child3_id, 1)] = ContractTaskInput(
+        task_id=child3_id, prompt="Operations and capacity analysis", created_at=root.created_at
+    )
+
+    # Child statuses
+    store.statuses[child1_id] = "completed"
+    store.terminal_outcomes[child1_id] = _make_terminal_outcome(
+        child1_id, terminal_status="completed", completed_at=root.created_at
+    )
+    store.statuses[child2_id] = "working"
+    store.statuses[child3_id] = "pending"
+
+    # Continuation v2
+    continuation = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="active",
+        wave_resolution=None,
+    )
+    store.continuations[(root.task_id, 2)] = continuation
+    store.latest_continuation[root.task_id] = 2
+
+    # Accepted delegation wave
+    deadline_deriv = _make_deadline_derivation(3, root.created_at)
+    accepted_wave = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.accepted_waves[(root.task_id, wave_id)] = accepted_wave
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    assert res["parent_task_id"] == root.task_id
+    assert res["parent_status"] == "waiting_for_children"
+    assert res["has_collaboration"] is True
+    assert res["continuation_version"] == 2
+    assert res["continuation_state"] == "active"
+    assert res["wave_id"] == wave_id
+    assert res["barrier_policy"] == "WAIT_ALL"
+    assert res["wave_resolution"] is None
+    assert len(res["children"]) == 3
+    assert res["children"][0] == {
+        "task_id": child1_id,
+        "intent": "Security analysis",
+        "status": "completed",
+        "terminal_status": "completed",
+    }
+    assert res["children"][1] == {
+        "task_id": child2_id,
+        "intent": "Reliability analysis",
+        "status": "working",
+        "terminal_status": None,
+    }
+    assert res["children"][2] == {
+        "task_id": child3_id,
+        "intent": "Operations and capacity analysis",
+        "status": "pending",
+        "terminal_status": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_resolved_satisfied_and_resumable() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        ResolvedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    store.statuses[root.task_id] = "resumable"
+
+    wave_id = "wave-res-456"
+    child1_id = "child-1"
+    child2_id = "child-2"
+    child3_id = "child-3"
+    children_tuple = (child1_id, child2_id, child3_id)
+
+    for cid in children_tuple:
+        store.inputs[(cid, 1)] = ContractTaskInput(
+            task_id=cid, prompt=f"Intent for {cid}", created_at=root.created_at
+        )
+        store.statuses[cid] = "completed"
+        store.terminal_outcomes[cid] = _make_terminal_outcome(
+            cid, terminal_status="completed", completed_at=root.created_at
+        )
+
+    continuation = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="released",
+        wave_resolution="SATISFIED",
+    )
+    store.continuations[(root.task_id, 2)] = continuation
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(3, root.created_at)
+    accepted_wave = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.accepted_waves[(root.task_id, wave_id)] = accepted_wave
+
+    resolved_wave = ResolvedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        resolution="SATISFIED",
+        resolved_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.resolved_waves[(root.task_id, wave_id)] = resolved_wave
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    assert res["parent_task_id"] == root.task_id
+    assert res["parent_status"] == "resumable"
+    assert res["has_collaboration"] is True
+    assert res["continuation_version"] == 2
+    assert res["continuation_state"] == "released"
+    assert res["wave_id"] == wave_id
+    assert res["barrier_policy"] == "WAIT_ALL"
+    assert res["wave_resolution"] == "SATISFIED"
+    assert len(res["children"]) == 3
+    for c in res["children"]:
+        assert c["status"] == "completed"
+        assert c["terminal_status"] == "completed"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_residual_closed_child() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        ResolvedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    store.statuses[root.task_id] = "resumable"
+
+    wave_id = "wave-partial-789"
+    child1_id = "child-c1"
+    child2_id = "child-c2"
+    child3_id = "child-c3"
+    children_tuple = (child1_id, child2_id, child3_id)
+
+    # child 1 completed
+    store.inputs[(child1_id, 1)] = ContractTaskInput(
+        task_id=child1_id, prompt="Intent 1", created_at=root.created_at
+    )
+    store.statuses[child1_id] = "completed"
+    store.terminal_outcomes[child1_id] = _make_terminal_outcome(
+        child1_id, terminal_status="completed", completed_at=root.created_at
+    )
+
+    # child 2 completed
+    store.inputs[(child2_id, 1)] = ContractTaskInput(
+        task_id=child2_id, prompt="Intent 2", created_at=root.created_at
+    )
+    store.statuses[child2_id] = "completed"
+    store.terminal_outcomes[child2_id] = _make_terminal_outcome(
+        child2_id, terminal_status="completed", completed_at=root.created_at
+    )
+
+    # child 3 residual closed
+    store.inputs[(child3_id, 1)] = ContractTaskInput(
+        task_id=child3_id, prompt="Intent 3", created_at=root.created_at
+    )
+    store.statuses[child3_id] = "ended / barrier_resolved"
+
+    continuation = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="released",
+        wave_resolution="SATISFIED",
+    )
+    store.continuations[(root.task_id, 2)] = continuation
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(3, root.created_at)
+    accepted_wave = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.accepted_waves[(root.task_id, wave_id)] = accepted_wave
+
+    resolved_wave = ResolvedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        resolution="SATISFIED",
+        resolved_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+        residual_disposition="ended / barrier_resolved",
+    )
+    store.resolved_waves[(root.task_id, wave_id)] = resolved_wave
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    assert res["children"][2] == {
+        "task_id": child3_id,
+        "intent": "Intent 3",
+        "status": "ended / barrier_resolved",
+        "terminal_status": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_not_found_and_validation() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    # Unknown task -> 404
+    with pytest.raises(HTTPException) as exc_404:
+        await task_collaboration("unknown-id-xyz", request=req)
+    assert exc_404.value.status_code == 404
+    assert "not found" in exc_404.value.detail.lower()
+
+    # Whitespace task -> 400
+    with pytest.raises(HTTPException) as exc_400:
+        await task_collaboration("   ", request=req)
+    assert exc_400.value.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_endpoint_data_minimization() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        ResolvedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root task for minimization check")
+    await store.register_root_task(root)
+    store.statuses[root.task_id] = "resumable"
+
+    wave_id = "wave-minimization"
+    child_id = "child-min-1"
+
+    store.inputs[(child_id, 1)] = ContractTaskInput(
+        task_id=child_id, prompt="Minimization intent", created_at=root.created_at
+    )
+    store.statuses[child_id] = "completed"
+    store.terminal_outcomes[child_id] = _make_terminal_outcome(
+        child_id,
+        terminal_status="completed",
+        completed_at=root.created_at,
+        safe_summary="A safe summary that must be omitted",
+        runtime_principal_id="principal-analysis-1",
+    )
+
+    continuation = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=(child_id,),
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="released",
+        wave_resolution="SATISFIED",
+    )
+    store.continuations[(root.task_id, 2)] = continuation
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(1, root.created_at)
+    accepted_wave = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=(child_id,),
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.accepted_waves[(root.task_id, wave_id)] = accepted_wave
+
+    resolved_wave = ResolvedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=(child_id,),
+        barrier_policy="WAIT_ALL",
+        resolution="SATISFIED",
+        resolved_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.resolved_waves[(root.task_id, wave_id)] = resolved_wave
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    res_str = json.dumps(res)
+
+    # Excluded fields must not be present
+    forbidden_terms = [
+        "principal-analysis-1",
+        "assignment_proof",
+        "proof_digest",
+        "fencing_epoch",
+        "semantic_fingerprint",
+        "proposal_fingerprint",
+        "safe_summary",
+        "task.fence",
+        "task.claim",
+        "delegation_grant",
+        "deadline_derivation",
+        "effective_timeout_seconds",
+    ]
+    for term in forbidden_terms:
+        assert term not in res_str, f"Forbidden term '{term}' leaked in collaboration response"
+
+    # Only approved top-level keys
+    approved_keys = {
+        "parent_task_id",
+        "parent_status",
+        "has_collaboration",
+        "continuation_version",
+        "continuation_state",
+        "wave_id",
+        "barrier_policy",
+        "wave_resolution",
+        "children",
+    }
+    assert set(res.keys()) == approved_keys
+    child_approved_keys = {"task_id", "intent", "status", "terminal_status"}
+    for child in res["children"]:
+        assert set(child.keys()) == child_approved_keys
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_asgi_route() -> None:
+    import httpx
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root task for ASGI route test")
+    await store.register_root_task(root)
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. 200 for existing task
+        res_200 = await client.get(f"/api/tasks/{root.task_id}/collaboration")
+        assert res_200.status_code == 200
+        data = res_200.json()
+        assert data["parent_task_id"] == root.task_id
+        assert data["has_collaboration"] is False
+
+        # 2. 404 for unknown task
+        res_404 = await client.get("/api/tasks/unknown-task-id-abc/collaboration")
+        assert res_404.status_code == 404
+        assert "not found" in res_404.json()["detail"].lower()
+
+
+def test_dashboard_html_contains_collaboration_elements() -> None:
+    from pathlib import Path
+
+    index_path = Path("services/orchestrator/src/orchestrator/presentation/index.html")
+    content = index_path.read_text(encoding="utf-8")
+
+    # Card and container exist
+    assert 'id="collaboration-card"' in content
+    assert 'id="collab-content"' in content
+    assert 'class="card collab-card"' in content
+
+    # Issue #35 boundary notice is explicitly displayed in copy
+    assert "Child result aggregation and multi-agent synthesis remain deferred to Issue #35" in content
+
+    # Polling integration with task result polling
+    assert "fetchTaskCollaboration(taskId)" in content
+    assert "/api/tasks/${encodeURIComponent(taskId)}/collaboration" in content
+
+    # CSS classes exist
+    assert ".collab-child-item" in content
+    assert ".collab-tree-connector" in content
+    assert ".badge-waiting" in content
+    assert ".badge-resumable" in content
+
+
+def test_dashboard_html_collaboration_labels_and_distinctions() -> None:
+    from pathlib import Path
+
+    index_path = Path("services/orchestrator/src/orchestrator/presentation/index.html")
+    content = index_path.read_text(encoding="utf-8")
+
+    # Distinguishes Parent Resumable from Research Resumed (Executing)
+    assert "'Parent Resumable'" in content
+    assert "'Research Resumed (Executing)'" in content
+
+    # Shows Parent Resumable only when parent_status is strictly resumable
+    assert "s === 'resumable'" in content
+    # Does not allow cState === 'released' to grant Parent Resumable
+    assert "cState === 'released' && s !== 'working'" not in content
+
+    # Only calls Research Resumed when working under continuation v2
+    assert "s === 'working'" in content
+    assert "cVer >= 2" in content
+
+    # Residual status matches exact authoritative string
+    assert "s === 'ended / barrier_resolved'" in content
+    assert "s.includes('barrier_resolved')" not in content
+
+    # Unknown intent fallback
+    assert "'Unknown intent'" in content
+    assert "'Analysis sibling'" not in content
+
+    # No forbidden/invented vocabulary in collaboration mapping logic
+    # In mapParentStatusBadge, mapChildStatusBadge, mapWaveResolutionBadge
+    assert "text: 'Claimed'" not in content
+    assert "r === 'FAILED'" not in content
+    assert "r === 'EXPIRED'" not in content
+    assert "t === 'succeeded'" not in content
+    assert "t === 'rejected'" not in content
+
+    # Does not infer state from AgentEvent strings in collaboration lifecycle
+    assert "function renderCollaborationLifecycle(data)" in content
+    assert "function mapChildStatusBadge(status, terminalStatus)" in content
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_version_2_missing_continuation() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    store.latest_continuation[root.task_id] = 2
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_version_2_wrong_continuation_type() -> None:
+    from agent_contracts import TaskContinuation
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    store.latest_continuation[root.task_id] = 2
+    store.continuations[(root.task_id, 2)] = TaskContinuation(
+        parent_task_id=root.task_id,
+        child_task_id="child-dummy",
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+    )
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_v2_missing_accepted_wave() -> None:
+    from agent_contracts import TaskContinuationV2
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    store.latest_continuation[root.task_id] = 2
+    store.continuations[(root.task_id, 2)] = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id="wave-missing-accepted",
+        required_child_task_ids=("child-1",),
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="active",
+        wave_resolution=None,
+    )
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_existing_parent_missing_status() -> None:
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+    # Delete parent status while lineage and input remain
+    del store.statuses[root.task_id]
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_missing_child_status() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+
+    wave_id = "wave-missing-child-status"
+    child_id = "child-1"
+    children_tuple = (child_id,)
+
+    # Task input exists for child, but status is missing
+    store.inputs[(child_id, 1)] = ContractTaskInput(
+        task_id=child_id, prompt="Some intent", created_at=root.created_at
+    )
+    # store.statuses[child_id] is deliberately absent
+
+    store.continuations[(root.task_id, 2)] = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="active",
+        wave_resolution=None,
+    )
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(1, root.created_at)
+    store.accepted_waves[(root.task_id, wave_id)] = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+async def test_presentation_task_collaboration_corrupt_missing_child_task_input() -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        TaskContinuationV2,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create("Root parent task")
+    await store.register_root_task(root)
+
+    wave_id = "wave-missing-child-input"
+    child_id = "child-1"
+    children_tuple = (child_id,)
+
+    # Status exists for child, but TaskInput v1 is missing
+    store.statuses[child_id] = "pending"
+    # store.inputs[(child_id, 1)] is deliberately absent
+
+    store.continuations[(root.task_id, 2)] = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="active",
+        wave_resolution=None,
+    )
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(1, root.created_at)
+    store.accepted_waves[(root.task_id, wave_id)] = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await task_collaboration(root.task_id, request=req)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Authoritative record corruption detected"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("resolution", ["UNSATISFIABLE", "TIMED_OUT", "CANCELLED", "SATISFIED"])
+async def test_presentation_task_collaboration_wave_resolutions_pass_through_exact(resolution: str) -> None:
+    from agent_contracts import (
+        AcceptedDelegationWave,
+        ResolvedDelegationWave,
+        TaskContinuationV2,
+    )
+    from agent_contracts import (
+        TaskInput as ContractTaskInput,
+    )
+
+    store = InMemoryAuthoritativeTaskStore()
+    root = TaskRequested.create(f"Root parent task for resolution {resolution}")
+    await store.register_root_task(root)
+
+    wave_id = f"wave-res-{resolution.lower()}"
+    child_id = "child-1"
+    children_tuple = (child_id,)
+
+    store.inputs[(child_id, 1)] = ContractTaskInput(
+        task_id=child_id, prompt="Intent 1", created_at=root.created_at
+    )
+    store.statuses[child_id] = "completed"
+
+    continuation = TaskContinuationV2(
+        parent_task_id=root.task_id,
+        wave_id=wave_id,
+        required_child_task_ids=children_tuple,
+        created_at=root.created_at,
+        updated_at=root.created_at,
+        continuation_version=2,
+        state="released" if resolution in ("SATISFIED", "UNSATISFIABLE", "TIMED_OUT") else "closed",
+        wave_resolution=resolution if resolution != "CANCELLED" else None,
+    )
+    store.continuations[(root.task_id, 2)] = continuation
+    store.latest_continuation[root.task_id] = 2
+
+    deadline_deriv = _make_deadline_derivation(1, root.created_at)
+    store.accepted_waves[(root.task_id, wave_id)] = AcceptedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        deadline_derivation=deadline_deriv,
+        accepted_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+    store.resolved_waves[(root.task_id, wave_id)] = ResolvedDelegationWave(
+        wave_id=wave_id,
+        parent_task_id=root.task_id,
+        required_child_task_ids=children_tuple,
+        barrier_policy="WAIT_ALL",
+        resolution=resolution,
+        resolved_at=root.created_at,
+        wave_deadline=deadline_deriv.wave_deadline,
+    )
+
+    app = create_app(
+        settings=Settings(redis_url="redis://fake:6379/9", app_env="test"),
+        task_store=store,
+        dispatcher=MockAtomicDispatcher(store),
+        state_reader=FakeStateReader(),
+    )
+    req = Request({"type": "http", "app": app})
+
+    res = await task_collaboration(root.task_id, request=req)
+    assert res["wave_resolution"] == resolution

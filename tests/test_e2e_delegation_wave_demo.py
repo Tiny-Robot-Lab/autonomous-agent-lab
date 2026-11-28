@@ -152,6 +152,21 @@ async def test_e2e_production_loop_full_delegation_wave_demo(monkeypatch: pytest
         body = resp.json()
         parent_id = body["task_id"]
 
+        # Verify initial non-collaborative state via GET /api/tasks/{parent_id}/collaboration
+        collab_init = await http_client.get(f"/api/tasks/{parent_id}/collaboration")
+        assert collab_init.status_code == 200
+        assert collab_init.json() == {
+            "parent_task_id": parent_id,
+            "parent_status": "pending",
+            "has_collaboration": False,
+            "continuation_version": None,
+            "continuation_state": None,
+            "wave_id": None,
+            "barrier_policy": None,
+            "wave_resolution": None,
+            "children": [],
+        }
+
         # Grant RootAuthorityRecord supporting wave baseline
         store.authorities[parent_id] = RootAuthorityRecord.create_wave_baseline(
             root_task_id=parent_id,
@@ -207,6 +222,28 @@ async def test_e2e_production_loop_full_delegation_wave_demo(monkeypatch: pytest
         for c_id in child_ids:
             assert store.statuses[c_id] == "pending"
 
+        # Verify collaboration lifecycle endpoint reflects waiting_for_children and 3 pending children
+        collab_wave = await http_client.get(f"/api/tasks/{parent_id}/collaboration")
+        assert collab_wave.status_code == 200
+        data_wave = collab_wave.json()
+        assert data_wave["parent_task_id"] == parent_id
+        assert data_wave["parent_status"] == "waiting_for_children"
+        assert data_wave["has_collaboration"] is True
+        assert data_wave["continuation_version"] == 2
+        assert data_wave["continuation_state"] == "active"
+        assert data_wave["barrier_policy"] == "WAIT_ALL"
+        assert data_wave["wave_resolution"] is None
+        assert len(data_wave["children"]) == 3
+        expected_intents = {
+            "Security analysis",
+            "Reliability analysis",
+            "Operations and capacity analysis",
+        }
+        for ch in data_wave["children"]:
+            assert ch["status"] == "pending"
+            assert ch["terminal_status"] is None
+            assert ch["intent"] in expected_intents
+
         # 5. Analysis agent runs production loop on the 3 delegated children sequentially
         monkeypatch.setenv("AGENT_ID", "analysis-agent-1")
         monkeypatch.setenv("RUNTIME_TOKEN", ANALYSIS_1_TOKEN)
@@ -242,6 +279,18 @@ async def test_e2e_production_loop_full_delegation_wave_demo(monkeypatch: pytest
         assert resumed_hint.task_id == parent_id
         assert resumed_hint.execution_kind == "resumed_continuation"
         assert resumed_hint.expected_continuation_version == 2
+
+        # Verify collaboration lifecycle endpoint reflects resumable parent and SATISFIED wave
+        collab_res = await http_client.get(f"/api/tasks/{parent_id}/collaboration")
+        assert collab_res.status_code == 200
+        data_res = collab_res.json()
+        assert data_res["parent_status"] == "resumable"
+        assert data_res["continuation_state"] == "released"
+        assert data_res["wave_resolution"] == "SATISFIED"
+        assert len(data_res["children"]) == 3
+        for ch in data_res["children"]:
+            assert ch["status"] == "completed"
+            assert ch["terminal_status"] == "completed"
 
         # 7. Resumed Research production loop on distinct instance research-agent-2
         monkeypatch.setenv("AGENT_ID", "research-agent-2")
@@ -281,6 +330,14 @@ async def test_e2e_production_loop_full_delegation_wave_demo(monkeypatch: pytest
         assert res_data["status"] == "completed"
         assert "Authoritative wave resolution: SATISFIED across 3 analysis children (barrier_policy=WAIT_ALL)" in res_data["output"]
         assert "Structured child-result aggregation remains Issue #35" in res_data["output"]
+
+        # Verify collaboration lifecycle endpoint reflects final completed parent
+        collab_final = await http_client.get(f"/api/tasks/{parent_id}/collaboration")
+        assert collab_final.status_code == 200
+        data_final = collab_final.json()
+        assert data_final["parent_status"] == "completed"
+        assert data_final["continuation_state"] == "released"
+        assert data_final["wave_resolution"] == "SATISFIED"
 
         # 9. Verify zero secret leakage across results and events
         for event in bus_1.published + bus_2.published + bus_analysis.published:

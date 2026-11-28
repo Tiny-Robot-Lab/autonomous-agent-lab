@@ -1365,6 +1365,153 @@
     .footer-content a {
       color: inherit;
     }
+
+    /* Collaboration Lifecycle Card (Issue #250 Increment 2) */
+    .collab-card {
+      margin-bottom: 24px;
+    }
+
+    .collab-header-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 14px;
+      background: var(--bg-panel-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-small);
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      margin-bottom: 14px;
+    }
+
+    .collab-tree {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .collab-child-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+      background: var(--bg-panel-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-small);
+    }
+
+    .collab-child-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .collab-tree-connector {
+      color: var(--border-subtle);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      user-select: none;
+    }
+
+    .collab-child-intent {
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .collab-child-id {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--text-faint);
+    }
+
+    .collab-wave-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 10px 14px;
+      background: rgba(139, 178, 255, 0.05);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-small);
+      font-size: 0.8125rem;
+      font-family: var(--font-mono);
+    }
+
+    .collab-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: var(--radius-small);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .badge-waiting {
+      background: rgba(139, 178, 255, 0.14);
+      color: var(--accent-cyan);
+      border: 1px solid rgba(139, 178, 255, 0.35);
+    }
+
+    .badge-resumable {
+      background: var(--state-idle-bg);
+      color: var(--state-idle);
+      border: 1px solid rgba(52, 211, 153, 0.35);
+    }
+
+    .badge-completed {
+      background: var(--state-idle-bg);
+      color: var(--state-idle);
+      border: 1px solid rgba(52, 211, 153, 0.35);
+    }
+
+    .badge-working {
+      background: var(--state-working-bg);
+      color: var(--state-working);
+      border: 1px solid rgba(251, 191, 36, 0.35);
+    }
+
+    .badge-pending {
+      background: var(--bg-panel);
+      color: var(--text-muted);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .badge-fallback {
+      background: var(--state-fallback-bg);
+      color: var(--state-fallback);
+      border: 1px solid var(--state-fallback-border);
+    }
+
+    .badge-error {
+      background: var(--state-error-bg);
+      color: var(--state-error);
+      border: 1px solid rgba(248, 113, 113, 0.35);
+    }
+
+    .badge-faint {
+      background: var(--bg-panel);
+      color: var(--text-faint);
+      border: 1px dashed var(--border-subtle);
+    }
+
+    .badge-unknown {
+      background: var(--bg-panel);
+      color: var(--text-faint);
+      border: 1px solid var(--border-subtle);
+    }
   </style>
 </head>
 
@@ -1484,6 +1631,15 @@
           <div class="result-actions">
             <button type="button" id="copy-result-btn" class="btn-secondary" disabled>Copy Result</button>
           </div>
+        </section>
+
+        <!-- Collaboration Lifecycle Card (Issue #250 Increment 2) -->
+        <section class="card collab-card" id="collaboration-card" style="display: none;" aria-labelledby="collab-heading" aria-live="polite">
+          <div class="card-header">
+            <h2 id="collab-heading" class="card-title">Collaboration Lifecycle</h2>
+            <p class="card-desc">Deterministic lifecycle synchronization (Issue #34/250). Child result aggregation and multi-agent synthesis remain deferred to Issue #35.</p>
+          </div>
+          <div class="collab-content" id="collab-content"></div>
         </section>
       </div>
 
@@ -1643,6 +1799,9 @@
     const progressBarEl = document.getElementById('task-progress-bar');
     const resultContentEl = document.getElementById('result-content');
     const copyResultBtn = document.getElementById('copy-result-btn');
+
+    const collaborationCardEl = document.getElementById('collaboration-card');
+    const collabContentEl = document.getElementById('collab-content');
 
     const routingPipelineEl = document.getElementById('task-routing-pipeline');
     const pipelineStepperEl = document.getElementById('pipeline-stepper');
@@ -2120,6 +2279,182 @@
       routingStatusEl.innerHTML = `<span class="pulse-dot"></span><span>Task accepted — awaiting agent dispatch</span>`;
     }
 
+    // --- Collaboration Lifecycle Presentation (Issue #250 Increment 2) ---
+    function mapParentStatusBadge(status, continuationVersion, continuationState) {
+      const s = String(status || '').toLowerCase();
+      const cVer = continuationVersion;
+
+      if (s === 'waiting_for_children') {
+        return { text: 'Waiting for Children', cls: 'badge-waiting' };
+      }
+      if (s === 'resumable') {
+        return { text: 'Parent Resumable', cls: 'badge-resumable' };
+      }
+      if (s === 'working') {
+        if (cVer >= 2) {
+          return { text: 'Research Resumed (Executing)', cls: 'badge-working' };
+        }
+        return { text: 'Working', cls: 'badge-working' };
+      }
+      if (s === 'completed') {
+        return { text: 'Completed', cls: 'badge-completed' };
+      }
+      if (s === 'failed') {
+        return { text: 'Failed', cls: 'badge-error' };
+      }
+      if (s === 'cancelled') {
+        return { text: 'Cancelled', cls: 'badge-error' };
+      }
+      if (s === 'recovery_required') {
+        return { text: 'Recovery Required', cls: 'badge-error' };
+      }
+      return { text: esc(status || 'Unknown'), cls: 'badge-unknown' };
+    }
+
+    function mapChildStatusBadge(status, terminalStatus) {
+      const s = String(status || '').toLowerCase();
+      const t = terminalStatus ? String(terminalStatus).toLowerCase() : null;
+
+      if (s === 'pending') {
+        return { text: 'Pending', cls: 'badge-pending' };
+      }
+      if (s === 'working') {
+        return { text: 'Working', cls: 'badge-working' };
+      }
+      if (s === 'completed' || t === 'completed') {
+        return { text: 'Completed', cls: 'badge-completed' };
+      }
+      if (s === 'failed' || t === 'failed') {
+        return { text: 'Failed', cls: 'badge-error' };
+      }
+      if (s === 'claim_timed_out' || t === 'claim_timed_out') {
+        return { text: 'Claim Timed Out', cls: 'badge-fallback' };
+      }
+      if (s === 'recovery_required') {
+        return { text: 'Recovery Required', cls: 'badge-error' };
+      }
+      if (s === 'ended / barrier_resolved') {
+        return { text: 'Residual Closed', cls: 'badge-faint' };
+      }
+      return { text: esc(status || 'Unknown'), cls: 'badge-unknown' };
+    }
+
+    function mapWaveResolutionBadge(resolution, children) {
+      if (!resolution) {
+        const completedCount = (children || []).filter(c => c.status === 'completed' || c.terminal_status === 'completed').length;
+        const totalCount = (children || []).length;
+        return {
+          text: `UNRESOLVED (${completedCount}/${totalCount})`,
+          cls: 'badge-waiting'
+        };
+      }
+      const r = String(resolution).toUpperCase();
+      if (r === 'SATISFIED') {
+        return { text: 'SATISFIED', cls: 'badge-completed' };
+      }
+      if (r === 'TIMED_OUT') {
+        return { text: 'TIMED_OUT', cls: 'badge-fallback' };
+      }
+      if (r === 'UNSATISFIABLE' || r === 'CANCELLED') {
+        return { text: r, cls: 'badge-error' };
+      }
+      return { text: esc(r), cls: 'badge-unknown' };
+    }
+
+    function renderCollaborationLifecycle(data) {
+      if (!collaborationCardEl || !collabContentEl || !data || !data.has_collaboration) {
+        hideCollaborationLifecycle();
+        return;
+      }
+
+      const parentBadge = mapParentStatusBadge(
+        data.parent_status,
+        data.continuation_version,
+        data.continuation_state
+      );
+      const resolutionBadge = mapWaveResolutionBadge(data.wave_resolution, data.children);
+      const barrierPolicy = esc(data.barrier_policy || 'WAIT_ALL');
+      const parentId = esc(data.parent_task_id || '');
+
+      let childrenHtml = '';
+      if (Array.isArray(data.children)) {
+        childrenHtml = data.children.map(child => {
+          const childBadge = mapChildStatusBadge(child.status, child.terminal_status);
+          const childIntent = esc(child.intent || 'Unknown intent');
+          const childId = esc(child.task_id || '');
+          return `
+            <div class="collab-child-item">
+              <div class="collab-child-left">
+                <span class="collab-tree-connector" aria-hidden="true">|---</span>
+                <div>
+                  <span class="collab-child-intent">${childIntent}</span>
+                  <span class="collab-child-id">(${childId})</span>
+                </div>
+              </div>
+              <span class="collab-badge ${childBadge.cls}">${childBadge.text}</span>
+            </div>
+          `;
+        }).join('');
+      }
+
+      collabContentEl.innerHTML = `
+        <div class="collab-header-meta">
+          <div>
+            <span style="color: var(--text-faint);">Parent Task:</span>
+            <span style="font-weight: 600; color: var(--text-main);">${parentId}</span>
+          </div>
+          <div>
+            <span class="collab-badge ${parentBadge.cls}">${parentBadge.text}</span>
+          </div>
+        </div>
+
+        <div class="collab-tree" role="list" aria-label="Delegation wave sibling tasks">
+          ${childrenHtml}
+        </div>
+
+        <div class="collab-wave-bar">
+          <div>
+            <span style="color: var(--text-faint);">Barrier Policy:</span>
+            <span style="color: var(--text-main); font-weight: 500;">${barrierPolicy}</span>
+          </div>
+          <div>
+            <span style="color: var(--text-faint); margin-right: 6px;">Resolution:</span>
+            <span class="collab-badge ${resolutionBadge.cls}">${resolutionBadge.text}</span>
+          </div>
+        </div>
+      `;
+
+      collaborationCardEl.style.display = 'block';
+    }
+
+    function hideCollaborationLifecycle() {
+      if (collaborationCardEl) {
+        collaborationCardEl.style.display = 'none';
+      }
+      if (collabContentEl) {
+        collabContentEl.innerHTML = '';
+      }
+    }
+
+    async function fetchTaskCollaboration(taskId) {
+      if (!taskId || taskId !== activeTaskId) return;
+      try {
+        const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/collaboration`);
+        if (res.ok && activeTaskId === taskId) {
+          const data = await res.json();
+          if (data && data.has_collaboration) {
+            renderCollaborationLifecycle(data);
+          } else {
+            hideCollaborationLifecycle();
+          }
+        } else if (activeTaskId === taskId) {
+          hideCollaborationLifecycle();
+        }
+      } catch (err) {
+        console.warn('Error fetching task collaboration:', err);
+      }
+    }
+
     function stopResultPolling() {
       if (pollTimer) {
         clearTimeout(pollTimer);
@@ -2134,6 +2469,9 @@
       if (!currentRoutingDecision && taskId) {
         fetchRoutingDecision(taskId);
       }
+
+      // Fetch collaboration lifecycle if active
+      fetchTaskCollaboration(taskId);
 
       pollAttempts++;
       if (pollAttempts > MAX_POLL_ATTEMPTS) {
@@ -2152,6 +2490,7 @@
             resultContentEl.innerHTML = safeFormatResult(data.output);
             copyResultBtn.disabled = !lastRawResultOutput;
             stopResultPolling();
+            fetchTaskCollaboration(taskId);
 
             // Request task-scoped successful inference telemetry
             try {
@@ -2189,6 +2528,7 @@
           } else if (data.status === 'error' || data.status === 'failed') {
             updateRoutingObservation('failed', data.detail || 'Execution failure');
             stopResultPolling();
+            fetchTaskCollaboration(taskId);
             try {
               const telemRes = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/telemetry`);
               if (telemRes.ok && activeTaskId === taskId) {
@@ -2242,6 +2582,7 @@
       setFormSubmitting(true);
       stopResultPolling();
       clearInferenceMeta();
+      hideCollaborationLifecycle();
 
       try {
         const response = await fetch('/api/tasks', {
