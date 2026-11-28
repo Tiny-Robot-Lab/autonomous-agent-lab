@@ -19,6 +19,7 @@ from agent_contracts import (
     RecoveryDecisionRecord,
     RequiredCapabilityRecord,
     ResolvedDelegationWave,
+    ResumedContinuationContext,
     RootAuthorityRecord,
     RoutingDecision,
     StageArtifact,
@@ -29,6 +30,9 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveCancellationCommand,
+    WaveCancellationRecord,
+    WaveTimeoutEvaluationCommand,
     WaveYieldRecord,
 )
 
@@ -117,6 +121,18 @@ class RecoveryConflictError(Exception):
 
 class RecoveryPreconditionFailedError(Exception):
     """Raised when recovery preconditions (status, claim, fence, or expiry record) are not met."""
+
+
+class WaveDeadlineNotReachedError(TaskNotClaimableError):
+    """Raised when wave-deadline evaluation is attempted before the frozen wave_deadline."""
+
+
+class WaveAlreadyResolvedError(DelegationConflictError):
+    """Raised when a wave-resolving operation loses to a prior authoritative resolution."""
+
+
+class WaveCancellationConflictError(DelegationConflictError):
+    """Raised when a wave cancellation command conflicts with an existing cancellation decision."""
 
 
 @runtime_checkable
@@ -392,6 +408,48 @@ class AuthoritativeTaskStore(Protocol):
         child_task_id: str,
     ) -> str | None:
         """Retrieve a child task's authoritative claim deadline."""
+        ...
+
+    async def evaluate_wave_timeout(
+        self,
+        command: WaveTimeoutEvaluationCommand,
+        now: str = "",
+    ) -> tuple[ResolvedDelegationWave, bool]:
+        """Atomically evaluate a frozen delegation-wave deadline and resolve TIMED_OUT if reached.
+
+        Returns (resolved_wave, is_replay).
+        """
+        ...
+
+    async def cancel_delegation_wave(
+        self,
+        command: WaveCancellationCommand,
+        operator_principal_id: str,
+        now: str = "",
+    ) -> tuple[WaveCancellationRecord, ResolvedDelegationWave, bool]:
+        """Atomically cancel an active delegation wave and terminate the collaborative parent.
+
+        Returns (cancellation_record, resolved_wave, is_replay).
+        """
+        ...
+
+    async def get_wave_cancellation_record(
+        self,
+        parent_task_id: str,
+        cancellation_decision_id: str,
+    ) -> WaveCancellationRecord | None:
+        """Retrieve a persisted wave cancellation decision record."""
+        ...
+
+    async def read_resumed_continuation_v2_context(
+        self,
+        parent_task_id: str,
+        assignment_id: str,
+        principal_id: str,
+        bound_agent_id: str,
+        expected_fencing_epoch: int,
+    ) -> ResumedContinuationContext:
+        """Read and atomically validate a released v2 continuation context snapshot."""
         ...
 
 

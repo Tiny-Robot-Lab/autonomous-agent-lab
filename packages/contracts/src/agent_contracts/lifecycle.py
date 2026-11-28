@@ -12,6 +12,7 @@ class TaskLifecycleStatus(str, Enum):
     FAILED = "failed"
     DISPATCH_FAILED = "dispatch_failed"
     CLAIM_TIMED_OUT = "claim_timed_out"
+    CANCELLED = "cancelled"
 
 
 PARENT_LIFECYCLE_STATUSES: frozenset[str] = frozenset({
@@ -24,6 +25,7 @@ PARENT_LIFECYCLE_STATUSES: frozenset[str] = frozenset({
     TaskLifecycleStatus.COMPLETED.value,
     TaskLifecycleStatus.FAILED.value,
     TaskLifecycleStatus.DISPATCH_FAILED.value,
+    TaskLifecycleStatus.CANCELLED.value,
 })
 
 CHILD_LIFECYCLE_STATUSES: frozenset[str] = frozenset({
@@ -46,6 +48,7 @@ TERMINAL_TASK_LIFECYCLE_STATUSES: frozenset[str] = frozenset({
     TaskLifecycleStatus.FAILED.value,
     TaskLifecycleStatus.CLAIM_TIMED_OUT.value,
     TaskLifecycleStatus.DISPATCH_FAILED.value,
+    TaskLifecycleStatus.CANCELLED.value,
 })
 
 NONTERMINAL_TASK_LIFECYCLE_STATUSES: frozenset[str] = frozenset(

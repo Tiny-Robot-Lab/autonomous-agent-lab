@@ -45,7 +45,10 @@ from agent_contracts import (
     TaskResult,
     TerminalOutcome,
     WakeUpHint,
+    WaveCancellationCommand,
+    WaveCancellationRecord,
     WaveResolution,
+    WaveTimeoutEvaluationCommand,
     WaveYieldRecord,
     compute_proposal_fingerprint,
     compute_wave_proposal_fingerprint,
@@ -104,6 +107,7 @@ from .ports import (
     TaskNotClaimableError,
     TaskQueue,
     TurnCompletionStore,
+    WaveAlreadyResolvedError,
 )
 
 
@@ -655,9 +659,10 @@ class ClaimTask:
                 if continuation.wave_resolution not in (
                     WaveResolution.SATISFIED.value,
                     WaveResolution.UNSATISFIABLE.value,
+                    WaveResolution.TIMED_OUT.value,
                 ):
                     raise TaskNotClaimableError(
-                        f"Wave resolution '{continuation.wave_resolution}' is not resumable in Increment 3"
+                        f"Wave resolution '{continuation.wave_resolution}' is not resumable"
                     )
                 resolved_wave = await self._task_store.get_resolved_delegation_wave(
                     clean_task_id, continuation.wave_id
@@ -1360,22 +1365,37 @@ def _assert_wave_consistency(
             or resolved_wave.wave_deadline != record.wave_deadline
             or resolved_wave.accepted_wave_fingerprint != wave.semantic_fingerprint()
             or resolved_wave.resolution
-            not in (WaveResolution.SATISFIED.value, WaveResolution.UNSATISFIABLE.value)
+            not in (
+                WaveResolution.SATISFIED.value,
+                WaveResolution.UNSATISFIABLE.value,
+                WaveResolution.TIMED_OUT.value,
+                WaveResolution.CANCELLED.value,
+            )
         ):
             raise CorruptAuthoritativeRecordError(
                 f"ResolvedDelegationWave '{record.wave_id}' is inconsistent with accepted wave"
             )
-        if (
-            continuation.state != "released"
-            or continuation.wave_resolution != resolved_wave.resolution
-        ):
-            raise CorruptAuthoritativeRecordError(
-                f"TaskContinuationV2 for resolved wave '{record.wave_id}' must be released with matching resolution"
-            )
-        if parent_status not in ("resumable", "working", "completed", "failed", "recovery_required"):
-            raise CorruptAuthoritativeRecordError(
-                f"Parent status for resolved wave '{record.wave_id}' is invalid: '{parent_status}'"
-            )
+        if resolved_wave.resolution == WaveResolution.CANCELLED.value:
+            if continuation.state != "closed" or continuation.wave_resolution is not None:
+                raise CorruptAuthoritativeRecordError(
+                    f"TaskContinuationV2 for cancelled wave '{record.wave_id}' must be closed with no wave_resolution"
+                )
+            if parent_status != "cancelled":
+                raise CorruptAuthoritativeRecordError(
+                    f"Parent status for cancelled wave '{record.wave_id}' must be 'cancelled', got '{parent_status}'"
+                )
+        else:
+            if (
+                continuation.state != "released"
+                or continuation.wave_resolution != resolved_wave.resolution
+            ):
+                raise CorruptAuthoritativeRecordError(
+                    f"TaskContinuationV2 for resolved wave '{record.wave_id}' must be released with matching resolution"
+                )
+            if parent_status not in ("resumable", "working", "completed", "failed", "recovery_required"):
+                raise CorruptAuthoritativeRecordError(
+                    f"Parent status for resolved wave '{record.wave_id}' is invalid: '{parent_status}'"
+                )
 
 
 class AcceptDelegationWave:
@@ -1676,6 +1696,24 @@ class AcceptDelegationWave:
                     ):
                         raise CorruptAuthoritativeRecordError(
                             f"Working child '{child_id}' has inconsistent claim/fence state under wave '{record.wave_id}'"
+                        )
+                elif child_status == "recovery_required":
+                    child_expiry = await self._task_store.get_claim_expiry(child_id)
+                    if (
+                        resolved_wave is not None
+                        or child_fence < 1
+                        or child_claim is not None
+                        or child_outcome is not None
+                        or child_result is not None
+                        or child_marker is not None
+                        or child_expiry is None
+                        or child_expiry.task_id != child_id
+                        or child_expiry.expired_fencing_epoch != child_fence
+                        or child_expiry.prior_claimable_status != "pending"
+                        or child_expiry.execution_kind != "delegated_child"
+                    ):
+                        raise CorruptAuthoritativeRecordError(
+                            f"Recovery-required child '{child_id}' has inconsistent expiry/claim/fence state under wave '{record.wave_id}'"
                         )
                 elif child_status in ("completed", "failed", "claim_timed_out"):
                     if (
@@ -2047,7 +2085,7 @@ class EvaluateExpiry:
                     action="none",
                     status="pending",
                 )
-            except ClaimTimeoutConflictError:
+            except (ClaimTimeoutConflictError, WaveAlreadyResolvedError):
                 cur_status = await self._task_store.get_status(clean_task_id, now=now_iso) or status
                 if cur_status == "claim_timed_out":
                     outcome = await self._task_store.get_terminal_outcome(clean_task_id)
@@ -2080,7 +2118,7 @@ class EvaluateExpiry:
                         status="recovery_required",
                         expiry_record=expiry_record,
                     )
-                except ClaimTimeoutConflictError:
+                except (ClaimTimeoutConflictError, WaveAlreadyResolvedError):
                     cur_status = await self._task_store.get_status(clean_task_id, now=now_iso) or status
                     if cur_status == "recovery_required":
                         expiry_record = await self._task_store.get_claim_expiry(clean_task_id)
@@ -2181,6 +2219,107 @@ class ResolveExpiredClaim:
         )
 
 
+class EvaluateWaveTimeout:
+    """Trusted platform evaluation of a frozen delegation-wave deadline.
+
+    Governed by ADR-0011 Decisions 3, 4, 5, 6, and 7:
+    - Requires 'recovery_operator' capability;
+    - Evaluates only against the frozen authoritative wave_deadline (now >= wave_deadline);
+    - Atomically resolves TIMED_OUT, closes residual authority, releases TaskContinuationV2,
+      transitions parent to 'resumable', and emits one Research wake-up hint;
+    - Exact replay returns the existing TIMED_OUT ResolvedDelegationWave without another hint.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("EvaluateWaveTimeout requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        parent_task_id: str,
+        wave_id: str,
+        now: str = "",
+    ) -> tuple[ResolvedDelegationWave, bool]:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("recovery_operator"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'recovery_operator'"
+            )
+
+        command = WaveTimeoutEvaluationCommand(
+            parent_task_id=parent_task_id,
+            wave_id=wave_id,
+        )
+        now_val = now if (now and str(now).strip()) else self._clock()
+        if isinstance(now_val, datetime):
+            now_iso = normalize_canonical_utc_timestamp(now_val)
+        else:
+            now_iso = normalize_canonical_utc_timestamp(str(now_val))
+
+        return await self._task_store.evaluate_wave_timeout(
+            command=command,
+            now=now_iso,
+        )
+
+
+class CancelDelegationWave:
+    """Authorized operator cancellation of an active unresolved delegation wave.
+
+    Governed by ADR-0011 Decisions 3, 4, 5, and 8:
+    - Requires distinct 'wave_cancel_operator' capability (never ordinary agents or recovery_operator);
+    - Atomically persists ResolvedDelegationWave(CANCELLED), WaveCancellationRecord,
+      closed TaskContinuationV2 (wave_resolution=None), parent status 'cancelled', and
+      residual child closure ('ended / barrier_resolved');
+    - Emits zero Research wake-up hints and creates no parent resumption or TerminalOutcome;
+    - Exact replay bound to operator_principal_id, decision ID, parent, wave, and fingerprint.
+    """
+
+    def __init__(
+        self,
+        task_store: AuthoritativeTaskStore,
+        clock: Any = None,
+    ) -> None:
+        if task_store is None:
+            raise TypeError("CancelDelegationWave requires an AuthoritativeTaskStore")
+        self._task_store = task_store
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(
+        self,
+        principal: RuntimePrincipal,
+        command: WaveCancellationCommand,
+        now: str = "",
+    ) -> tuple[WaveCancellationRecord, ResolvedDelegationWave, bool]:
+        if not principal or not principal.active:
+            raise UnauthorizedPrincipalError("Principal is invalid or inactive")
+        if not principal.has_capability("wave_cancel_operator"):
+            raise CapabilityMismatchError(
+                f"Principal '{principal.principal_id}' lacks required capability 'wave_cancel_operator'"
+            )
+        if not isinstance(command, WaveCancellationCommand):
+            raise TypeError("command must be a WaveCancellationCommand")
+
+        now_val = now if (now and str(now).strip()) else self._clock()
+        if isinstance(now_val, datetime):
+            now_iso = normalize_canonical_utc_timestamp(now_val)
+        else:
+            now_iso = normalize_canonical_utc_timestamp(str(now_val))
+
+        return await self._task_store.cancel_delegation_wave(
+            command=command,
+            operator_principal_id=principal.principal_id,
+            now=now_iso,
+        )
+
+
 class GetResumedContinuationContext:
     """Authenticated continuation-context reader for resumed parent turns.
 
@@ -2193,15 +2332,16 @@ class GetResumedContinuationContext:
     - Validates claim.assigned_capability == 'research';
     - Validates claim.state == 'acknowledged';
     - Validates claim.execution_kind == 'resumed_continuation';
-    - Validates claim.continuation_version == 1;
+    - Validates claim.continuation_version in (1, 2);
     - Validates current fencing epoch matches claim.fencing_epoch;
     - Cryptographically verifies X-Assignment-Proof via verify_assignment_proof;
-    - Retrieves parent_task_input (v1);
-    - Retrieves continuation (v1, stage='incorporate_analysis_child');
-    - Retrieves sealed stage_artifact (referenced by continuation);
-    - Retrieves child_outcome for continuation.child_task_id;
-    - Retrieves child_result for continuation.child_task_id (if child_outcome is completed);
-    - Returns ResumedContinuationContext.
+    - For v1: retrieves parent_task_input (v1), continuation (v1), sealed stage_artifact,
+      child_outcome, and child_result (if completed);
+    - For v2: atomically validates parent working state, continuation_latest == 2,
+      released TaskContinuationV2 (SATISFIED/UNSATISFIABLE/TIMED_OUT), matching
+      ResolvedDelegationWave, parent TaskInput, and sealed StageArtifact without
+      aggregating child result content;
+    - Returns versioned ResumedContinuationContext.
     """
 
     def __init__(
@@ -2265,9 +2405,9 @@ class GetResumedContinuationContext:
             raise TaskNotClaimableError(
                 f"Continuation context is only available for 'resumed_continuation', got '{claim.execution_kind}'"
             )
-        if claim.continuation_version != 1:
+        if claim.continuation_version not in (1, 2):
             raise TaskNotClaimableError(
-                f"Continuation context requires continuation_version=1, got {claim.continuation_version}"
+                f"Continuation context requires continuation_version in (1, 2), got {claim.continuation_version}"
             )
 
         cur_epoch = await self._task_store.get_fencing_epoch(clean_task)
@@ -2279,6 +2419,15 @@ class GetResumedContinuationContext:
 
         if not verify_assignment_proof(self._verifier_key, clean_proof, claim.proof_digest):
             raise InvalidClaimProofError("Assignment proof verification failed")
+
+        if claim.continuation_version == 2:
+            return await self._task_store.read_resumed_continuation_v2_context(
+                parent_task_id=clean_task,
+                assignment_id=clean_assignment,
+                principal_id=principal.principal_id,
+                bound_agent_id=principal.bound_agent_id,
+                expected_fencing_epoch=cur_epoch,
+            )
 
         # 1. Authoritative TaskInput v1
         task_input = await self._task_store.get_task_input(clean_task, 1)

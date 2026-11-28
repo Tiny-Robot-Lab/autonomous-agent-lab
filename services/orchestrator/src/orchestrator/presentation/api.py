@@ -6,6 +6,7 @@ from agent_contracts import (
     FORBIDDEN_AUTHORITY_FIELDS,
     ArtifactReference,
     RecoveryDecisionCommand,
+    WaveCancellationCommand,
     __version__,
     sanitize_redis_url,
 )
@@ -42,7 +43,10 @@ from orchestrator.application.ports import (
     TaskQueue,
     TelemetryStorageError,
     TurnCompletionStore,
+    WaveAlreadyResolvedError,
     WaveBudgetExceededError,
+    WaveCancellationConflictError,
+    WaveDeadlineNotReachedError,
 )
 from orchestrator.application.queries import (
     FindCandidatesByCapability,
@@ -56,9 +60,11 @@ from orchestrator.application.queries import (
 from orchestrator.application.use_cases import (
     AcceptDelegationProposal,
     AcknowledgeAssignment,
+    CancelDelegationWave,
     ClaimTask,
     CompleteTurn,
     EvaluateExpiry,
+    EvaluateWaveTimeout,
     GetChildTaskInput,
     GetResumedContinuationContext,
     ResolveExpiredClaim,
@@ -254,6 +260,18 @@ class ResolveExpiredClaimInput(BaseModel):
 
 class EvaluateExpiryInput(BaseModel):
     now: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class EvaluateWaveTimeoutInput(BaseModel):
+    now: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class CancelDelegationWaveInput(BaseModel):
+    cancellation_decision_id: str = Field(min_length=1, max_length=256)
 
     model_config = {"extra": "forbid"}
 
@@ -633,6 +651,103 @@ async def resolve_expired_claim_endpoint(
         raise HTTPException(status_code=500, detail="Authoritative record corruption detected") from exc
 
 
+async def evaluate_wave_timeout_endpoint(
+    task_id: str,
+    wave_id: str,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+    value: Annotated[EvaluateWaveTimeoutInput | None, Body()] = None,
+) -> dict[str, Any]:
+    eval_uc: EvaluateWaveTimeout | None = getattr(
+        request.app.state, "evaluate_wave_timeout", None
+    )
+    if eval_uc is None:
+        raise HTTPException(
+            status_code=503, detail="Wave timeout evaluation service is not enabled"
+        )
+    now_str = value.now if (value and value.now) else ""
+    try:
+        resolved_wave, replayed = await eval_uc.execute(
+            principal=principal,
+            parent_task_id=task_id,
+            wave_id=wave_id,
+            now=now_str,
+        )
+        return {
+            "resolved_wave": resolved_wave.to_dict(),
+            "replayed": replayed,
+        }
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ParentTaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        WaveDeadlineNotReachedError,
+        WaveAlreadyResolvedError,
+        DelegationConflictError,
+        TaskNotClaimableError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(
+            status_code=500, detail="Authoritative record corruption detected"
+        ) from exc
+
+
+async def cancel_delegation_wave_endpoint(
+    task_id: str,
+    wave_id: str,
+    value: CancelDelegationWaveInput,
+    request: Request,
+    principal: Annotated[RuntimePrincipal, Depends(get_current_runtime_principal)],
+) -> dict[str, Any]:
+    cancel_uc: CancelDelegationWave | None = getattr(
+        request.app.state, "cancel_delegation_wave", None
+    )
+    if cancel_uc is None:
+        raise HTTPException(
+            status_code=503, detail="Wave cancellation service is not enabled"
+        )
+    try:
+        command = WaveCancellationCommand(
+            cancellation_decision_id=value.cancellation_decision_id,
+            parent_task_id=task_id,
+            wave_id=wave_id,
+        )
+        cancellation_rec, resolved_wave, replayed = await cancel_uc.execute(
+            principal=principal,
+            command=command,
+        )
+        return {
+            "cancellation": cancellation_rec.to_dict(),
+            "resolved_wave": resolved_wave.to_dict(),
+            "replayed": replayed,
+        }
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except CapabilityMismatchError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ParentTaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        WaveCancellationConflictError,
+        WaveAlreadyResolvedError,
+        DelegationConflictError,
+        TaskNotClaimableError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CorruptAuthoritativeRecordError as exc:
+        raise HTTPException(
+            status_code=500, detail="Authoritative record corruption detected"
+        ) from exc
+
+
 async def continuation_context_endpoint(
     task_id: str,
     assignment_id: str,
@@ -845,6 +960,8 @@ def create_app(
     get_child_task_input: GetChildTaskInput | None = None
     evaluate_expiry: EvaluateExpiry | None = None
     resolve_expired_claim: ResolveExpiredClaim | None = None
+    evaluate_wave_timeout: EvaluateWaveTimeout | None = None
+    cancel_delegation_wave: CancelDelegationWave | None = None
 
     assignment_lifecycle_configured = bool(
         resolved_settings.assignment_proof_pepper.strip()
@@ -892,6 +1009,8 @@ def create_app(
             )
         evaluate_expiry = EvaluateExpiry(task_store=resolved_task_store)
         resolve_expired_claim = ResolveExpiredClaim(task_store=resolved_task_store)
+        evaluate_wave_timeout = EvaluateWaveTimeout(task_store=resolved_task_store)
+        cancel_delegation_wave = CancelDelegationWave(task_store=resolved_task_store)
 
     if executable_delegation_enabled:
         stage_artifact = StageArtifactUseCase(
@@ -947,6 +1066,8 @@ def create_app(
     app.state.get_child_task_input = get_child_task_input
     app.state.evaluate_expiry = evaluate_expiry
     app.state.resolve_expired_claim = resolve_expired_claim
+    app.state.evaluate_wave_timeout = evaluate_wave_timeout
+    app.state.cancel_delegation_wave = cancel_delegation_wave
     app.state.find_candidates = find_candidates_query
 
     static_dir = Path(__file__).parent / "static"
@@ -1012,6 +1133,16 @@ def create_app(
     app.add_api_route(
         "/api/tasks/{task_id}/resolve-expired-claim",
         resolve_expired_claim_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/waves/{wave_id}/evaluate-timeout",
+        evaluate_wave_timeout_endpoint,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/api/tasks/{task_id}/waves/{wave_id}/cancel",
+        cancel_delegation_wave_endpoint,
         methods=["POST"],
     )
 

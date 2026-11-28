@@ -38,6 +38,7 @@ from agent_contracts import (
     normalize_canonical_utc_timestamp,
 )
 from orchestrator.application.ports import (
+    ClaimDeadlineNotExpiredError,
     ClaimNotFoundError,
     ClaimTimeoutConflictError,
     DelegationConflictError,
@@ -1030,9 +1031,9 @@ async def test_v2_child_completion_and_timeout_fail_closed_without_parent_resump
     assert (parent_id, resp.wave_id) not in store.resolved_waves
     assert len(store.hints) == initial_hints
 
-    # Attempt v1 claim_timeout on unclaimed child 2 after deadline -> must still fail closed (Increment 4)
-    with pytest.raises((ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
-        await store.materialize_claim_timeout(c2, now="2026-11-27T10:10:00Z")
+    # Before child claim deadline, attempt claim_timeout on unclaimed child 2 -> must fail closed without parent resumption
+    with pytest.raises((ClaimDeadlineNotExpiredError, ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
+        await store.materialize_claim_timeout(c2, now=resp.child_claim_deadline)
     assert store.statuses[parent_id] == "waiting_for_children"
     assert store.statuses[c2] == "pending"
     assert c2 not in store.terminal_outcomes
@@ -1172,10 +1173,10 @@ async def test_live_redis_gateway_wave_acceptance_claim_replay_and_fail_closed()
         assert await gw.get_status(p2) == "waiting_for_children"
         assert await gw.get_status(c1) == "failed"
 
-        with pytest.raises((ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
-            await gw.materialize_claim_timeout(c2, now="2026-11-27T10:10:00Z")
+        with pytest.raises((ClaimDeadlineNotExpiredError, ClaimTimeoutConflictError, TaskNotClaimableError, CorruptAuthoritativeRecordError)):
+            await gw.materialize_claim_timeout(c2, now="2026-11-27T10:02:00Z")
         assert await gw.get_status(p2) == "waiting_for_children"
-        assert await gw.get_status(c2) == "pending"
+        assert await gw.get_status(c2, now="2026-11-27T10:02:00Z") == "pending"
     finally:
         await admin.aclose()
         await gw.aclose()

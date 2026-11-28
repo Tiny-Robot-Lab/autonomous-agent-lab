@@ -12,7 +12,7 @@ TOKEN_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.token-key.v1"
 VERIFIER_KEY_LABEL = b"autonomous-agent-lab.assignment-proof.verifier-key.v1"
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RECOGNIZED_CAPABILITIES: frozenset[str] = frozenset(
-    {"general", "research", "analysis", "recovery_operator"}
+    {"general", "research", "analysis", "recovery_operator", "wave_cancel_operator"}
 )
 
 

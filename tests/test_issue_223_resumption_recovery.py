@@ -1639,6 +1639,7 @@ async def test_redis_adapter_eval_executes_exactly_once() -> None:
     mock_client.get.side_effect = [
         '{"parent_task_id": "parent-1", "root_task_id": "root-1", "task_id": "child-1"}',  # lineage
         "2026-11-22T11:00:00.000000Z",  # deadline
+        "1",  # continuation_latest
     ]
     mock_outcome = build_claim_timed_out_terminal_outcome(
         task_id="child-1",
@@ -1828,7 +1829,7 @@ def test_ast_all_eval_calls_in_try_blocks() -> None:
     visitor = EvalVisitor()
     visitor.visit(tree)
 
-    assert len(visitor.eval_calls) == 20, f"Expected 20 direct eval calls, found {len(visitor.eval_calls)}"
+    assert len(visitor.eval_calls) == 26, f"Expected 26 direct eval calls, found {len(visitor.eval_calls)}"
 
     messages: list[str] = []
     for call in visitor.eval_calls:
@@ -1869,7 +1870,7 @@ def test_ast_all_eval_calls_in_try_blocks() -> None:
                 break
         assert "ResponseError" in caught_types and handler_found, f"eval at line {call.lineno} does not catch ResponseError"
 
-    assert len(messages) == 20
+    assert len(messages) == 26
 
 
 @pytest.mark.anyio
